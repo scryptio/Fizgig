@@ -75,8 +75,13 @@ docs/PHONE_MONITOR_PLAN.md
 docs/MINIMAX_REFERENCE_NOTES.md
 docs/MINIMAX_BLOCKS.md
 
-# Written by launch.pyw when the app fails to start
-launch_error.log
+# Written by install_fizgig_rocm.bat (BNB_ROCM_VERSION / ROCM_PATH for bitsandbytes)
+rocm_env.bat
+gpu_detect_debug.log
+
+# Portable Python downloaded by install_fizgig_rocm.bat when py -3.12 is unavailable
+python312/
+
 
 # Internal-only: debugging test harnesses + template setup notes (local, never public)
 tests/

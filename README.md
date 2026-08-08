@@ -258,9 +258,10 @@ session picks up where you left off.
 
 ## Requirements
 
-- **GPU** — NVIDIA RTX 30 / 40 / 50-series. **16 GB+ VRAM** recommended (24 GB+ comfortable), but the floor is lower than that suggests: **Klein 9B** needs 16 GB, while **Krea 2** trains on **8 GB** with everything on Auto and batch size 1 — see [VRAM guidance](#vram-guidance). The fp8 Base's VRAM savings apply on every supported card.
+- **GPU** — NVIDIA RTX 30 / 40 / 50-series, or **AMD Radeon** with ROCm (RDNA1 through RDNA4, Strix Point / Halo, Instinct MI300+). **16 GB+ VRAM** recommended (24 GB+ comfortable), but the floor is lower than that suggests: **Klein 9B** needs 16 GB, while **Krea 2** trains on **8 GB** with everything on Auto and batch size 1 — see [VRAM guidance](#vram-guidance). The fp8 Base's VRAM savings apply on NVIDIA Ada+; on AMD, NF4 and INT8 are the primary quant paths.
 - **NVIDIA driver** — 555+ on Windows, 550+ on Linux (for the CUDA 12.8 PyTorch wheels).
-- **OS** — Windows 10 / 11 or Linux. macOS handles captioning and image prep, but training needs CUDA.
+- **AMD ROCm** — Linux: ROCm-capable kernel with `/dev/kfd` (installer auto-detects). Windows: use `install_fizgig_rocm.bat` (Python 3.12, up-to-date ROCm nightly wheels — same approach as [comfyui-rocm](https://github.com/patientx/comfyui-rocm) and OneTrainer's custom install, not Zluda).
+- **OS** — Windows 10 / 11 or Linux. macOS handles captioning and image prep, but training needs CUDA or ROCm.
 - **Python** — 3.10, 3.11, 3.12, or 3.13.
 - **Disk** — ~10 GB for the venv, plus ~40 GB for model files.
 - **Visual Studio Build Tools** (Windows only) — needed to compile InsightFace, and for the **torch.compile training speedup**. Direct installer (no hunting on the MS site): **[aka.ms/vs/17/release/vs_BuildTools.exe](https://aka.ms/vs/17/release/vs_BuildTools.exe)** — tick the **"Desktop development with C++"** workload. The installer and `update_fizgig.bat` detect it and print this link if it's missing; without it everything still works, you just skip the compile speedup. (triton, compile's other dependency, installs automatically with the requirements.)
@@ -276,7 +277,21 @@ git clone https://github.com/shootthesound/Fizgig.git
 cd Fizgig
 ```
 
-**Windows (one-click)** — double-click `install_fizgig.bat`. It creates a venv, installs CUDA 12.8 PyTorch and all dependencies, pre-downloads the InsightFace models, and verifies CUDA is visible to PyTorch. Launch with `run_fizgig.bat`; update later with `update_fizgig.bat`.
+**Windows (NVIDIA, one-click)** — double-click `install_fizgig.bat`. It creates a venv, installs CUDA 12.8 PyTorch and all dependencies, pre-downloads the InsightFace models, and verifies the GPU is visible to PyTorch. Launch with `run_fizgig.bat`; update later with `update_fizgig.bat`.
+
+**Windows (AMD ROCm)** — double-click `install_fizgig_rocm.bat`. It picks **Python 3.12** via `py -3.12` / `python3.12` (not whatever `python` defaults to — e.g. 3.14), or downloads portable 3.12.10 if none is found (same approach as comfyui-rocm). GPU detection, ROCm nightly PyTorch wheels, and the cp312 bitsandbytes ROCm build follow. Launch with `run_fizgig_rocm.bat`.
+
+**Linux (auto-detect)** — `install_fizgig.py` picks CUDA or ROCm wheels from your hardware (`/dev/nvidia0` vs `/dev/kfd`):
+
+```bash
+python install_fizgig.py              # auto-detect
+python install_fizgig.py --platform rocm   # force ROCm
+python install_fizgig.py --platform cuda   # force CUDA
+```
+
+Launch with `./run_fizgig.sh` (ROCm tuning env vars, `amd-smi` on PATH, and `LD_LIBRARY_PATH` are written in on ROCm installs).
+
+**VRAM status bar on AMD:** Windows ROCm uses `typeperf`; Linux ROCm uses the **`amd-smi`** CLI from [AMD SMI / ROCm Core SDK](https://rocm.docs.amd.com/projects/amdsmi/en/latest/install/install.html) (`sudo apt install amdrocm-amdsmi`), with legacy `rocm-smi` as fallback. Do not `pip install amdsmi` — the PyPI package is outdated; upstream moved to [rocm-systems/projects/amdsmi](https://github.com/ROCm/rocm-systems/tree/develop/projects/amdsmi). `nvidia-ml-py` is CUDA-only and not used on ROCm paths.
 
 **Linux / macOS:**
 

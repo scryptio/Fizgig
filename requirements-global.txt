@@ -1,0 +1,47 @@
+# Fizgig — shared dependencies (no PyTorch / GPU backend wheels).
+# Installed by install_fizgig.py (CUDA default) and install_fizgig_rocm.bat (AMD ROCm).
+
+# Training framework
+accelerate==1.6.0
+diffusers==0.32.1
+safetensors==0.5.3  # 0.4.5 had no cp313 wheel (forced a Rust source build on Python 3.13 / cold machines); 0.5.3 ships wheels for 3.12 + 3.13
+einops==0.7.0
+
+# Text encoder (Qwen3 for Klein; Qwen3-VL-4B for Krea 2 — needs transformers >= 4.57)
+transformers==4.57.6
+tokenizers==0.22.2
+sentencepiece==0.2.1
+
+# Dataset config
+toml==0.10.2
+voluptuous==0.15.2
+
+# Image processing
+pillow==11.3.0
+numpy>=1.26.4,<3  # range, not a hard pin — over-constraining numpy breaks pip resolution on some setups (issue #4). torch 2.10 supports numpy 1.26+ and 2.x.
+opencv-python==4.10.0.84
+imageio-ffmpeg>=0.5  # bundled ffmpeg → LoRA Royale exports web-standard H.264 MP4 (Reddit/X/IG), no system ffmpeg needed
+
+# Logging and monitoring
+tensorboard==2.20.0
+tqdm==4.67.1
+
+# HuggingFace
+huggingface-hub==0.34.3
+hf_xet>=1.0  # Xet-backed repos (Comfy-Org/Krea-2 is one) transfer much faster with this than
+             # over plain HTTP — it matters on the 26 GB RAW DiT that fetch_models pulls. Purely
+             # an accelerator: without it huggingface-hub falls back to HTTP and still works.
+
+# Face detection (for data preparation)
+insightface>=0.7.0
+onnxruntime>=1.15.0
+
+# AI Captioning (Florence-2)
+timm>=0.9.0
+
+# Misc
+pyyaml==6.0.3
+packaging==25.0  # Explicit — used by src/fizgig/training/trainer.py for Version parsing
+
+# Status bar / system metrics
+psutil>=5.9  # system-RAM checks (sample-model cache) + status bar

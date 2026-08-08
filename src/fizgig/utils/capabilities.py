@@ -22,6 +22,8 @@ import shutil
 from dataclasses import dataclass, field
 from typing import Optional
 
+from .gpu_backend import is_rocm
+
 logger = logging.getLogger(__name__)
 
 
@@ -38,6 +40,7 @@ def has_host_c_compiler(platform: Optional[str] = None) -> bool:
 @dataclass
 class Capabilities:
     has_cuda: bool = False
+    is_rocm: bool = False
     device_name: str = "cpu"
     sm: tuple = (0, 0)
     vram_gb: float = 0.0        # card total, as reported
@@ -52,8 +55,11 @@ class Capabilities:
 
     def summary(self) -> str:
         if not self.has_cuda:
-            return "no CUDA device"
-        flags = [f"sm_{self.sm[0]}{self.sm[1]}"]
+            return "no GPU device"
+        backend = "ROCm" if self.is_rocm else "CUDA"
+        flags = [backend]
+        if not self.is_rocm:
+            flags.append(f"sm_{self.sm[0]}{self.sm[1]}")
         used = self.vram_gb - self.vram_free_gb
         vram = (f"{self.vram_free_gb:.1f} GB free of {self.vram_gb:.0f} GB"
                 + (f" ({used:.1f} GB already in use)" if used > 1.0 else ""))
@@ -103,10 +109,11 @@ def detect() -> Capabilities:
         return caps
 
     if not torch.cuda.is_available():
-        caps.notes.append("CUDA unavailable")
+        caps.notes.append("GPU unavailable")
         return caps
 
     caps.has_cuda = True
+    caps.is_rocm = is_rocm()
     props = torch.cuda.get_device_properties(0)
     caps.device_name = props.name
     caps.sm = torch.cuda.get_device_capability(0)
@@ -121,15 +128,18 @@ def detect() -> Capabilities:
         caps.vram_free_gb = caps.vram_gb
         caps.notes.append("could not read free VRAM — using card total")
 
-    caps.fp8_matmul = _probe_scaled_mm(torch.float8_e4m3fn)
+    caps.fp8_matmul = _probe_scaled_mm(torch.float8_e4m3fn) if not caps.is_rocm else False
     caps.int8_matmul = _probe_scaled_mm(torch.int8)     # expected False: _scaled_mm is fp8-only
     caps.int8_matmul_train = _probe_int_mm()
 
-    try:    # cuDNN SDPA backend: present from PyTorch 2.5-ish, Ampere and newer
-        from torch.backends.cuda import can_use_cudnn_attention  # noqa: F401
-        caps.cudnn_attention = True
-    except Exception:
-        caps.cudnn_attention = hasattr(__import__("torch").backends.cuda, "cudnn_sdp_enabled")
+    if caps.is_rocm:
+        caps.cudnn_attention = False
+    else:
+        try:    # cuDNN SDPA backend: present from PyTorch 2.5-ish, Ampere and newer
+            from torch.backends.cuda import can_use_cudnn_attention  # noqa: F401
+            caps.cudnn_attention = True
+        except Exception:
+            caps.cudnn_attention = hasattr(__import__("torch").backends.cuda, "cudnn_sdp_enabled")
 
     try:
         import flash_attn  # noqa: F401

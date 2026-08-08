@@ -2191,7 +2191,7 @@ class LoRATrainerGUI:
         """Bottom status panel: stacked VRAM + system-RAM gradient fill bars (with
         per-run peak ticks) on the left, the live sample override on the right,
         and a remembered hide/show toggle. A daemon thread does the reads so the
-        Tk redraw never stalls on an nvidia-smi call."""
+        Tk redraw never stalls on an nvidia-smi / typeperf call."""
         container = tk.Frame(master, bg=COLORS["bg_deep"])
         container.pack(side=tk.BOTTOM, fill=tk.X)
         self._status_container = container
@@ -2331,28 +2331,10 @@ class LoRATrainerGUI:
             pass
 
     def _read_vram(self):
-        """Return (used_bytes, total_bytes) for GPU 0, or None. Prefers pynvml
-        (fast); falls back to a one-shot nvidia-smi query."""
+        """Return (used_bytes, total_bytes) for GPU 0, or None."""
         try:
-            import pynvml
-            if not getattr(self, "_nvml_init", False):
-                pynvml.nvmlInit()
-                self._nvml_handle = pynvml.nvmlDeviceGetHandleByIndex(0)
-                self._nvml_init = True
-            m = pynvml.nvmlDeviceGetMemoryInfo(self._nvml_handle)
-            return int(m.used), int(m.total)
-        except Exception:
-            pass
-        try:
-            import subprocess
-            out = subprocess.run(
-                ["nvidia-smi", "--query-gpu=memory.used,memory.total",
-                 "--format=csv,noheader,nounits"],
-                capture_output=True, text=True, timeout=4,
-                creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
-            )
-            used, total = out.stdout.strip().splitlines()[0].split(",")
-            return int(used) * 1024 * 1024, int(total) * 1024 * 1024
+            from fizgig.utils.vram_monitor import read_gpu_vram
+            return read_gpu_vram()
         except Exception:
             return None
 

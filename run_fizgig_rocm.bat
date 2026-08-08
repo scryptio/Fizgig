@@ -1,0 +1,27 @@
+@echo off
+REM Fizgig launcher for AMD ROCm on Windows.
+REM Sets ROCm/HIP tuning env vars, then starts the consoleless GUI chain.
+cd /d "%~dp0"
+
+echo [AMD-ROCm] Setting environment variables...
+set "MIOPEN_FIND_MODE=2"
+set "FLASH_ATTENTION_TRITON_AMD_ENABLE=TRUE"
+set "PYTORCH_ALLOC_CONF=max_split_size_mb:512,garbage_collection_threshold:0.8"
+set "TORCH_ROCM_AOTRITON_ENABLE_EXPERIMENTAL=1"
+set "FIZGIG_GPU_BACKEND=rocm"
+
+REM BNB_ROCM_VERSION / ROCM_PATH / HIP_PATH — written by install_fizgig_rocm.bat
+REM to match the installed PyTorch ROCm SDK (e.g. 715 for ROCm 7.15).
+if exist "%~dp0rocm_env.bat" (
+    call "%~dp0rocm_env.bat"
+) else if exist "%~dp0venv\Scripts\python.exe" (
+    "%~dp0venv\Scripts\python.exe" "%~dp0write_rocm_env.py" >nul 2>&1
+    if exist "%~dp0rocm_env.bat" call "%~dp0rocm_env.bat"
+)
+if not defined BNB_ROCM_VERSION set "BNB_ROCM_VERSION=715"
+if not defined ROCM_PATH set "ROCM_PATH=%~dp0venv\Lib\site-packages\_rocm_sdk_core"
+if not defined HIP_PATH set "HIP_PATH=%ROCM_PATH%"
+
+echo [AMD-ROCm] BNB_ROCM_VERSION=%BNB_ROCM_VERSION%  ROCM_PATH=%ROCM_PATH%
+
+start "" /b wscript //nologo //b "%~dp0run_silent.vbs"

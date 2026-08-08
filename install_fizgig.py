@@ -3,21 +3,24 @@
 Fizgig Installer
 ================
 Sets up Fizgig with its own Python virtual environment.
-Installs PyTorch built against CUDA 12.8 — required for Klein 9B and Krea 2 training,
-preview rendering, profiling, extraction, and Repair Studio on NVIDIA GPUs.
+Installs PyTorch for NVIDIA CUDA (default) or AMD ROCm — required for Klein 9B and
+Krea 2 training, preview rendering, profiling, extraction, and Repair Studio.
 
 Features:
 - Creates isolated venv for Fizgig dependencies
-- Installs CUDA 12.8 PyTorch (supports RTX 30xx / 40xx / 50xx Blackwell)
+- Installs CUDA 12.8 PyTorch on NVIDIA GPUs (RTX 30xx / 40xx / 50xx Blackwell)
+- Installs ROCm PyTorch on Linux AMD GPUs when /dev/kfd is present (or --platform rocm)
+- Windows AMD: use install_fizgig_rocm.bat instead (ROCm nightly wheels + GPU detection)
 - Installs InsightFace face detection (runs on CPU for GPU independence)
 - Downloads face detection models automatically
 - Installs Florence-2 AI captioning (transformers library; runs on GPU)
 - Creates launcher scripts for Windows/Linux/Mac
-- Verifies CUDA is visible to PyTorch after install
+- Verifies the GPU backend is visible to PyTorch after install
 
 Note: Florence-2 models are auto-downloaded from Hugging Face on first use (~500MB-1.5GB)
 """
 
+import argparse
 import os
 import sys
 import subprocess
@@ -32,6 +35,38 @@ MIN_PYTHON_VERSION = (3, 10)
 SCRIPT_DIR = Path(__file__).parent.absolute()
 VENV_DIR = SCRIPT_DIR / "venv"
 REQUIREMENTS_FILE = SCRIPT_DIR / "requirements.txt"
+REQUIREMENTS_GLOBAL = SCRIPT_DIR / "requirements-global.txt"
+REQUIREMENTS_ROCM_LINUX = SCRIPT_DIR / "requirements-rocm-linux.txt"
+
+
+def detect_gpu_platform() -> str:
+    """Return 'cuda', 'rocm', or 'cpu' based on host hardware."""
+    if platform.system() == "Linux":
+        if os.path.exists("/dev/nvidia0") or shutil.which("nvidia-smi"):
+            return "cuda"
+        if os.path.exists("/dev/kfd"):
+            return "rocm"
+    elif platform.system() == "Windows":
+        if shutil.which("nvidia-smi"):
+            return "cuda"
+        # Windows AMD ROCm uses install_fizgig_rocm.bat (GPU-specific nightly wheels).
+        try:
+            result = subprocess.run(
+                ["wmic", "path", "win32_videocontroller", "get", "name"],
+                capture_output=True, text=True, timeout=10,
+            )
+            if result.returncode == 0 and "AMD" in result.stdout and "Radeon" in result.stdout:
+                return "rocm"
+        except Exception:
+            pass
+    return "cpu"
+
+
+def resolve_platform(requested: str) -> str:
+    if requested != "detect":
+        return requested
+    detected = detect_gpu_platform()
+    return detected if detected != "cpu" else "cuda"
 
 
 def print_header(text):
@@ -94,8 +129,8 @@ def get_python_path():
     return VENV_DIR / "bin" / "python"
 
 
-def install_dependencies():
-    """Install dependencies from requirements.txt"""
+def install_dependencies(gpu_platform: str = "cuda"):
+    """Install dependencies for the chosen GPU backend."""
     python_path = get_python_path()
 
     if not python_path.exists():
@@ -106,22 +141,30 @@ def install_dependencies():
     subprocess.run([str(python_path), "-m", "pip", "install", "--upgrade", "pip"], check=True)
 
     print("Installing uv...")
-    # shell=False (list form) with internal Path constants — not injectable
     subprocess.run([str(python_path), "-m", "pip", "install", "--upgrade", "uv"], check=True)
 
-    print(f"Installing dependencies from: {REQUIREMENTS_FILE} (using uv)")
+    if gpu_platform == "rocm":
+        if platform.system() == "Windows":
+            print("ERROR: Windows AMD ROCm is not supported by this script.")
+            print("Use install_fizgig_rocm.bat instead — it installs up-to-date ROCm nightly wheels.")
+            return False
+        if not REQUIREMENTS_GLOBAL.exists() or not REQUIREMENTS_ROCM_LINUX.exists():
+            print("ERROR: requirements-global.txt or requirements-rocm-linux.txt is missing.")
+            return False
+        req_files = [REQUIREMENTS_GLOBAL, REQUIREMENTS_ROCM_LINUX]
+        print("Installing ROCm PyTorch + shared dependencies (Linux)...")
+    else:
+        req_files = [REQUIREMENTS_FILE]
+        print(f"Installing dependencies from: {REQUIREMENTS_FILE} (CUDA, using uv)")
+
     print("(This may take a few minutes for PyTorch download...)")
 
     try:
-        # shell=False (list form) with internal Path constants — not injectable.
-        # --link-mode=copy: the uv cache and the venv are often on different drives
-        # (e.g. cache on C:, install on S:), where hardlinking isn't possible — copy
-        # mode avoids the noisy "Failed to hardlink" warning.
-        subprocess.run(
-            [str(python_path), "-m", "uv", "pip", "install", "--link-mode", "copy",
-             "--index-strategy", "unsafe-best-match", "-r", str(REQUIREMENTS_FILE)],
-            check=True
-        )
+        cmd = [str(python_path), "-m", "uv", "pip", "install", "--link-mode", "copy",
+               "--index-strategy", "unsafe-best-match"]
+        for req in req_files:
+            cmd.extend(["-r", str(req)])
+        subprocess.run(cmd, check=True)
         print("Dependencies installed successfully.")
         return True
     except subprocess.CalledProcessError as e:
@@ -129,9 +172,8 @@ def install_dependencies():
         return False
 
 
-def verify_cuda():
-    """Probe torch.cuda after install so users learn about driver mismatches
-    at install time rather than mid-training."""
+def verify_gpu():
+    """Probe torch.cuda after install (CUDA or ROCm/HIP backend)."""
     python_path = get_python_path()
     probe_script = '''
 import sys
@@ -145,16 +187,21 @@ if torch.cuda.is_available():
     try:
         name = torch.cuda.get_device_name(0)
         vram_gb = torch.cuda.get_device_properties(0).total_memory / (1024 ** 3)
-        print(f"OK  CUDA visible: {name} ({vram_gb:.1f} GB VRAM)")
-        print(f"    PyTorch {torch.__version__}  |  CUDA runtime {torch.version.cuda}")
+        hip = getattr(torch.version, "hip", None)
+        rocm = getattr(torch.version, "rocm", None)
+        backend = "ROCm/HIP" if (hip or rocm or "+rocm" in torch.__version__.lower()) else "CUDA"
+        runtime = rocm or hip or getattr(torch.version, "cuda", None) or "unknown"
+        print(f"OK  {backend} visible: {name} ({vram_gb:.1f} GB VRAM)")
+        print(f"    PyTorch {torch.__version__}  |  runtime {runtime}")
         sys.exit(0)
     except Exception as e:
-        print(f"WARN CUDA reported available but device query failed: {e}")
+        print(f"WARN GPU reported available but device query failed: {e}")
         sys.exit(1)
 else:
     print("WARN PyTorch installed but torch.cuda.is_available() is False.")
-    print("     Fizgig training (Klein 9B / Krea 2) needs a CUDA-capable GPU.")
-    print("     If you have one, update your NVIDIA driver to 555+ and re-run this installer.")
+    print("     Fizgig training (Klein 9B / Krea 2) needs a CUDA- or ROCm-capable GPU.")
+    print("     NVIDIA: update driver to 555+ (Windows) / 550+ (Linux) and re-run.")
+    print("     AMD Windows: use install_fizgig_rocm.bat for ROCm nightly wheels.")
     sys.exit(1)
 '''
     try:
@@ -168,8 +215,12 @@ else:
             print(result.stderr.strip())
         return result.returncode == 0
     except Exception as e:
-        print(f"Note: CUDA probe skipped: {e}")
+        print(f"Note: GPU probe skipped: {e}")
         return True  # Don't fail installation
+
+
+# Backward-compatible alias
+verify_cuda = verify_gpu
 
 
 def download_insightface_models():
@@ -224,7 +275,43 @@ except Exception as e:
         return True  # Don't fail installation
 
 
-def create_launcher_scripts():
+def verify_rocm_vram():
+    """Linux ROCm: probe amd-smi/rocm-smi for status-bar VRAM reads (informational)."""
+    if platform.system() != "Linux":
+        return True
+    python_path = get_python_path()
+    probe_script = '''
+import sys
+sys.path.insert(0, "src")
+try:
+    from fizgig.utils.vram_monitor import _read_vram_amd_smi_cli, _read_vram_rocm_smi
+    hit = _read_vram_amd_smi_cli() or _read_vram_rocm_smi()
+    if hit:
+        used, total = hit
+        print(f"OK  VRAM monitor: {used / (1024**3):.1f} / {total / (1024**3):.1f} GB in use")
+        sys.exit(0)
+    print("WARN VRAM monitor: amd-smi and rocm-smi unavailable — status bar may show")
+    print("     allocator-only usage. Install amdrocm-amdsmi (see requirements-rocm-linux.txt).")
+    sys.exit(1)
+except Exception as e:
+    print(f"WARN VRAM monitor probe failed: {e}")
+    sys.exit(1)
+'''
+    try:
+        result = subprocess.run(
+            [str(python_path), "-c", probe_script],
+            capture_output=True, text=True,
+            cwd=str(SCRIPT_DIR),
+        )
+        if result.stdout.strip():
+            print(result.stdout.strip())
+        return result.returncode == 0
+    except Exception as e:
+        print(f"Note: VRAM monitor probe skipped: {e}")
+        return True
+
+
+def create_launcher_scripts(gpu_platform: str = "cuda"):
     """Verify/create launcher scripts.
 
     Windows: run_fizgig.bat ships WITH the repo (the consoleless chain: .bat -> run_silent.vbs
@@ -240,23 +327,41 @@ def create_launcher_scripts():
         print(f"WARNING: {bat_path} is missing — restore it with `git checkout -- run_fizgig.bat`")
 
     # Linux/Mac shell script (not shipped in the repo — generated here)
-    sh_content = '''#!/bin/bash
+    rocm_env = ""
+    if gpu_platform == "rocm" or (platform.system() == "Linux" and os.path.exists("/dev/kfd")):
+        rocm_env = """\
+export MIOPEN_FIND_MODE=2
+export FLASH_ATTENTION_TRITON_AMD_ENABLE=TRUE
+export TORCH_ROCM_AOTRITON_ENABLE_EXPERIMENTAL=1
+export PYTORCH_ALLOC_CONF=max_split_size_mb:512,garbage_collection_threshold:0.8
+export FIZGIG_GPU_BACKEND=rocm
+for _d in /opt/rocm/core-*/bin /opt/rocm/bin; do
+  [ -d "$_d" ] && PATH="$_d:$PATH"
+done
+export PATH
+if [ -d /opt/rocm/lib ]; then
+  export LD_LIBRARY_PATH="/opt/rocm/lib${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
+fi
+"""
+
+    sh_content = f'''#!/bin/bash
 cd "$(dirname "$0")"
 source venv/bin/activate
-python lora_trainer_gui.py
+{rocm_env}python lora_trainer_gui.py
 '''
 
     sh_path = SCRIPT_DIR / "run_fizgig.sh"
-    if not sh_path.exists():
+    existed = sh_path.exists()
+    if not existed or gpu_platform == "rocm":
         with open(sh_path, 'w', newline='\n') as f:
             f.write(sh_content)
         if platform.system() != "Windows":
             os.chmod(sh_path, 0o755)
-        print(f"Created: {sh_path}")
+        print(f"{'Updated' if existed else 'Created'}: {sh_path}")
     return True
 
 
-def print_summary():
+def print_summary(gpu_platform: str = "cuda"):
     """Print installation summary and next steps"""
     print_header("Installation Complete!")
 
@@ -264,10 +369,17 @@ def print_summary():
     print("\nTo launch Fizgig:")
 
     if platform.system() == "Windows":
-        print(f"  Double-click: {SCRIPT_DIR / 'run_fizgig.bat'}")
-        print("  Or run: .\\run_fizgig.bat")
+        if gpu_platform == "rocm":
+            print(f"  Double-click: {SCRIPT_DIR / 'run_fizgig_rocm.bat'}")
+            print("  Or run: .\\run_fizgig_rocm.bat")
+        else:
+            print(f"  Double-click: {SCRIPT_DIR / 'run_fizgig.bat'}")
+            print("  Or run: .\\run_fizgig.bat")
     else:
         print(f"  Run: ./run_fizgig.sh")
+
+    backend = "ROCm/HIP" if gpu_platform == "rocm" else "CUDA"
+    print(f"\nGPU backend: {backend}")
 
     print("\nFace Detection:")
     print("  - InsightFace models will download on first use (~300MB)")
@@ -277,9 +389,20 @@ def print_summary():
     print("\nAI Captioning (Florence-2):")
     print("  - Florence models auto-download from Hugging Face on first use")
     print("  - Model sizes: base (~500MB), large (~1.5GB)")
-    print("  - Runs on GPU via CUDA 12.8 PyTorch (fast)")
+    print("  - Runs on GPU via PyTorch (CUDA or ROCm)")
 
     print("\n" + "=" * 60)
+
+
+def parse_args():
+    parser = argparse.ArgumentParser(description="Install Fizgig and its dependencies.")
+    parser.add_argument(
+        "--platform",
+        choices=("detect", "cuda", "rocm"),
+        default="detect",
+        help="GPU backend to install (default: auto-detect)",
+    )
+    return parser.parse_args()
 
 
 def check_msvc_build_tools():
@@ -333,8 +456,15 @@ def check_msvc_build_tools():
 
 
 def main():
+    args = parse_args()
+    gpu_platform = resolve_platform(args.platform)
+
     print_header("Fizgig Installer — Klein 9B & Krea 2 LoRA Workbench")
     print(f"Installation directory: {SCRIPT_DIR}")
+    if gpu_platform == "rocm":
+        print("GPU backend: AMD ROCm")
+    else:
+        print("GPU backend: NVIDIA CUDA 12.8")
 
     # Step 1: Check Python version
     print_step(1, "Checking Python version")
@@ -347,13 +477,18 @@ def main():
         sys.exit(1)
 
     # Step 3: Install dependencies
-    print_step(3, "Installing dependencies")
-    if not install_dependencies():
+    print_step(3, f"Installing dependencies ({gpu_platform.upper()})")
+    if not install_dependencies(gpu_platform):
         sys.exit(1)
 
-    # Step 4: Verify CUDA is visible to PyTorch
-    print_step(4, "Verifying CUDA availability")
-    verify_cuda()  # Don't fail on this — user may be on a CPU-only machine for prep only
+    # Step 4: Verify GPU is visible to PyTorch
+    print_step(4, "Verifying GPU availability")
+    verify_gpu()  # Don't fail on this — user may be on a CPU-only machine for prep only
+
+    if gpu_platform == "rocm" and platform.system() == "Linux":
+        print("\n[ROCm] Checking VRAM monitor (amd-smi / rocm-smi)...")
+        print("-" * 40)
+        verify_rocm_vram()
 
     # Step 5: Download InsightFace models
     print_step(5, "Downloading face detection models")
@@ -361,7 +496,7 @@ def main():
 
     # Step 6: Create launcher scripts
     print_step(6, "Creating launcher scripts")
-    if not create_launcher_scripts():
+    if not create_launcher_scripts(gpu_platform):
         sys.exit(1)
 
     # Step 7: MSVC C++ Build Tools check (torch.compile's inductor backend needs them on
@@ -370,7 +505,7 @@ def main():
     check_msvc_build_tools()
 
     # Print summary
-    print_summary()
+    print_summary(gpu_platform)
 
 
 if __name__ == "__main__":
