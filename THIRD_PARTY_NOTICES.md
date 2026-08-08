@@ -2,10 +2,12 @@
 
 Fizgig is licensed under the Apache License, Version 2.0 (see `LICENSE`).
 
-It includes code derived from the third-party projects listed below. Each is
-adapted under its own license; all are permissive and compatible with
-Apache-2.0. Where a file was modified, that is noted — Fizgig's changes are
-themselves released under Apache-2.0.
+It includes code derived from the third-party projects listed below. Each
+component remains under its upstream license. Permissive components (Apache-2.0,
+MIT) are compatible with Fizgig's Apache-2.0 license; where those files were
+modified, Fizgig's changes are released under Apache-2.0. Copyleft components
+(GPL-3.0) are marked separately and stay under GPL-3.0 — see the comfyui-rocm
+section below.
 
 ---
 
@@ -85,6 +87,34 @@ Upstream: https://github.com/huggingface/diffusers
 `AutoencoderKLQwenImage` implementation.
 Copyright 2025 The Qwen-Image Team, Wan Team, and The HuggingFace Team.
 All rights reserved. Licensed under the Apache License, Version 2.0.
+
+---
+
+## comfyui-rocm — GNU General Public License v3.0
+
+Upstream: https://github.com/patientx/comfyui-rocm
+Copyright the comfyui-rocm authors (patientx and contributors).
+
+comfyui-rocm is a Windows ROCm build of ComfyUI. Fizgig's AMD ROCm Windows
+installer uses code from that project as follows:
+
+- `detect_gpu.py` — copied verbatim from comfyui-rocm's `detect_gpu.py`
+  (AMD GPU → gfx architecture detection on Windows). **Unmodified.** This file
+  is **GPL-3.0 only**; it is not relicensed under Apache-2.0.
+- `install_fizgig_rocm.bat` — Fizgig-authored installer that **calls**
+  `detect_gpu.py` and follows the same portable-Python / ROCm-wheel install
+  patterns as comfyui-rocm's `install.bat` (adapted for Fizgig's venv and
+  requirements). The batch file itself is Apache-2.0; the bundled
+  `detect_gpu.py` remains GPL-3.0.
+
+`detect_gpu.py` is free software: you may redistribute and/or modify it under
+the terms of the GNU General Public License as published by the Free Software
+Foundation, either version 3 of the License, or (at your option) any later
+version. A copy of the GPL-3.0 text is available at
+https://www.gnu.org/licenses/gpl-3.0.html and in comfyui-rocm's `LICENSE` file.
+
+To receive source for `detect_gpu.py`, use this repository or the upstream
+comfyui-rocm repository linked above.
 
 ---
 

@@ -441,7 +441,7 @@ If Fizgig saves you time or helps you make better LoRAs, consider supporting dev
 
 ## License
 
-Fizgig is open source under the **[Apache License 2.0](LICENSE)** — free to use, modify, and redistribute, including commercially, with attribution and no warranty. It includes third-party components under compatible permissive licenses (musubi-tuner — Apache-2.0; ai-toolkit — MIT; Diffusers / FLUX — Apache-2.0); see **[THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md)**.
+Fizgig is open source under the **[Apache License 2.0](LICENSE)** — free to use, modify, and redistribute, including commercially, with attribution and no warranty. It includes third-party components under their respective licenses (musubi-tuner — Apache-2.0; ai-toolkit — MIT; Diffusers / FLUX — Apache-2.0; comfyui-rocm `detect_gpu.py` — GPL-3.0); see **[THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md)**.
 
 Copyright © 2026 Peter Neill.
 

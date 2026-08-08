@@ -1,4 +1,8 @@
 @echo off
+REM Fizgig ROCm Windows installer.
+REM Uses detect_gpu.py (GPL-3.0, from comfyui-rocm — see THIRD_PARTY_NOTICES.md)
+REM and portable-Python / ROCm-wheel patterns adapted from comfyui-rocm install.bat:
+REM   https://github.com/patientx/comfyui-rocm
 setlocal enabledelayedexpansion
 title Fizgig ROCm Installer
 cd /d "%~dp0"
