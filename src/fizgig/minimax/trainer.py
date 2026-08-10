@@ -913,6 +913,28 @@ class MovementGovernor:
                 f"effective LR at {100 * self.mult:.0f}% of the configured value{tail}")
 
 
+def should_reassert_lr(*, resuming, adaptive, governor, warmup_steps, global_step) -> bool:
+    """Does anything write param_group['lr'] from here on? If not, a resume must reassert the
+    CONFIGURED rate.
+
+    torch's optimizer.load_state_dict restores the saved param_groups INCLUDING lr, and the
+    step loop only writes lr while warmup is still ramping or the governor is live. Resuming a
+    governed run with the governor off therefore inherited that state's last throttled rate and
+    kept it for the whole run (measured on a real run: 3.28e-5 against a configured 2e-4).
+
+    The subtle case, and the one the first version of this fix got wrong: warmup CONFIGURED but
+    already FINISHED. warmup_steps > 0 is not the question — `global_step < warmup_steps` is."""
+    if not resuming:
+        return False
+    if adaptive is not None:
+        return False        # adaptive owns the LR; its restored mid-flight value is correct
+    if governor is not None:
+        return False        # the governor rewrites lr every step
+    if warmup_steps and global_step < warmup_steps:
+        return False        # the ramp rewrites lr every step until it ends
+    return True
+
+
 class EMAWeights:
     """Exponential moving average of the trainable adapter — the smooth center of a rough
     trajectory.
@@ -1685,6 +1707,18 @@ def train_minimax(
         # mid-ramp state would have left partway up.
         for _g in optimizer.param_groups:
             _g["_warmup_base_lr"] = learning_rate * float(_g.get("lr_scale", 1.0))
+    # WHOEVER OWNS THE LR SETS IT — and when nobody does, the configured value must win.
+    # NOT an elif on the block above: warmup CONFIGURED but already FINISHED lands here too,
+    # and that was exactly the case the first version of this fix missed.
+    if should_reassert_lr(resuming=bool(resume_state_dir), adaptive=adaptive, governor=governor,
+                          warmup_steps=warmup_steps, global_step=global_step):
+        _stale = float(optimizer.param_groups[0].get("lr", learning_rate))
+        for _g in optimizer.param_groups:
+            _g["lr"] = learning_rate * float(_g.get("lr_scale", 1.0))
+        if abs(_stale - learning_rate) > 1e-12:
+            logger.info("[resume] the saved state carried lr=%.3e (a throttled value from when "
+                        "it was written); nothing is modulating the LR this run, so the "
+                        "configured %.3e is reasserted.", _stale, learning_rate)
 
     def _run_provenance():
         """What actually produced this LoRA — the facts you need to compare two of them.
