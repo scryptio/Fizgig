@@ -75,8 +75,9 @@ docs/PHONE_MONITOR_PLAN.md
 docs/MINIMAX_REFERENCE_NOTES.md
 docs/MINIMAX_BLOCKS.md
 
-# Written by install_fizgig_rocm.bat (BNB_ROCM_VERSION / ROCM_PATH for bitsandbytes)
+# Written by install_fizgig_rocm.bat / install_fizgig_rocm_linux.sh (BNB_ROCM_VERSION / ROCM_PATH)
 rocm_env.bat
+rocm_env.sh
 gpu_detect_debug.log
 
 # Portable Python downloaded by install_fizgig_rocm.bat when py -3.12 is unavailable
