@@ -119,7 +119,7 @@ if !USE_LEGACY_URL!==1 (
         python -m pip install rocm[devel,libraries] --index-url https://rocm.nightlies.amd.com/v2-staging/gfx942-dcgpu/
         if errorlevel 1 goto :install_failed
         rocm-sdk init
-        python -m pip install --index-url https://rocm.nightlies.amd.com/v2-staging/gfx942-dcgpu/ torch torchaudio torchvision
+        python -m pip install --index-url https://rocm.nightlies.amd.com/v2-staging/gfx942-dcgpu/ torch torchvision
         if errorlevel 1 goto :install_failed
     )
     if /I "!arch!"=="gfx950" (
@@ -127,14 +127,14 @@ if !USE_LEGACY_URL!==1 (
         python -m pip install rocm[devel,libraries] --index-url https://rocm.nightlies.amd.com/v2-staging/gfx950-dcgpu/
         if errorlevel 1 goto :install_failed
         rocm-sdk init
-        python -m pip install --index-url https://rocm.nightlies.amd.com/v2-staging/gfx950-dcgpu/ torch torchaudio torchvision
+        python -m pip install --index-url https://rocm.nightlies.amd.com/v2-staging/gfx950-dcgpu/ torch torchvision
         if errorlevel 1 goto :install_failed
     )
     goto :install_global
 )
 
 echo Installing ROCm PyTorch ^(multi-arch nightly^) for !arch!...
-python -m pip install "torch[device-!arch!]" "torchvision[device-!arch!]" torchaudio rocm-sdk-devel --index-url https://rocm.nightlies.amd.com/whl-multi-arch/
+python -m pip install "torch[device-!arch!]" "torchvision[device-!arch!]" rocm-sdk-devel --index-url https://rocm.nightlies.amd.com/whl-multi-arch/
 if errorlevel 1 goto :install_failed
 
 :install_global
