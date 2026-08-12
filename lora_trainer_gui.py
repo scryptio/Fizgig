@@ -2387,7 +2387,7 @@ class LoRATrainerGUI:
     def _poll_status_bar(self):
         vram, ram = getattr(self, "_status_latest", (None, None))
         visible = getattr(self, "_status_bar_visible", True)
-        if vram:
+        if vram and vram[1] > 0:
             u, t = vram
             self._vram_peak = max(self._vram_peak, u)
             if visible:

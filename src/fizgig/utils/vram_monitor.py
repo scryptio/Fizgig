@@ -54,25 +54,46 @@ def _total_vram_from_torch() -> Optional[int]:
     return None
 
 
+def _to_bytes(num: float, unit: Optional[str]) -> int:
+    u = (unit or "MB").upper()
+    scale = {"B": 1, "KB": 1024, "KIB": 1024, "MB": 1024 ** 2, "MIB": 1024 ** 2,
+             "GB": 1024 ** 3, "GIB": 1024 ** 3}.get(u, 1024 ** 2)
+    return int(num * scale)
+
+
+def _parse_vram_mb(value) -> Optional[int]:
+    """Parse amd-smi VRAM fields — API reports vram_used/vram_total in megabytes."""
+    if value is None or isinstance(value, bool):
+        return None
+    if isinstance(value, (int, float)):
+        return _to_bytes(float(value), "MB")
+    if isinstance(value, dict):
+        if "value" in value:
+            unit = value.get("unit") or value.get("Unit") or "MB"
+            try:
+                return _to_bytes(float(value["value"]), str(unit))
+            except (TypeError, ValueError, KeyError):
+                pass
+        return None
+    if isinstance(value, str):
+        m = re.match(r"^([\d.]+)\s*(B|KB|MB|GB|MiB|GiB|KIB|MIB|GIB)?$", value.strip(), re.I)
+        if m:
+            return _to_bytes(float(m.group(1)), m.group(2) or "MB")
+    return None
+
+
 def _coerce_bytes(value) -> Optional[int]:
     if value is None:
         return None
     if isinstance(value, bool):
         return None
-    if isinstance(value, str):
-        m = re.match(r"^([\d.]+)\s*(B|KB|MB|GB|MiB|GiB|KIB|MIB|GIB)?$", value.strip(), re.I)
-        if m:
-            num = float(m.group(1))
-            unit = (m.group(2) or "B").upper()
-            scale = {"B": 1, "KB": 1024, "KIB": 1024, "MB": 1024 ** 2, "MIB": 1024 ** 2,
-                     "GB": 1024 ** 3, "GIB": 1024 ** 3}.get(unit, 1)
-            return int(num * scale)
-        return None
-    if isinstance(value, int):
-        return value
-    if isinstance(value, float):
-        return int(value)
     if isinstance(value, dict):
+        if "value" in value:
+            unit = value.get("unit") or value.get("Unit") or "B"
+            try:
+                return _to_bytes(float(value["value"]), str(unit))
+            except (TypeError, ValueError, KeyError):
+                pass
         for key in (
             "vram_used", "vram_total", "used", "total",
             "VRAM Used Memory (B)", "VRAM Total Memory (B)",
@@ -87,14 +108,205 @@ def _coerce_bytes(value) -> Optional[int]:
             hit = _coerce_bytes(v)
             if hit is not None:
                 return hit
+        return None
+    if isinstance(value, str):
+        m = re.match(r"^([\d.]+)\s*(B|KB|MB|GB|MiB|GiB|KIB|MIB|GIB)?$", value.strip(), re.I)
+        if m:
+            num = float(m.group(1))
+            unit = (m.group(2) or "B").upper()
+            scale = {"B": 1, "KB": 1024, "KIB": 1024, "MB": 1024 ** 2, "MIB": 1024 ** 2,
+                     "GB": 1024 ** 3, "GIB": 1024 ** 3}.get(unit, 1)
+            return int(num * scale)
+        return None
+    if isinstance(value, int):
+        return value
+    if isinstance(value, float):
+        return int(value)
     return None
 
 
-def _to_bytes(num: float, unit: Optional[str]) -> int:
-    u = (unit or "MB").upper()
-    scale = {"B": 1, "KB": 1024, "KIB": 1024, "MB": 1024 ** 2, "MIB": 1024 ** 2,
-             "GB": 1024 ** 3, "GIB": 1024 ** 3}.get(u, 1024 ** 2)
-    return int(num * scale)
+def _vram_pair_from_monitor_node(node: dict) -> Optional[tuple[int, int]]:
+    """Extract used/total from one amd-smi monitor GPU object (VRAM fields are MB)."""
+    if not isinstance(node, dict):
+        return None
+
+    def _pair(used_val, total_val, parser=_parse_vram_mb) -> Optional[tuple[int, int]]:
+        used = parser(used_val)
+        total = parser(total_val)
+        if used is not None and total is not None and total > 0:
+            return int(used), int(total)
+        return None
+
+    for used_key, total_key, parser in (
+        ("vram_used", "vram_total", _parse_vram_mb),
+        ("VRAM_USED", "VRAM_TOTAL", _parse_vram_mb),
+        ("VRAM Used Memory (B)", "VRAM Total Memory (B)", _coerce_bytes),
+    ):
+        if used_key in node and total_key in node:
+            hit = _pair(node[used_key], node[total_key], parser)
+            if hit:
+                return hit
+
+    for block_key in ("vram_usage", "memory_usage", "vram", "memory"):
+        block = node.get(block_key)
+        if not isinstance(block, dict):
+            continue
+        for used_key, total_key, parser in (
+            ("vram_used", "vram_total", _parse_vram_mb),
+            ("VRAM_USED", "VRAM_TOTAL", _parse_vram_mb),
+        ):
+            if used_key in block and total_key in block:
+                hit = _pair(block[used_key], block[total_key], parser)
+                if hit:
+                    return hit
+        if isinstance(block.get("size"), dict) and "vram_used" in block:
+            hit = _pair(block.get("vram_used"), block["size"], _parse_vram_mb)
+            if hit:
+                return hit
+    return None
+
+
+def _gpu_index(node: dict) -> Optional[int]:
+    gpu = node.get("gpu")
+    if isinstance(gpu, int):
+        return gpu
+    if isinstance(gpu, str) and gpu.isdigit():
+        return int(gpu)
+    return None
+
+
+def _monitor_vram_used_by_gpu(data) -> dict[int, int]:
+    """gpu index -> used bytes from amd-smi monitor JSON."""
+    out: dict[int, int] = {}
+
+    def _scan(node):
+        if isinstance(node, dict):
+            idx = _gpu_index(node)
+            if idx is not None and "vram_used" in node:
+                used = _parse_vram_mb(node["vram_used"])
+                if used is not None:
+                    out[idx] = int(used)
+            for v in node.values():
+                _scan(v)
+        elif isinstance(node, list):
+            for item in node:
+                _scan(item)
+
+    _scan(data)
+    return out
+
+
+def _static_vram_total_by_gpu(data) -> dict[int, int]:
+    """gpu index -> total bytes from amd-smi static --vram JSON."""
+    out: dict[int, int] = {}
+
+    def _scan(node):
+        if isinstance(node, dict):
+            idx = _gpu_index(node)
+            vram = node.get("vram")
+            if idx is not None and isinstance(vram, dict):
+                total = _parse_vram_mb(vram.get("size"))
+                if total is not None:
+                    out[idx] = int(total)
+            for v in node.values():
+                _scan(v)
+        elif isinstance(node, list):
+            for item in node:
+                _scan(item)
+
+    _scan(data)
+    return out
+
+
+def _hip_device_total_bytes() -> Optional[int]:
+    try:
+        import torch
+        if torch.cuda.is_available():
+            return int(torch.cuda.get_device_properties(0).total_memory)
+    except Exception:
+        pass
+    return None
+
+
+def _pick_amd_gpu_index(totals_by_gpu: dict[int, int]) -> Optional[int]:
+    """Pick the GPU index Fizgig runs on — matches HIP device 0 VRAM when possible."""
+    if not totals_by_gpu:
+        return None
+    hip_total = _hip_device_total_bytes()
+    if hip_total is not None:
+        return min(totals_by_gpu, key=lambda g: abs(totals_by_gpu[g] - hip_total))
+    return max(totals_by_gpu, key=lambda g: totals_by_gpu[g])
+
+
+def _merge_amd_smi_vram(static_data, monitor_data) -> Optional[tuple[int, int]]:
+    """Use static --vram for capacity (accurate) + monitor for used (live)."""
+    totals = _static_vram_total_by_gpu(static_data) if static_data else {}
+    used_map = _monitor_vram_used_by_gpu(monitor_data) if monitor_data else {}
+    if totals:
+        gpu = _pick_amd_gpu_index(totals)
+        if gpu is not None:
+            total = totals[gpu]
+            used = used_map.get(gpu, 0)
+            return int(used), int(total)
+    # No static — fall back to monitor pairs, still prefer HIP-matched total.
+    pairs: dict[int, tuple[int, int]] = {}
+    if monitor_data:
+        def _scan(node):
+            if isinstance(node, dict):
+                idx = _gpu_index(node)
+                if idx is not None:
+                    hit = _vram_pair_from_monitor_node(node)
+                    if hit:
+                        pairs[idx] = hit
+                for v in node.values():
+                    _scan(v)
+            elif isinstance(node, list):
+                for item in node:
+                    _scan(item)
+        _scan(monitor_data)
+    if pairs:
+        gpu = _pick_amd_gpu_index({g: t for g, (_u, t) in pairs.items()})
+        if gpu is not None:
+            return pairs[gpu]
+    return _best_vram_pair(list(pairs.values()))
+
+
+def _collect_amd_smi_monitor_pairs(data) -> list[tuple[int, int]]:
+    """Collect VRAM pairs from amd-smi monitor JSON (not static-only size blobs)."""
+    hits: list[tuple[int, int]] = []
+
+    def _walk(node):
+        if isinstance(node, dict):
+            hit = _vram_pair_from_monitor_node(node)
+            if hit:
+                hits.append(hit)
+            for v in node.values():
+                _walk(v)
+        elif isinstance(node, list):
+            for item in node:
+                _walk(item)
+
+    _walk(data)
+    return hits
+
+
+def _best_vram_pair(pairs: list[tuple[int, int]], min_total: int = 512 * 1024 * 1024) -> Optional[tuple[int, int]]:
+    """Prefer the GPU with the largest VRAM total (skip iGPU / empty entries)."""
+    valid = [(u, t) for u, t in pairs if t >= min_total]
+    if not valid:
+        valid = [(u, t) for u, t in pairs if t > 0]
+    if not valid:
+        return None
+    return max(valid, key=lambda x: x[1])
+
+
+def _parse_vram_json(data) -> Optional[tuple[int, int]]:
+    pairs = _collect_amd_smi_monitor_pairs(data)
+    hit = _best_vram_pair(pairs)
+    if hit:
+        return hit
+    # Monitor JSON missing used — do not invent used=0 from unrelated fields.
+    return None
 
 
 def _linux_rocm_cli_env() -> dict[str, str]:
@@ -163,7 +375,12 @@ def _find_amd_smi() -> Optional[str]:
                 if name == "amd-smi":
                     _amd_smi_bin = candidate
                     return candidate
-    for pattern in ("/opt/rocm/core-*/bin/amd-smi", "/opt/rocm/bin/amd-smi"):
+    for pattern in (
+        "/opt/rocm/core-*/bin/amd-smi",
+        "/opt/rocm/bin/amd-smi",
+        "venv/bin/amd-smi",
+        "*/venv/bin/amd-smi",
+    ):
         for candidate in sorted(glob.glob(pattern)):
             if os.access(candidate, os.X_OK):
                 _amd_smi_bin = candidate
@@ -172,56 +389,15 @@ def _find_amd_smi() -> Optional[str]:
     return None
 
 
-def _parse_vram_json(data) -> Optional[tuple[int, int]]:
-    used_keys = (
-        "VRAM Total Used Memory (B)", "VRAM Used Memory (B)", "VRAM_USED",
-        "vram_used", "Used Memory (B)", "used", "mem_usage", "vram_used_mb",
-    )
-    total_keys = (
-        "VRAM Total Memory (B)", "VRAM_TOTAL", "vram_total", "Total Memory (B)",
-        "total", "SIZE", "size", "vram_total_mb",
-    )
-
-    def _walk(node):
-        if isinstance(node, dict):
-            used = total = None
-            for k in used_keys:
-                if k in node and node[k] is not None:
-                    used = _coerce_bytes(node[k])
-                    if used is not None:
-                        break
-            for k in total_keys:
-                if k in node and node[k] is not None:
-                    total = _coerce_bytes(node[k])
-                    if total is not None:
-                        break
-            if used is not None and total is not None:
-                return int(used), int(total)
-            for v in node.values():
-                hit = _walk(v)
-                if hit:
-                    return hit
-        elif isinstance(node, list):
-            for item in node:
-                hit = _walk(item)
-                if hit:
-                    return hit
-        return None
-
-    return _walk(data)
-
-
 def _parse_amd_smi_monitor_text(text: str) -> Optional[tuple[int, int]]:
-    """Parse ``amd-smi monitor`` text — GPU 0 row, VRAM_USED / VRAM_TOTAL columns."""
+    """Parse ``amd-smi monitor`` text — pick the GPU row with the largest VRAM total."""
+    best: Optional[tuple[int, int]] = None
     for line in text.splitlines():
         if line.startswith("GPU") or not line.strip():
             continue
         parts = line.split()
         if len(parts) < 2 or not parts[0].isdigit():
             continue
-        if parts[0] != "0":
-            continue
-        # ... N/A 0 % 14 MB 96432 MB  -> last two numeric+unit pairs
         nums: list[tuple[float, Optional[str]]] = []
         i = 0
         while i < len(parts):
@@ -236,8 +412,9 @@ def _parse_amd_smi_monitor_text(text: str) -> Optional[tuple[int, int]]:
         if len(nums) >= 2:
             used = _to_bytes(nums[-2][0], nums[-2][1])
             total = _to_bytes(nums[-1][0], nums[-1][1])
-            return used, total
-    return None
+            if total > 0 and (best is None or total > best[1]):
+                best = (used, total)
+    return best
 
 
 def _read_vram_amd_smi_cli() -> Optional[tuple[int, int]]:
@@ -247,29 +424,38 @@ def _read_vram_amd_smi_cli() -> Optional[tuple[int, int]]:
     bin_path = _amd_smi_bin
     assert bin_path
 
+    static_text = _run_linux_cli([bin_path, "static", "--vram", "--json"])
+    static_data = None
+    if static_text:
+        try:
+            static_data = json.loads(static_text)
+        except json.JSONDecodeError:
+            static_data = None
+
     for extra in (
-        ["monitor", "--vram-usage", "--json"],
         ["monitor", "-v", "--json"],
-        ["--json"],
-        ["static", "--vram", "--json"],
+        ["monitor", "--vram-usage", "--json"],
+        ["monitor", "--vram-usage", "-v", "--json"],
+        ["monitor", "--json"],
     ):
         text = _run_linux_cli([bin_path, *extra])
         if not text:
             continue
         try:
-            hit = _parse_vram_json(json.loads(text))
-            if hit:
+            monitor_data = json.loads(text)
+            hit = _merge_amd_smi_vram(static_data, monitor_data)
+            if hit and hit[1] > 0:
                 return hit
         except json.JSONDecodeError:
             pass
         hit = _parse_amd_smi_monitor_text(text)
-        if hit:
+        if hit and hit[1] > 0:
             return hit
 
     text = _run_linux_cli([bin_path, "monitor", "--vram-usage"])
     if text:
         hit = _parse_amd_smi_monitor_text(text)
-        if hit:
+        if hit and hit[1] > 0:
             return hit
     return None
 
