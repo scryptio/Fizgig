@@ -1,13 +1,14 @@
-"""MiniMax H3 video VAE — ENCODE PATH ONLY (image -> 24-channel latent).
+"""MiniMax H3 video VAE — ENCODE PATH ONLY (image or clip -> 24-channel latent).
 
 Pure-PyTorch port of the encoder half of ComfyUI's comfy/ldm/minimax/vae.py. Image-only
 training needs to turn a still image into the DiT's 24-channel latent exactly once (caching),
 so only the 3D-causal-CNN encoder + quant_conv + latent normalization are ported. The ViT3D
-decoder, spatial tiling and temporal chunking are omitted — no sampling/decode in scope.
+decoder and spatial/temporal tiling are omitted — no sampling/decode in scope.
 
 Weight names match the checkpoint's `encoder.*` / `quant_conv.*` / `latents_mean/std`, so the
 official minimax_h3_video_vae_fp16.safetensors loads with strict=False (decoder/post_quant keys
-ignored). A single image is one video frame (T=1): 16x spatial downscale, T stays 1.
+ignored). 16x spatial downscale; 4x causal temporal downscale, so a still (T=1) stays T=1 and a
+clip of T frames yields ceil(T/4) latent frames.
 """
 
 import math
@@ -164,15 +165,20 @@ class MiniMaxH3VideoVAEEncoder(nn.Module):
 
     @torch.no_grad()
     def encode(self, x):
-        """x: [B,3,H,W] or [B,3,T,H,W] in [-1,1] -> normalized latent [B,24,1,H/16,W/16] (image: T=1)."""
+        """x: [B,3,H,W] or [B,3,T,H,W] in [-1,1] -> normalized latent [B,24,ceil(T/4),H/16,W/16].
+
+        The stack is temporally causal with a 4x stride, so latent frame k depends only on pixel
+        frames up to 4k (verified by perturbation) and a still gives T'=1 — the image path is
+        unchanged. Feed 1+4k frames for a clean 1+k latent frames.
+
+        No temporal chunking: peak activation is dominated by the first level at full T x H x W,
+        so long clips want tiling that this port does not implement. Encode in clips.
+        """
         if x.ndim == 4:
             x = x.unsqueeze(2)
         x = (x + 1.0) * 0.5
         x = (x - self.pixel_mean.to(x)) / self.pixel_std.to(x)
-        if x.shape[2] != 1:
-            raise NotImplementedError("MiniMax H3 image training encodes a single frame (T=1)")
         moments = self.quant_conv(self.encoder(x))
-        moments = moments[:, :, -1:, :, :]
         mean = torch.chunk(moments.float(), 2, dim=1)[0]
         lm = self.latents_mean.view(1, -1, 1, 1, 1).to(mean)
         ls = self.latents_std.view(1, -1, 1, 1, 1).to(mean)

@@ -1072,7 +1072,67 @@ DEFAULT_PREFS = {
     # faster matmul. On by default — same VRAM as fp8 (8-bit either way), composes with block swap,
     # and only affects previews (never the saved LoRA). Toggle off in Preferences to use fp8.
     "inference_int8": "1",
+    # Which physical GPU to use, as a bare index ("0", "1", ...). Empty = leave the machine's
+    # default alone, which is what every install before this had, so single-GPU users see no
+    # change. Applied by exporting CUDA_VISIBLE_DEVICES (see _apply_cuda_device_pref): torch
+    # then renumbers the chosen card to cuda:0 and nothing downstream - trainer, loader,
+    # sampler, cache scripts - has to know a choice was made at all.
+    "cuda_device": "",
 }
+
+
+def _enumerate_gpus():
+    """[(index, name, total_gb)] for every card in the machine, or [] if it cannot be read.
+
+    Deliberately NOT torch.cuda: touching it creates the CUDA context, which fixes the visible
+    device set for the life of the process - i.e. asking torch what GPUs exist would defeat the
+    setting this list feeds. NVML and nvidia-smi both enumerate the real hardware regardless of
+    CUDA_VISIBLE_DEVICES, which is exactly what a chooser needs."""
+    try:
+        import pynvml
+        pynvml.nvmlInit()
+        out = []
+        for i in range(pynvml.nvmlDeviceGetCount()):
+            h = pynvml.nvmlDeviceGetHandleByIndex(i)
+            name = pynvml.nvmlDeviceGetName(h)
+            out.append((i, name.decode() if isinstance(name, bytes) else name,
+                        pynvml.nvmlDeviceGetMemoryInfo(h).total / (1024 ** 3)))
+        if out:
+            return out
+    except Exception:
+        pass
+    try:
+        import subprocess
+        r = subprocess.run(["nvidia-smi", "--query-gpu=index,name,memory.total",
+                            "--format=csv,noheader,nounits"],
+                           capture_output=True, text=True, timeout=6,
+                           creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
+        out = []
+        for line in r.stdout.strip().splitlines():
+            idx, name, mb = [p.strip() for p in line.split(",")]
+            out.append((int(idx), name, int(mb) / 1024))
+        return out
+    except Exception:
+        return []
+
+
+def _apply_cuda_device_pref(prefs) -> str:
+    """Export CUDA_VISIBLE_DEVICES from the saved pref. Returns what was applied, or "".
+
+    This is the whole GPU-selection mechanism: everything downstream keeps asking for "cuda"
+    and gets the chosen card, because it is the only one it can see. Must run before anything
+    creates a CUDA context - the variable is read once, when that context is built.
+
+    An existing CUDA_VISIBLE_DEVICES in the environment wins: someone who launched with it set
+    meant it, and silently overriding that from a saved pref would be worse than not having the
+    pref at all."""
+    if os.environ.get("CUDA_VISIBLE_DEVICES"):
+        return os.environ["CUDA_VISIBLE_DEVICES"]
+    want = str(prefs.get("cuda_device", "")).strip()
+    if want.isdigit():
+        os.environ["CUDA_VISIBLE_DEVICES"] = want
+        return want
+    return ""
 
 
 def _auto_detect_blocks_to_swap() -> int:
@@ -1373,6 +1433,12 @@ class LoRATrainerGUI:
 
         # Load user preferences (model paths, output directories)
         self.prefs = load_prefs()
+        # Before ANY CUDA work: _auto_detect_blocks_to_swap and the workbench tools both build a
+        # CUDA context, and the visible set is frozen the moment one exists.
+        self._cuda_device_env_locked = bool(
+            os.environ.get("CUDA_VISIBLE_DEVICES")) and not str(
+            self.prefs.get("cuda_device", "")).strip()
+        self._cuda_device_applied = _apply_cuda_device_pref(self.prefs)
         self.prefs_vars = {}
         for key, default in DEFAULT_PREFS.items():
             var = tk.StringVar(value=self.prefs.get(key, default))
@@ -2388,15 +2454,27 @@ class LoRATrainerGUI:
         except Exception:
             pass
 
+    def _visible_gpu_index(self):
+        """The physical GPU index training will actually use.
+
+        NVML and nvidia-smi index every card in the machine; CUDA_VISIBLE_DEVICES does not
+        change that, it only changes what torch can see. So on a two-GPU box with
+        CUDA_VISIBLE_DEVICES=1, training runs on physical card 1 while an unqualified NVML read
+        reports card 0 — the status bar then shows a card that is doing nothing (issue #60).
+        Torch's cuda:0 is the FIRST entry in the list, hence [0]. A UUID rather than an index
+        is valid too; there is no cheap mapping for it, so fall back to 0."""
+        raw = (os.environ.get("CUDA_VISIBLE_DEVICES") or "").split(",")[0].strip()
+        return int(raw) if raw.isdigit() else 0
+
     def _read_vram(self):
-        """Return (used_bytes, total_bytes) for GPU 0, or None. Prefers pynvml
+        """Return (used_bytes, total_bytes) for the GPU training uses, or None. Prefers pynvml
         (fast); falls back to a one-shot nvidia-smi query. AMD ROCm paths are
         tried only when NVIDIA readers return nothing."""
         try:
             import pynvml
             if not getattr(self, "_nvml_init", False):
                 pynvml.nvmlInit()
-                self._nvml_handle = pynvml.nvmlDeviceGetHandleByIndex(0)
+                self._nvml_handle = pynvml.nvmlDeviceGetHandleByIndex(self._visible_gpu_index())
                 self._nvml_init = True
             m = pynvml.nvmlDeviceGetMemoryInfo(self._nvml_handle)
             return int(m.used), int(m.total)
@@ -2405,7 +2483,8 @@ class LoRATrainerGUI:
         try:
             import subprocess
             out = subprocess.run(
-                ["nvidia-smi", "--query-gpu=memory.used,memory.total",
+                ["nvidia-smi", "-i", str(self._visible_gpu_index()),
+                 "--query-gpu=memory.used,memory.total",
                  "--format=csv,noheader,nounits"],
                 capture_output=True, text=True, timeout=4,
                 creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
@@ -7246,6 +7325,27 @@ class LoRATrainerGUI:
         except Exception:
             pass
         return 0  # safe fallback — avoid the buggy swap path on detection failure
+
+    def _on_gpu_choice(self, _event=None):
+        """Save the picked GPU as a bare index. Label -> index, since the combobox shows names."""
+        _picked = self._gpu_choice_var.get()
+        _idx = next((k for k, v in self._gpu_choice_labels.items() if v == _picked), "")
+        self.prefs_vars["cuda_device"].set(_idx)          # trace writes prefs.json
+        self.update_console(
+            f"[gpu] training will use {_picked}. Restart Fizgig to move the workbench tools too.\n"
+            if _idx else "[gpu] back to the system default GPU.\n")
+
+    def _cuda_env_for_subprocess(self, env):
+        """Stamp the chosen GPU onto a subprocess environment.
+
+        The child would inherit our own CUDA_VISIBLE_DEVICES anyway, but only the value set at
+        startup - so without this, changing the pref would not reach a run until the app was
+        restarted, which is the one place it easily can take effect immediately."""
+        _want = str(self.prefs_vars["cuda_device"].get()).strip() if hasattr(
+            self, "prefs_vars") else ""
+        if _want.isdigit() and not getattr(self, "_cuda_device_env_locked", False):
+            env["CUDA_VISIBLE_DEVICES"] = _want
+        return env
 
     def _get_inference_blocks_to_swap(self) -> int:
         """Resolve the Preferences inference_blocks_to_swap pref to an int.
@@ -15533,6 +15633,47 @@ class LoRATrainerGUI:
             wraplength=760, justify=tk.LEFT)
         _offline_tip.grid(row=kr + 2, column=0, columnspan=3, sticky=tk.W, pady=(12, 2))
 
+        # Card 1b: which GPU. Only when the machine actually has more than one - a chooser with a
+        # single entry is noise, and the whole feature is a no-op there.
+        _gpus = _enumerate_gpus()
+        if len(_gpus) > 1:
+            gpu_card = self._start_section_card(
+                outer, "Graphics Card",
+                "Which GPU Fizgig uses — for training and for the workbench tools alike. "
+                "Everything else in the app then treats that card as the only one there is.",
+            )
+            gpu_card.columnconfigure(1, weight=1)
+            ttk.Label(gpu_card, text="Use GPU:").grid(row=0, column=0, sticky=tk.W,
+                                                      padx=(0, 10), pady=4)
+            self._gpu_choice_labels = {"": "System default (GPU 0)"}
+            for _i, _name, _gb in _gpus:
+                self._gpu_choice_labels[str(_i)] = f"{_i}: {_name} ({_gb:.0f} GB)"
+            self._gpu_choice_var = tk.StringVar(
+                value=self._gpu_choice_labels.get(
+                    str(self.prefs.get("cuda_device", "")).strip(),
+                    self._gpu_choice_labels[""]))
+            _gpu_combo = ttk.Combobox(
+                gpu_card, textvariable=self._gpu_choice_var,
+                values=list(self._gpu_choice_labels.values()), width=44, state="readonly")
+            _gpu_combo.grid(row=0, column=1, sticky=tk.W, pady=4)
+            _gpu_combo.bind("<<ComboboxSelected>>", self._on_gpu_choice)
+            _gpu_note = tk.Label(
+                gpu_card,
+                text=("Takes effect for the next training run straight away. The in-app tools "
+                      "(Repair Studio, Explorer, Royale, Profiler, Extract) hold on to the card "
+                      "they started with, so restart Fizgig to move those."),
+                font=(FONT_FAMILY, 9), fg=COLORS["text_muted"], bg=COLORS["bg_surface"],
+                wraplength=720, justify=tk.LEFT)
+            _gpu_note.grid(row=1, column=1, sticky=tk.W, pady=(0, 4))
+            if os.environ.get("CUDA_VISIBLE_DEVICES") and not str(
+                    self.prefs.get("cuda_device", "")).strip():
+                tk.Label(gpu_card,
+                         text=(f"CUDA_VISIBLE_DEVICES={os.environ['CUDA_VISIBLE_DEVICES']} is set "
+                               f"in your environment and wins over this setting."),
+                         font=(FONT_FAMILY, 9), fg=COLORS["warning"],
+                         bg=COLORS["bg_surface"], wraplength=720, justify=tk.LEFT
+                         ).grid(row=2, column=1, sticky=tk.W, pady=(0, 4))
+
         # Card 2: Inference Performance
         inf_card = self._start_section_card(
             outer, "Inference Performance",
@@ -16083,7 +16224,7 @@ class LoRATrainerGUI:
             _opt = getattr(self, f"_fetch_optional_{family}", None)
             if _opt is not None and _opt.get():
                 cmd.append("--include-optional")
-            env = dict(os.environ)
+            env = self._cuda_env_for_subprocess(dict(os.environ))
             env["PYTHONPATH"] = os.path.join(FIZGIG_DIR, "src")
             env["PYTHONUNBUFFERED"] = "1"
             if token.strip():
@@ -17848,18 +17989,12 @@ class LoRATrainerGUI:
         _pr = tk.Frame(setup, bg=_sbg); _pr.grid(row=r, column=1, columnspan=2, sticky=tk.W, pady=4)
         self.royale_seed_var = tk.StringVar(value=self.last_used.get("royale_seed", "42"))
         ttk.Entry(_pr, textvariable=self.royale_seed_var, width=10).pack(side=tk.LEFT)
-        tk.Label(_pr, text="W", bg=_sbg, fg=COLORS["text_muted"]).pack(side=tk.LEFT, padx=(12, 3))
-        self.royale_w_var = tk.StringVar(value=self.last_used.get("royale_w", "512"))
-        ttk.Combobox(_pr, textvariable=self.royale_w_var, values=["384", "512", "768", "1024", "1280", "1536", "2048"],
-                     state="readonly", width=5).pack(side=tk.LEFT)
-        tk.Label(_pr, text="H", bg=_sbg, fg=COLORS["text_muted"]).pack(side=tk.LEFT, padx=(8, 3))
-        self.royale_h_var = tk.StringVar(value=self.last_used.get("royale_h", "512"))
-        ttk.Combobox(_pr, textvariable=self.royale_h_var, values=["384", "512", "768", "1024", "1280", "1536", "2048"],
-                     state="readonly", width=5).pack(side=tk.LEFT)
-        tk.Label(_pr, text="Max renders", bg=_sbg, fg=COLORS["text_muted"]).pack(side=tk.LEFT, padx=(12, 3))
-        self.royale_max_var = tk.StringVar(value=self.last_used.get("royale_max", "12"))
-        ttk.Combobox(_pr, textvariable=self.royale_max_var, values=["All", "6", "8", "10", "12", "16", "20"],
-                     state="readonly", width=6).pack(side=tk.LEFT)
+        tk.Label(_pr, text="shared by the crossfade, prompt travel and strength travel",
+                 bg=_sbg, fg=COLORS["text_muted"], font=(FONT_FAMILY, 9)).pack(side=tk.LEFT, padx=(10, 0))
+        # Size and Max renders USED to sit here, beside the seed. They only ever drove the
+        # crossfade - every travel card and the comparison sheet carry their own - so in a card
+        # called Setup they read as global and were silently ignored by four of the six modes.
+        # They now live in Crossfade, next to the thing they size.
         r += 1
 
         ttk.Label(setup, text="Reference:").grid(row=r, column=0, sticky=tk.W, padx=(0, 10), pady=4)
@@ -17879,9 +18014,10 @@ class LoRATrainerGUI:
                       "LoRA renders the prompt), lower lets the prompt vary more, 0 = off.")
         r += 1
 
-        # Remember the render inputs across sessions.
-        for _v in (self.royale_prompt_var, self.royale_seed_var, self.royale_w_var, self.royale_h_var,
-                   self.royale_max_var, self.royale_ref_var, self.royale_ref_strength_var):
+        # Remember the render inputs across sessions. Size and Max renders are bound with the
+        # Crossfade card below, where they are now built.
+        for _v in (self.royale_prompt_var, self.royale_seed_var,
+                   self.royale_ref_var, self.royale_ref_strength_var):
             _v.trace_add("write", lambda *a: self._save_last_used_paths())
 
         _br = tk.Frame(setup, bg=_sbg); _br.grid(row=r, column=0, columnspan=3, sticky=tk.W, pady=(8, 0))
@@ -17897,6 +18033,26 @@ class LoRATrainerGUI:
 
         cf = self._start_section_card(outer, "Crossfade",
                                       "Drag to blend between consecutive epochs — stop where it looks best.")
+        _cfr = tk.Frame(cf, bg=_sbg); _cfr.pack(anchor=tk.W, pady=(0, 8))
+        tk.Label(_cfr, text="Size", bg=_sbg, fg=COLORS["text_muted"]).pack(side=tk.LEFT, padx=(0, 6))
+        self.royale_w_var = tk.StringVar(value=self.last_used.get("royale_w", "512"))
+        ttk.Combobox(_cfr, textvariable=self.royale_w_var,
+                     values=["384", "512", "768", "1024", "1280", "1536", "2048"],
+                     state="readonly", width=5).pack(side=tk.LEFT)
+        tk.Label(_cfr, text="x", bg=_sbg, fg=COLORS["text_muted"]).pack(side=tk.LEFT, padx=(6, 6))
+        self.royale_h_var = tk.StringVar(value=self.last_used.get("royale_h", "512"))
+        ttk.Combobox(_cfr, textvariable=self.royale_h_var,
+                     values=["384", "512", "768", "1024", "1280", "1536", "2048"],
+                     state="readonly", width=5).pack(side=tk.LEFT)
+        tk.Label(_cfr, text="Max renders", bg=_sbg, fg=COLORS["text_muted"]).pack(side=tk.LEFT, padx=(16, 6))
+        self.royale_max_var = tk.StringVar(value=self.last_used.get("royale_max", "12"))
+        ttk.Combobox(_cfr, textvariable=self.royale_max_var,
+                     values=["All", "6", "8", "10", "12", "16", "20"],
+                     state="readonly", width=6).pack(side=tk.LEFT)
+        tk.Label(_cfr, text="how many epochs to render, newest first",
+                 bg=_sbg, fg=COLORS["text_muted"], font=(FONT_FAMILY, 9)).pack(side=tk.LEFT, padx=(10, 0))
+        for _v in (self.royale_w_var, self.royale_h_var, self.royale_max_var):
+            _v.trace_add("write", lambda *a: self._save_last_used_paths())
         holder = tk.Frame(cf, width=512, height=512, bg="#1c1c1c", highlightthickness=0)
         holder.pack(pady=(0, 8))
         holder.pack_propagate(False)
@@ -22040,7 +22196,7 @@ class LoRATrainerGUI:
 
     def run_subprocess(self, cmd, name, callback=None):
         """Run a subprocess and handle its output with UTF-8 encoding"""
-        env = os.environ.copy()
+        env = self._cuda_env_for_subprocess(os.environ.copy())
         env["PYTHONIOENCODING"] = "utf-8"
         env["PYTHONUNBUFFERED"] = "1"  # flush stdout/stderr line-by-line so log output streams live
 

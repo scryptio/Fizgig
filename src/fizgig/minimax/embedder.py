@@ -138,6 +138,32 @@ def _bundled_tokenizer_dir():
     return os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "assets", "qwen3vl_tokenizer")
 
 
+# H3 extends the stock Qwen3-VL vocabulary with these, in this order — MiniMax's own
+# text_encoder/tokenizer_config.json lists them appended to Qwen's 13, which is what assigns them
+# ids 151669..151675 (all inside the 151936-row embedding table, so they index real trained rows).
+# ORDER IS LOAD-BEARING: they exist in neither vocab.json nor tokenizer.json, so transformers
+# numbers them sequentially on load, and a reordering would silently shift every id.
+_H3_SPECIAL_TOKENS = ("<d>", "</d>", "<|cutoff|>", "<|lyrics_start|>", "<|lyrics_end|>",
+                      "<|caption_start|>", "<|caption_end|>")
+
+
+def _add_h3_special_tokens(tok):
+    """Teach a stock Qwen3-VL tokenizer H3's markup, unless it already knows it.
+
+    The bundled tokenizer is redistributed unmodified from Qwen3-VL-4B-Instruct and is SHARED
+    with the krea2 encoder, so the tokens are added here rather than to that asset: patching the
+    asset would change tokenization on an unrelated model path.
+
+    Without this, `<d>` splits into byte pairs ([90707, 30768, ...] rather than [151669]) and
+    `<|lyrics_start|>hold on<|lyrics_end|>` goes from 4 tokens to 16. Ordinary prose is
+    unaffected, which is why the omission is invisible until a prompt carries dialogue markup —
+    and H3 wraps ALL dialogue in `<d>[Language] ...</d>`.
+    """
+    missing = [t for t in _H3_SPECIAL_TOKENS if tok.convert_tokens_to_ids(t) is None]
+    if missing:
+        tok.add_tokens(missing, special_tokens=True)
+
+
 def build_qwen3_te(config_overrides=None):
     """A Qwen3Model text encoder with no final norm (returns the raw layer-50 output).
 
@@ -595,4 +621,5 @@ def load_minimax_h3_te(path: str, device="cuda", compute_dtype=torch.bfloat16,
     model.requires_grad_(False)
 
     tok = AutoTokenizer.from_pretrained(tokenizer_dir or _bundled_tokenizer_dir())
+    _add_h3_special_tokens(tok)
     return MiniMaxH3TextEncoder(model, tok, device=device, compute_dtype=compute_dtype)

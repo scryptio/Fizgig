@@ -1602,6 +1602,16 @@ def train_minimax(
     else:
         n_swap = max(0, int(blocks_to_swap))
         _ckpt_auto = n_swap > 0
+        if base_quant == "auto" and quantize:
+            # A hand-set swap count skips the planner, and the planner is what weighs int8's
+            # residency against free VRAM. Auto precision then falls back to "whatever the file
+            # is", which on a pruned checkpoint is always int8 — ~21 GB and a slow run on a card
+            # the planner would have put on 4-bit with no swap at all. It does not fail, so
+            # nothing would otherwise say why the run is crawling.
+            logger.info(f"[vram] base precision: {_base_mode} — chosen from the checkpoint, not "
+                        f"from free VRAM, because Blocks Swap is set to {n_swap} rather than "
+                        f"Auto. Set Blocks Swap to Auto to have the precision and the swap count "
+                        f"planned together.")
     use_ckpt = {"on": True, "off": False}.get(_ckpt_req, _ckpt_auto)
     if n_swap > 0 and not use_ckpt:
         logger.info("[vram] block swap needs gradient checkpointing (autograd would pin swapped "
@@ -1644,8 +1654,13 @@ def train_minimax(
     # ---- base (NF4-frozen) + trainable LoRA over the transformer blocks ----
     # adaln_fp32 matches ComfyUI's curve-checkpoint dtype, but only when AdaLN is NOT a LoRA
     # target — a bf16 adapter cannot take an fp32 activation from the Linear it wraps.
+    # base_quant is the RESOLVED mode, never the raw "auto" (issue #55). The loader has its own
+    # auto rule — int8 whenever the file is pre-quantized — which ignores how much VRAM is free,
+    # so handing it "auto" threw away the plan: swap sized for an ~11 GB NF4 base while a ~21 GB
+    # int8 one loaded, and the log printed both decisions a few lines apart. It also made
+    # ss_base_quant a lie in the output metadata.
     dit = load_minimax_h3_dit(dit_path, device=device, compute_dtype=dtype, quantize=quantize,
-                              blocks_to_swap=n_swap, base_quant=base_quant,
+                              blocks_to_swap=n_swap, base_quant=_base_mode,
                               adaln_fp32=not train_adaln)
     dit.requires_grad_(False)                                   # frozen base (QLoRA-style)
     if n_swap > 0:

@@ -18,6 +18,8 @@ that tensor, decode it if quantized, and place it —
 The frozen base is what LoRA/FT trains on top of; the fp32 output-head island stays fp32.
 """
 
+import os
+
 import torch
 import torch.nn as nn
 
@@ -25,7 +27,7 @@ import torch.nn as nn
 # safe_open(device="cpu").get_tensor() hard-crashes (access violation) in torch's storage
 # mmap-slicing. MemoryEfficientSafeOpen reads each tensor with a plain np.fromfile instead —
 # the same reader every other large-model loader in the repo uses. See embedder.py.
-from fizgig.krea2.safetensors_utils import MemoryEfficientSafeOpen
+from fizgig.krea2.safetensors_utils import MemoryEfficientSafeOpen, ShardedSafeOpen
 
 from .convrot import ConvRotInt8Linear, dequantize_int8_convrot, parse_comfy_quant
 from .model import MiniMaxH3DiT, MiniMaxH3Config
@@ -69,6 +71,10 @@ def load_minimax_h3_dit(path: str, device="cuda", compute_dtype=torch.bfloat16,
                         adaln_fp32: bool = True) -> MiniMaxH3DiT:
     """Return a MiniMaxH3DiT with the real weights loaded, the base frozen.
 
+    `path` is either a single .safetensors file or a directory of Hub shards — the Hub serves
+    FL2VA/transformer as 13 shards + an index, which carry the same 535 key names the single
+    ComfyUI-converted file does.
+
     adaln_fp32 keeps the AdaLN projections in fp32 on a PRUNED (curve-table) checkpoint, which
     is what ComfyUI does: `adaln_dtype = torch.float32 if use_adaln_curves else dtype`
     (comfy/ldm/minimax/model.py), and it never downcasts the lerped `t_emb` either. The file
@@ -99,7 +105,8 @@ def load_minimax_h3_dit(path: str, device="cuda", compute_dtype=torch.bfloat16,
     model.enable_block_swap(n) so the forward moves them just-in-time."""
     from bitsandbytes.nn import Linear4bit, Params4bit
 
-    with MemoryEfficientSafeOpen(path) as f:
+    opener = ShardedSafeOpen if os.path.isdir(path) else MemoryEfficientSafeOpen
+    with opener(path) as f:
         keys = set(f.keys())
         table_shape = None
         if "adaln_t_table" in keys:
