@@ -10,7 +10,7 @@ Features:
 - Creates isolated venv for Fizgig dependencies
 - Installs CUDA 12.8 PyTorch on NVIDIA GPUs (RTX 30xx / 40xx / 50xx Blackwell)
 - Installs ROCm PyTorch on Linux AMD GPUs when /dev/kfd is present (or --platform rocm)
-- Windows AMD: use install_fizgig_rocm.bat instead (ROCm nightly wheels + GPU detection)
+- Linux AMD: use install_fizgig_rocm_linux.sh — highly experimental; Windows ROCm is the supported AMD path
 - Installs InsightFace face detection (runs on CPU for GPU independence)
 - Downloads face detection models automatically
 - Installs Florence-2 AI captioning (transformers library; runs on GPU)
@@ -129,7 +129,29 @@ def get_python_path():
     return VENV_DIR / "bin" / "python"
 
 
-def install_dependencies(gpu_platform: str = "cuda"):
+def torch_already_installed(python_path: Path) -> bool:
+    """True when venv torch imports and reports a CUDA/ROCm device."""
+    probe = '''
+import sys
+try:
+    import torch
+except Exception:
+    sys.exit(1)
+if not torch.cuda.is_available():
+    sys.exit(1)
+sys.exit(0)
+'''
+    try:
+        result = subprocess.run(
+            [str(python_path), "-c", probe],
+            capture_output=True, text=True,
+        )
+        return result.returncode == 0
+    except Exception:
+        return False
+
+
+def install_dependencies(gpu_platform: str = "cuda", skip_torch: bool = False):
     """Install dependencies for the chosen GPU backend."""
     python_path = get_python_path()
 
@@ -148,11 +170,21 @@ def install_dependencies(gpu_platform: str = "cuda"):
             print("ERROR: Windows AMD ROCm is not supported by this script.")
             print("Use install_fizgig_rocm.bat instead — it installs up-to-date ROCm nightly wheels.")
             return False
+        if platform.system() == "Linux" and not skip_torch:
+            script = SCRIPT_DIR / "install_fizgig_rocm_linux.sh"
+            print("ERROR: Linux AMD ROCm PyTorch is not installed via pinned requirements anymore.")
+            print("HIGHLY EXPERIMENTAL: Linux AMD training is best-effort only (crashes/GPU resets common).")
+            print(f"Run: chmod +x {script.name} && ./{script.name}")
+            print("Or, if PyTorch ROCm is already in this venv: python install_fizgig.py --platform rocm --skip-torch")
+            return False
         if not REQUIREMENTS_GLOBAL.exists() or not REQUIREMENTS_ROCM_LINUX.exists():
             print("ERROR: requirements-global.txt or requirements-rocm-linux.txt is missing.")
             return False
         req_files = [REQUIREMENTS_GLOBAL, REQUIREMENTS_ROCM_LINUX]
-        print("Installing ROCm PyTorch + shared dependencies (Linux)...")
+        if skip_torch:
+            print("Installing Fizgig deps only (ROCm PyTorch already present)...")
+        else:
+            print("Installing ROCm extras + shared dependencies (Linux)...")
     else:
         req_files = [REQUIREMENTS_FILE]
         print(f"Installing dependencies from: {REQUIREMENTS_FILE} (CUDA, using uv)")
@@ -326,38 +358,19 @@ def create_launcher_scripts(gpu_platform: str = "cuda"):
     else:
         print(f"WARNING: {bat_path} is missing — restore it with `git checkout -- run_fizgig.bat`")
 
-    # Linux/Mac shell script (not shipped in the repo — generated here)
-    rocm_env = ""
-    if gpu_platform == "rocm" or (platform.system() == "Linux" and os.path.exists("/dev/kfd")):
-        rocm_env = """\
-export MIOPEN_FIND_MODE=2
-export FLASH_ATTENTION_TRITON_AMD_ENABLE=TRUE
-export TORCH_ROCM_AOTRITON_ENABLE_EXPERIMENTAL=1
-export PYTORCH_ALLOC_CONF=max_split_size_mb:512,garbage_collection_threshold:0.8
-export FIZGIG_GPU_BACKEND=rocm
-for _d in /opt/rocm/core-*/bin /opt/rocm/bin; do
-  [ -d "$_d" ] && PATH="$_d:$PATH"
-done
-export PATH
-if [ -d /opt/rocm/lib ]; then
-  export LD_LIBRARY_PATH="/opt/rocm/lib${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
-fi
-"""
-
-    sh_content = f'''#!/bin/bash
-cd "$(dirname "$0")"
-source venv/bin/activate
-{rocm_env}python lora_trainer_gui.py
-'''
-
+    # Linux shell launcher ships with the repo (like run_fizgig.bat on Windows) — never overwrite.
     sh_path = SCRIPT_DIR / "run_fizgig.sh"
-    existed = sh_path.exists()
-    if not existed or gpu_platform == "rocm":
-        with open(sh_path, 'w', newline='\n') as f:
-            f.write(sh_content)
+    if sh_path.exists():
+        print(f"Launcher present: {sh_path} (ships with the repo — not modified)")
+    else:
+        print(f"WARNING: {sh_path} is missing — restore it with `git checkout -- run_fizgig.sh`")
+
+    rocm_sh = SCRIPT_DIR / "run_fizgig_rocm.sh"
+    if rocm_sh.exists():
         if platform.system() != "Windows":
-            os.chmod(sh_path, 0o755)
-        print(f"{'Updated' if existed else 'Created'}: {sh_path}")
+            os.chmod(rocm_sh, 0o755)
+        if gpu_platform == "rocm" or (platform.system() == "Linux" and os.path.exists("/dev/kfd")):
+            print(f"ROCm launcher: {rocm_sh}  (use this on Linux AMD — not run_fizgig.sh)")
     return True
 
 
@@ -376,7 +389,14 @@ def print_summary(gpu_platform: str = "cuda"):
             print(f"  Double-click: {SCRIPT_DIR / 'run_fizgig.bat'}")
             print("  Or run: .\\run_fizgig.bat")
     else:
-        print(f"  Run: ./run_fizgig.sh")
+        if gpu_platform == "rocm" or (platform.system() == "Linux" and os.path.exists("/dev/kfd")):
+            print(f"  Run: ./run_fizgig_rocm.sh")
+            print(f"  (Upstream ./run_fizgig.sh has no ROCm env — use run_fizgig_rocm.sh on AMD Linux)")
+            print(f"  WARNING: Linux AMD ROCm is highly experimental — expect instability.")
+        else:
+            print(f"  Run: ./run_fizgig.sh")
+            if gpu_platform == "rocm":
+                print("  (ROCm install: ./install_fizgig_rocm_linux.sh)")
 
     backend = "ROCm/HIP" if gpu_platform == "rocm" else "CUDA"
     print(f"\nGPU backend: {backend}")
@@ -401,6 +421,11 @@ def parse_args():
         choices=("detect", "cuda", "rocm"),
         default="detect",
         help="GPU backend to install (default: auto-detect)",
+    )
+    parser.add_argument(
+        "--skip-torch",
+        action="store_true",
+        help="Linux ROCm only: skip PyTorch install (venv already has ROCm torch)",
     )
     return parser.parse_args()
 
@@ -476,9 +501,16 @@ def main():
     if not create_venv():
         sys.exit(1)
 
+    if gpu_platform == "rocm" and args.skip_torch and platform.system() == "Linux":
+        python_path = get_python_path()
+        if not python_path.exists() or not torch_already_installed(python_path):
+            print("ERROR: --skip-torch set but venv has no working ROCm/CUDA torch.")
+            print(f"Run: chmod +x install_fizgig_rocm_linux.sh && ./install_fizgig_rocm_linux.sh")
+            sys.exit(1)
+
     # Step 3: Install dependencies
     print_step(3, f"Installing dependencies ({gpu_platform.upper()})")
-    if not install_dependencies(gpu_platform):
+    if not install_dependencies(gpu_platform, skip_torch=args.skip_torch):
         sys.exit(1)
 
     # Step 4: Verify GPU is visible to PyTorch
