@@ -10,7 +10,7 @@ Features:
 - Creates isolated venv for Fizgig dependencies
 - Installs CUDA 12.8 PyTorch on NVIDIA GPUs (RTX 30xx / 40xx / 50xx Blackwell)
 - Installs ROCm PyTorch on Linux AMD GPUs when /dev/kfd is present (or --platform rocm)
-- Linux AMD: use install_fizgig_rocm_linux.sh (AMD multi-arch pip wheels + GPU detection)
+- Linux AMD: use install_fizgig_rocm_linux.sh — highly experimental; Windows ROCm is the supported AMD path
 - Installs InsightFace face detection (runs on CPU for GPU independence)
 - Downloads face detection models automatically
 - Installs Florence-2 AI captioning (transformers library; runs on GPU)
@@ -173,6 +173,7 @@ def install_dependencies(gpu_platform: str = "cuda", skip_torch: bool = False):
         if platform.system() == "Linux" and not skip_torch:
             script = SCRIPT_DIR / "install_fizgig_rocm_linux.sh"
             print("ERROR: Linux AMD ROCm PyTorch is not installed via pinned requirements anymore.")
+            print("HIGHLY EXPERIMENTAL: Linux AMD training is best-effort only (crashes/GPU resets common).")
             print(f"Run: chmod +x {script.name} && ./{script.name}")
             print("Or, if PyTorch ROCm is already in this venv: python install_fizgig.py --platform rocm --skip-torch")
             return False
@@ -391,6 +392,7 @@ def print_summary(gpu_platform: str = "cuda"):
         if gpu_platform == "rocm" or (platform.system() == "Linux" and os.path.exists("/dev/kfd")):
             print(f"  Run: ./run_fizgig_rocm.sh")
             print(f"  (Upstream ./run_fizgig.sh has no ROCm env — use run_fizgig_rocm.sh on AMD Linux)")
+            print(f"  WARNING: Linux AMD ROCm is highly experimental — expect instability.")
         else:
             print(f"  Run: ./run_fizgig.sh")
             if gpu_platform == "rocm":

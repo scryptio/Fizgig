@@ -1,4 +1,4 @@
-# Fizgig — AMD ROCm extras (Linux only).
+# Fizgig — AMD ROCm extras (Linux only — HIGHLY EXPERIMENTAL).
 # PyTorch + ROCm: install_fizgig_rocm_linux.sh (stable 7.14 from repo.amd.com by default).
 # bitsandbytes ships libbitsandbytes_rocm714.so — run_fizgig_rocm.sh sets BNB_ROCM_VERSION=714.
 # Pair with requirements-global.txt.
