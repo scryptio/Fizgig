@@ -1,5 +1,7 @@
 #!/usr/bin/env bash
 # Fizgig ROCm Linux installer — AMD pip wheels (Path B).
+# HIGHLY EXPERIMENTAL: Linux AMD training is best-effort only (driver resets, gfx gaps,
+# desktop+compute contention). Use Windows ROCm or NVIDIA Linux for production workloads.
 # Detects gfx target, installs PyTorch/ROCm from AMD multi-arch wheels into venv,
 # then Fizgig deps from requirements-global.txt.
 # Prerequisites: amdgpu driver, /dev/kfd, user in render/video groups; sudo for libnuma-dev / pythonX.Y-dev.
@@ -13,6 +15,7 @@ ROCM_NIGHTLY_INDEX="${ROCM_NIGHTLY_INDEX:-https://rocm.nightlies.amd.com/whl-mul
 # nightly = newer torch builds from rocm.nightlies.amd.com, still pinned to ROCm 7.14 for bitsandbytes.
 ROCM_CHANNEL="${ROCM_CHANNEL:-stable}"
 ROCM_SDK_PIN="${ROCM_SDK_PIN:-7.14.0}"
+TORCH_PIN="${TORCH_PIN:-2.13.0+rocm7.14.0}"
 # Set CLEAR_PIP_CACHE=1 to run `pip cache purge` and pass --no-cache-dir for torch/vision wheels.
 CLEAR_PIP_CACHE="${CLEAR_PIP_CACHE:-0}"
 
@@ -223,7 +226,8 @@ import sys
 index = """${index}"""
 arch = """${ARCH}"""
 torch_pin = """${TORCH_PIN:-}"""
-device_pkg = f"amd-torch-device-{arch}"
+torch_device_pkg = f"amd-torch-device-{arch}"
+vision_device_pkg = f"amd-torchvision-device-{arch}"
 
 
 def semver_tuple(v: str) -> tuple[int, ...]:
@@ -274,18 +278,27 @@ def vision_for_torch(torch_ver: str) -> str:
     sys.exit(1)
 
 
-device_vers = rocm714_only(pip_versions(device_pkg))
-if not device_vers:
+torch_device_vers = rocm714_only(pip_versions(torch_device_pkg))
+vision_device_vers = rocm714_only(pip_versions(vision_device_pkg))
+if not torch_device_vers or not vision_device_vers:
     if torch_pin:
         print(f"TORCH_VER={torch_pin}")
         print(f"VISION_VER={vision_for_torch(torch_pin)}")
     print("STABLE_DEVICE_WHEEL=0")
     sys.exit(0)
 
-torch_ver = torch_pin if torch_pin else max(device_vers, key=semver_tuple)
+torch_ver = torch_pin if torch_pin else max(torch_device_vers, key=semver_tuple)
+vision_ver = vision_for_torch(torch_ver)
+vision_prefix = vision_ver.split("+", 1)[0] + "+"
+if vision_ver not in vision_device_vers and not any(v.startswith(vision_prefix) for v in vision_device_vers):
+    if torch_pin:
+        print(f"TORCH_VER={torch_pin}")
+        print(f"VISION_VER={vision_ver}")
+    print("STABLE_DEVICE_WHEEL=0")
+    sys.exit(0)
 
 print(f"TORCH_VER={torch_ver}")
-print(f"VISION_VER={vision_for_torch(torch_ver)}")
+print(f"VISION_VER={vision_ver}")
 print("STABLE_DEVICE_WHEEL=1")
 PY
 )
@@ -294,7 +307,6 @@ PY
 verify_torch_device_wheel() {
     local py
     py="$(_fizgig_rocm_python)"
-    # Skip when stable Path B has no separate amd-torch-device-{arch} package on the index.
     if [[ "${STABLE_DEVICE_WHEEL:-0}" != "1" ]]; then
         return 0
     fi
@@ -303,29 +315,30 @@ import importlib.metadata as md
 import sys
 
 import torch
+import torchvision
 
 arch = "${ARCH}"
-needle = f"amd-torch-device-{arch}".lower()
-torch_ver = torch.__version__
-found = []
-for d in md.distributions():
-    name = (d.metadata.get("Name") or "").lower()
-    if needle in name:
-        found.append(d.metadata.get("Name", ""))
-        if d.version != torch_ver:
-            print(
-                f"ERROR: {d.metadata.get('Name')} {d.version} != torch {torch_ver}",
-                file=sys.stderr,
-            )
-            sys.exit(1)
-if not found:
-    print(
-        f"ERROR: missing {needle} — repo.amd.com may have resolved generic torch without "
-        f"device-{arch}; try TORCH_PIN if amd-torch-device-{arch} is missing",
-        file=sys.stderr,
-    )
-    sys.exit(1)
-print(f"OK  device wheel installed: {found[0]} (matches torch {torch_ver})")
+checks = [
+    (f"amd-torch-device-{arch}", torch.__version__),
+    (f"amd-torchvision-device-{arch}", torchvision.__version__),
+]
+for pkg_prefix, want_ver in checks:
+    needle = pkg_prefix.lower()
+    found = []
+    for d in md.distributions():
+        name = (d.metadata.get("Name") or "").lower()
+        if name == needle:
+            found.append(d.metadata.get("Name", ""))
+            if d.version != want_ver:
+                print(
+                    f"ERROR: {d.metadata.get('Name')} {d.version} != expected {want_ver}",
+                    file=sys.stderr,
+                )
+                sys.exit(1)
+    if not found:
+        print(f"ERROR: missing {pkg_prefix}=={want_ver}", file=sys.stderr)
+        sys.exit(1)
+    print(f"OK  {found[0]} (matches {want_ver})")
 PY
 }
 
@@ -365,9 +378,10 @@ install_rocm_torch_wheels() {
                 "torch==${TORCH_VER}"
                 "torchvision==${VISION_VER}"
                 "amd-torch-device-${ARCH}==${TORCH_VER}"
+                "amd-torchvision-device-${ARCH}==${VISION_VER}"
                 "rocm-sdk-devel==${ROCM_SDK_PIN}"
             )
-            echo "Installing torch==${TORCH_VER} + torchvision==${VISION_VER} + amd-torch-device-${ARCH} + rocm-sdk-devel==${ROCM_SDK_PIN} (stable — no device-* extras)..."
+            echo "Installing torch==${TORCH_VER} + torchvision==${VISION_VER} + amd-torch-device-${ARCH} + amd-torchvision-device-${ARCH} + rocm-sdk-devel==${ROCM_SDK_PIN} ..."
         elif [[ -n "${TORCH_VER:-}" ]]; then
             pip_pkgs=(
                 "torch==${TORCH_VER}"
@@ -494,6 +508,7 @@ cd "$FIZGIG_ROOT"
 echo "============================================================"
 echo "  Fizgig Installer — AMD ROCm (Linux, pip wheels)"
 echo "  Klein 9B and Krea 2 LoRA Studio"
+echo "  *** HIGHLY EXPERIMENTAL — Linux AMD is best-effort only ***"
 echo "============================================================"
 echo
 
@@ -709,4 +724,6 @@ echo "  Installation complete!"
 echo
 echo "  Launch with: ./run_fizgig_rocm.sh"
 echo "  (run_fizgig.sh is the upstream launcher — no ROCm env; do not use for AMD training)"
+echo
+echo "  NOTE: Linux AMD ROCm is highly experimental — crashes and GPU resets are common."
 echo "============================================================"
