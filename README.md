@@ -260,7 +260,7 @@ session picks up where you left off.
 
 - **GPU** — NVIDIA RTX 30 / 40 / 50-series, or **AMD Radeon** with ROCm (RDNA1 through RDNA4, Strix Point / Halo, Instinct MI300+). **16 GB+ VRAM** recommended (24 GB+ comfortable), but the floor is lower than that suggests: **Klein 9B** needs 16 GB, while **Krea 2** trains on **8 GB** with everything on Auto and batch size 1 — see [VRAM guidance](#vram-guidance). The fp8 Base's VRAM savings apply on NVIDIA Ada+; on AMD, NF4 and INT8 are the primary quant paths.
 - **NVIDIA driver** — 555+ on Windows, 550+ on Linux (for the CUDA 12.8 PyTorch wheels).
-- **AMD ROCm** — Linux: ROCm-capable kernel with `/dev/kfd` (installer auto-detects). Windows: use `install_fizgig_rocm.bat` (Python 3.12, up-to-date ROCm nightly wheels — same approach as [comfyui-rocm](https://github.com/patientx/comfyui-rocm) and OneTrainer's custom install, not Zluda).
+- **AMD ROCm** — Linux: `/dev/kfd` + `./install_fizgig_rocm_linux.sh` (AMD multi-arch pip wheels, same idea as Windows). Windows: `install_fizgig_rocm.bat`. Optional system `amdrocm-amdsmi` for accurate status-bar VRAM via `amd-smi`.
 - **OS** — Windows 10 / 11 or Linux. macOS handles captioning and image prep, but training needs CUDA or ROCm.
 - **Python** — 3.10, 3.11, 3.12, or 3.13.
 - **Disk** — ~10 GB for the venv, plus ~40 GB for model files.
@@ -281,25 +281,26 @@ cd Fizgig
 
 **Windows (AMD ROCm)** — double-click `install_fizgig_rocm.bat`. It picks **Python 3.12** via `py -3.12` / `python3.12` (not whatever `python` defaults to — e.g. 3.14), or downloads portable 3.12.10 if none is found (same approach as comfyui-rocm). GPU detection, ROCm nightly PyTorch wheels, and the cp312 bitsandbytes ROCm build follow. Launch with `run_fizgig_rocm.bat`.
 
-**Linux (auto-detect)** — `install_fizgig.py` picks CUDA or ROCm wheels from your hardware (`/dev/nvidia0` vs `/dev/kfd`):
+**Linux (AMD ROCm)** — prerequisites: amdgpu driver loaded (`/dev/kfd`), user in `render`/`video` groups. See [Install ROCm](https://rocm.docs.amd.com/en/latest/install/rocm.html) and [PyTorch for ROCm](https://rocm.docs.amd.com/projects/ai-ecosystem/en/latest/frameworks/pytorch/install.html). Then:
+
+```bash
+chmod +x install_fizgig_rocm_linux.sh
+./install_fizgig_rocm_linux.sh
+./run_fizgig_rocm.sh
+```
+
+The script detects your gfx target (`detect_gpu_linux.py`), installs **ROCm 7.14** PyTorch wheels (matching `libbitsandbytes_rocm714.so` / `BNB_ROCM_VERSION=714`). Default index: `repo.amd.com` (`ROCM_CHANNEL=stable`) — **no nightly fallback** on failure. Stable: **no `device-*` pip extras** (torch 2.13+ ignores them). When `amd-torch-device-{arch}` exists on the index, installs `torch`, `torchvision`, and `amd-torch-device-{arch}` as explicit pinned packages plus `rocm-sdk-devel==7.14.0`. Otherwise unpinned torch/torchvision. Nightly still uses `torch[device-{arch}]`. Override: `TORCH_PIN=…`. Deactivates conda if active (or set `FIZGIG_PYTHON`). Installs **`libnuma-dev`** and **`pythonX.Y-dev`** when missing. **Launch with `run_fizgig_rocm.sh`**. Leave upstream `run_fizgig.sh` alone.
+
+**Linux (NVIDIA, auto-detect)** — `install_fizgig.py` picks CUDA wheels when `/dev/nvidia0` or `nvidia-smi` is present:
 
 ```bash
 python install_fizgig.py              # auto-detect
-python install_fizgig.py --platform rocm   # force ROCm
 python install_fizgig.py --platform cuda   # force CUDA
-```
-
-Launch with `./run_fizgig.sh` (ROCm tuning env vars, `amd-smi` on PATH, and `LD_LIBRARY_PATH` are written in on ROCm installs).
-
-**VRAM status bar on AMD:** Windows ROCm uses `typeperf`; Linux ROCm uses the **`amd-smi`** CLI from [AMD SMI / ROCm Core SDK](https://rocm.docs.amd.com/projects/amdsmi/en/latest/install/install.html) (`sudo apt install amdrocm-amdsmi`), with legacy `rocm-smi` as fallback. Do not `pip install amdsmi` — the PyPI package is outdated; upstream moved to [rocm-systems/projects/amdsmi](https://github.com/ROCm/rocm-systems/tree/develop/projects/amdsmi). `nvidia-ml-py` is CUDA-only and not used on ROCm paths.
-
-**Linux / macOS:**
-
-```bash
-python install_fizgig.py
 chmod +x run_fizgig.sh
 ./run_fizgig.sh
 ```
+
+**VRAM status bar on AMD:** Windows ROCm uses `typeperf`; Linux ROCm uses the **`amd-smi`** CLI when available ([AMD SMI / ROCm Core SDK](https://rocm.docs.amd.com/projects/amdsmi/en/latest/install/install.html), e.g. `sudo apt install amdrocm-amdsmi`). Fizgig picks the GPU with the largest VRAM total (skips empty iGPU entries). Legacy `rocm-smi` is a fallback. Do not `pip install amdsmi` — the PyPI package is outdated.
 
 Three small models auto-download on first use: InsightFace `buffalo_l` (~300 MB, during install), Florence-2 (~500 MB–1.5 GB, first AI caption), and Helsinki-NLP `opus-mt-en-zh` (~300 MB, first bilingual translation).
 
