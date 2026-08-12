@@ -48,11 +48,14 @@ def prepare_cache_files_and_paths(datasets):
     return all_files, all_paths
 
 
-def process_batches(args, datasets, all_files, all_paths, encode_fn):
-    """Process text encoder batches with skip-existing and batching support."""
+def process_batches(args, datasets, all_files, all_paths, encode_fn, index_offset=0):
+    """Process text encoder batches with skip-existing and batching support.
+
+    index_offset only affects the log line: the reference pass calls this once per dataset with
+    a ONE-element list, so without it every dataset reports itself as "[0]"."""
     num_workers = args.num_workers if args.num_workers is not None else max(1, os.cpu_count() - 1)
     for i, dataset in enumerate(datasets):
-        logger.info(f"Encoding dataset [{i}]")
+        logger.info(f"Encoding dataset [{i + index_offset}]")
         batches = dataset.retrieve_text_encoder_output_cache_batches(num_workers)
 
         bs_want = args.batch_size if args.batch_size is not None else 16

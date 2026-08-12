@@ -408,8 +408,10 @@ class MiniMaxH3VideoVAEDecoder(nn.Module):
         lm = self.latents_mean.view(1, -1, 1, 1, 1).to(z)
         ls = self.latents_std.view(1, -1, 1, 1, 1).to(z)
         # Follow the module's own dtype rather than forcing fp32: this decoder is 2.4 B params,
-        # so fp32 residency is 9.7 GB against bf16's 4.8 GB — a difference that matters when it
-        # is loaded on top of the resident base for a preview.
+        # so fp32 residency is 9.7 GB against 4.8 GB for a 16-bit dtype — a difference that
+        # matters when it is loaded on top of the resident base for a preview. Callers should
+        # load it FP16 (the weights' native format, and the only 16-bit dtype ComfyUI permits
+        # for this VAE), not bf16.
         w_dtype = self.post_quant_conv.weight.dtype
         # post_quant_conv is a real learned 1x1x1 channel mix, NOT an identity — skipping it
         # leaves the image structurally recognisable but badly wrong (measured: 7 dB PSNR).

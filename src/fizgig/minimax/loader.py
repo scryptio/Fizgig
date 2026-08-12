@@ -65,8 +65,24 @@ def config_from_checkpoint(keys, table_shape=None) -> MiniMaxH3Config:
 
 
 def load_minimax_h3_dit(path: str, device="cuda", compute_dtype=torch.bfloat16,
-                        quantize=True, blocks_to_swap: int = 0, base_quant="auto") -> MiniMaxH3DiT:
+                        quantize=True, blocks_to_swap: int = 0, base_quant="auto",
+                        adaln_fp32: bool = True) -> MiniMaxH3DiT:
     """Return a MiniMaxH3DiT with the real weights loaded, the base frozen.
+
+    adaln_fp32 keeps the AdaLN projections in fp32 on a PRUNED (curve-table) checkpoint, which
+    is what ComfyUI does: `adaln_dtype = torch.float32 if use_adaln_curves else dtype`
+    (comfy/ldm/minimax/model.py), and it never downcasts the lerped `t_emb` either. The file
+    stores those weights FP16, so loading them at the bf16 compute dtype drops 3 mantissa bits
+    on the shift/scale/GATE of every block — measured 0.22-0.30% RMS on the modulation vectors,
+    with gate_msa deviating up to 0.084 at block 49. That is a deterministic, same-sign
+    perturbation applied 100 times per forward, not zero-mean rounding, and the gate scales the
+    whole attention/MLP branch — i.e. exactly where a LoRA's contribution lands.
+
+    `_mod_scale_shift` / `_mod_gate` still cast to the activation dtype at the point of use, so
+    only the modulation itself gains precision; the block matmuls stay bf16, as in the reference.
+
+    Ignored on the full bf16 checkpoint, where ComfyUI also uses the compute dtype. Pass False
+    when AdaLN is a LoRA target: the adapters are bf16 and would meet an fp32 activation.
 
     base_quant:
       "int8" — KEEP the checkpoint's int8 ConvRot weights (what the reference trainer does).
@@ -101,6 +117,11 @@ def load_minimax_h3_dit(path: str, device="cuda", compute_dtype=torch.bfloat16,
                              "(minimax_h3_*_pruned_int8_convrot.safetensors)")
         if not quantize:
             mode = "none"
+        # fp32 AdaLN only applies to a curve-table (pruned) file — see the docstring.
+        _adaln32 = bool(adaln_fp32) and cfg.adaln_t_table_size is not None
+
+        def _is_adaln(n: str) -> bool:
+            return _adaln32 and ".adaln_proj.linear." in n
         # In int8 mode ONLY the checkpoint's own quantized linears stay quantized — the refiner,
         # AdaLN and the IO layers load dense, exactly as the reference leaves them (its
         # get_quantization_exclude_modules covers token_refiner and *adaln_proj*).
@@ -188,7 +209,7 @@ def load_minimax_h3_dit(path: str, device="cuda", compute_dtype=torch.bfloat16,
                 continue                      # already placed as int8 buffers above
             w = _read_weight(name)
             parent, leaf = _owner_and_leaf(model, name)
-            if mode == "nf4" and _is_nf4_target(name):
+            if mode == "nf4" and _is_nf4_target(name) and not _is_adaln(name):
                 # NF4-quantize this weight onto the GPU; frozen (no grad).
                 # NF4 quantization happens on the .to(cuda) move (Params4bit.cuda()).
                 p = Params4bit(w.to(compute_dtype), requires_grad=False, quant_type="nf4").to(dev)
@@ -196,7 +217,9 @@ def load_minimax_h3_dit(path: str, device="cuda", compute_dtype=torch.bfloat16,
                     p = p.to("cpu")            # stays packed (uint8) + keeps quant_state
                 setattr(parent, leaf, p)
             else:
-                keep = w.to(torch.float32) if w.dtype == torch.float32 else w.to(compute_dtype)
+                keep = (w.to(torch.float32)
+                        if (w.dtype == torch.float32 or _is_adaln(name))
+                        else w.to(compute_dtype))
                 target = torch.device("cpu") if _parked(name) else dev
                 setattr(parent, leaf, nn.Parameter(keep.to(target), requires_grad=False))
         # buffers (rope.inv_freq, and adaln_t_table on a pruned file)
@@ -204,5 +227,7 @@ def load_minimax_h3_dit(path: str, device="cuda", compute_dtype=torch.bfloat16,
             if name in keys:
                 parent, leaf = _owner_and_leaf(model, name)
                 parent.register_buffer(leaf, f.get_tensor(name).to(torch.float32).to(dev))
+    # tells the forward not to demote t_emb — an fp32 projection needs an fp32 input.
+    model.adaln_fp32 = _adaln32
     model.eval()
     return model

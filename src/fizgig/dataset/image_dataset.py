@@ -63,7 +63,11 @@ BUCKET_RESO_STEPS = {ARCHITECTURE_MINIMAX: 32}
 # Pixel -> stored-latent spatial factor per architecture. Klein's FLUX.2 AE packs 2x2
 # space-to-channel after its /8 encoder, so cached latents are pixel/16; Krea 2's
 # Qwen-Image VAE stores plain /8 latents.
-LATENT_SPATIAL_FACTOR = {"klein9b": 16, "krea2": 8}
+# MiniMax H3's video VAE is 16x spatial, same as Klein's packed latents (verified against a real
+# cache: a 448x544 bucket stores `latent_28x34`). Missing here, latent_cache_matches_reso could
+# only ever return None for H3 — so --skip_existing re-encoded every image anyway, which is
+# exactly the "it re-caches everything" symptom.
+LATENT_SPATIAL_FACTOR = {"klein9b": 16, "krea2": 8, ARCHITECTURE_MINIMAX: 16}
 
 
 # ---------------------------------------------------------------------------

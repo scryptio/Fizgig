@@ -96,13 +96,27 @@ class _Int8RotLinearFn(torch.autograd.Function):
         ctx.save_for_backward(qdata, wscale)
         ctx.rot, ctx.dt = rot, dt
         xr = rotate(x.to(dt), rot) if rot > 1 else x.to(dt)
-        return torch.nn.functional.linear(xr, qdata.to(dt) * wscale.to(dt), bias)
+        # Scale on the OUTPUT, not the weight. wscale is per output ROW, so
+        #     y[t,o] = sum_i xr[t,i]*q[o,i]*s[o] = (xr @ q^T)[t,o] * s[o]
+        # is exact, and it buys two things. The int8 CODES are integers <= 127, so they survive
+        # the bf16 cast bit-for-bit; the fp32 SCALES do not — measured 0.137% mean / 0.388% max
+        # relative error per row on the real checkpoint, i.e. a systematic per-output-channel
+        # GAIN error on all 200 block linears, every block, every step. Applying s in fp32 to a
+        # [tokens, out] tensor removes it. It also means no dequantized [out, in] weight is
+        # materialized at all, which is the 308 MB-per-layer transient this Function exists to
+        # avoid. Structurally this is also what ComfyUI's int8 kernel does: accumulate, then
+        # apply the fp32 scale.
+        y = torch.nn.functional.linear(xr, qdata.to(dt))
+        y = (y.float() * wscale.reshape(-1).float()).to(dt)
+        return y if bias is None else y + bias.to(dt)
 
     @staticmethod
     def backward(ctx, grad_out):
         qdata, wscale = ctx.saved_tensors
-        w = qdata.to(ctx.dt) * wscale.to(ctx.dt)          # recomputed, then freed
-        gx = grad_out.to(ctx.dt) @ w                       # [..., out] @ [out, in]
+        # grad_x = grad_out @ W = grad_out @ (q * s) = (grad_out * s) @ q — same identity, so
+        # the [out, in] weight is never rebuilt here either.
+        gs = (grad_out.float() * wscale.reshape(-1).float()).to(ctx.dt)
+        gx = gs @ qdata.to(ctx.dt)                         # [..., out] @ [out, in]
         if ctx.rot > 1:
             gx = rotate(gx, ctx.rot)                       # H is symmetric: R^T == R
         return gx, None, None, None, None, None

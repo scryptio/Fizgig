@@ -365,7 +365,7 @@ ARCHITECTURES = {
         "sample_height_default": 1024,
         "lora_name_suffix": "krea2",
     },
-    "MiniMax H3 (experimental)": {
+    "MiniMax H3": {
         # MiniMax H3 trains natively via fizgig.scripts.minimax_* (single-process). The command
         # builders branch on "is_minimax". Barebones IMAGE-ONLY: no samples, no preview, no
         # per-image loss watch, no LoKR — the most minimal training surface. The Klein-shaped keys
@@ -397,19 +397,43 @@ ARCHITECTURES = {
         "supports_samples": True,
         "sample_cfg_default": 1.0,
         "sample_flow_shift_default": None,
+        # H3 samples run CFG-free on a fixed shift-12 schedule, exactly as every shipped ComfyUI
+        # workflow does (BasicGuider, no negative conditioning). Reusing the existing distilled
+        # flags greys out Negative Prompt and CFG Scale through the generic path rather than
+        # adding a MiniMax branch — nothing about them is editable on this family.
+        "sample_is_distilled": True,
+        "sample_cfg_fixed": True,
         "sample_steps_default": 20,   # the reference pipeline default
-        # 512x512, NOT the 768 canvas convention: preview cost scales with tokens, and a
-        # 124-frame CLIP at 768^2 is ~2.25x the rows of 512^2 — measured on a 32 GB card,
-        # that is the difference between fitting with headroom and spilling to system RAM at
-        # 3-6x the step time (8 Aug). 768 stays one dropdown click away for final-quality
-        # checks; the real 768-canvas judgement belongs in ComfyUI anyway.
-        "sample_width_default": 512,
-        "sample_height_default": 512,
+        # 1024x1024 STILLS (Peter, 11 Aug). Once the four dtype/integration divergences from
+        # ComfyUI were fixed (VAE decode dtype, audio integration order, the int8 per-row scale,
+        # AdaLN precision) previews stopped being soft, and a still at full size became the
+        # better trade than a clip at a small one: 1 latent frame is 1/17th the video rows of a
+        # 56-frame clip, so 1024 costs less than 640 did before and renders in seconds instead
+        # of minutes. Our still decode is its own path (a 5-token group, keeping frame 3) and
+        # measures ~28 dB against the VAE's own reconstruction, well clear of the reference's
+        # single-frame route. Clips are still a dropdown away when motion is what you need.
+        "sample_width_default": 1024,
+        "sample_height_default": 1024,
         "lora_name_suffix": "mmh3",
     },
 }
 
-ARCHITECTURE_LIST = list(ARCHITECTURES.keys())
+# Saved configs written before 3.6.1 carry the old label. Every lookup here is a .get() that
+# falls back to Klein, so without an alias a MiniMax preset would silently come back as a Klein
+# one - wrong family, no error. The alias points at the same config; _canon_arch maps it forward
+# so what the user then SEES is the current name.
+_ARCH_ALIASES = {"MiniMax H3 (experimental)": "MiniMax H3",
+                 "Krea 2 (experimental)": "Krea 2"}       # pre-rename saves (2026-07-28)
+for _old, _new in _ARCH_ALIASES.items():
+    ARCHITECTURES[_old] = ARCHITECTURES[_new]
+
+# Aliases are readable, not offerable: the dropdown lists current names only.
+ARCHITECTURE_LIST = [k for k in ARCHITECTURES if k not in _ARCH_ALIASES]
+
+
+def _canon_arch(name):
+    """Old label in, current label out."""
+    return _ARCH_ALIASES.get(name, name)
 
 # Every family suffix we recognise on a LoRA name. Used to swap ONE tag for another when the
 # model family changes — matching this set (never "the last underscore segment") is what stops
@@ -422,7 +446,7 @@ LORA_NAME_SUFFIXES = {c["lora_name_suffix"] for c in ARCHITECTURES.values()
 # override stopped at 1024, so a run previewing at 1280+ could not be reproduced by the override,
 # which silently downgraded it. Nothing downstream caps the value (Krea 2 rounds up to alignment,
 # Klein floors to a multiple of 16), so the ceiling was purely this list.
-SAMPLE_RESOLUTIONS = ["512", "768", "1024", "1280", "1536"]
+SAMPLE_RESOLUTIONS = ["512", "640", "768", "1024", "1280", "1536"]
 
 # Fizgig installation directory (where this GUI lives)
 FIZGIG_DIR = os.path.dirname(os.path.abspath(__file__))
@@ -754,14 +778,24 @@ MINIMAX_BUILT_IN_PRESETS = {
     # leading. 50% is worth trying: its shift is exactly 1.00, i.e. the plain logit-normal that
     # earlier runs recorded as overdriving adapters — on adamw8bit, before the optimizer was
     # understood.
-    "✨ MiniMax H3 Defaults (LoKR 8, 0.25 MP)": {
+    # LoRA, not LoKR (Peter, 10 Aug). The runs that produced the best likeness on this family
+    # were standard LoRA at dim/alpha 16, and LoKR moves ~7-10x further per unit LR — which made
+    # the same Learning Rate box mean two very different things depending on the Network Type
+    # sitting above it. LoKR stays one dropdown away for anyone who wants it.
+    "✨ MiniMax H3 Defaults (LoRA 16, 0.25 MP)": {
         "NETWORK_DIM": 16, "NETWORK_ALPHA": 16,
-        "NETWORK_TYPE": "LoKR (Kronecker)", "LOKR_FACTOR": 8,
-        # 2e-4 is HEADROOM, not a dose: the governor throttles the effective LR to hold the
-        # movement budget, and late in a run (gradients cooling) a 1e-4 ceiling runs out of
-        # authority to keep the rate at target. The bigger ceiling costs nothing early (the
-        # governor spends what the budget allows) and sustains the clean rate longer.
+        "NETWORK_TYPE": "LoRA (standard)", "LOKR_FACTOR": 8,
+        # 2e-4 is a CEILING, not a dose — it is what Adapter-relative LR works its way up toward,
+        # and a flat run should be judged from its samples rather than trusted to this number.
         "LEARNING_RATE": 2e-4,
+        # Ships ON at the slow build (Peter, 11 Aug). A LoRA starts at zero, so the first steps
+        # are enormous relative to its own size — the ramp holds that ratio steady instead of
+        # asking for a number that is wrong at one end of the run or the other. Off is still a
+        # dropdown away for a flat run.
+        "MINIMAX_ADAPTER_RAMP": "0.003 (slow build)",
+        # Carried so "load Defaults" genuinely resets it. Multi Concept overrides this to Off
+        # when it is on, and the command builder locks it there regardless.
+        "MINIMAX_CAPTION_DROPOUT": "0.05 (default)",
         "MAX_TRAIN_EPOCHS": 60, "SAVE_EVERY_N_EPOCHS": 1, "SEED": 42,
         "ADAPTIVE_LR": False, "ADAPTIVE_LR_MIN": "1e-5", "ADAPTIVE_LR_MAX": "4e-4",
         # adamw, NOT adamw8bit — the single biggest likeness change measured on H3 (2026-08-06).
@@ -771,9 +805,12 @@ MINIMAX_BUILT_IN_PRESETS = {
         # fine detail. Costs ~1.2 GB of fp32 state against a 21 GB resident base.
         "OPTIMIZER_TYPE": "adamw",
         "GRADIENT_ACCUMULATION": 1, "MAX_GRAD_NORM": 1.0,
-        # 0.25 MP (Peter, 9 Aug): paired with Image Prep's face-crop mode this is the quality
-        # AND speed recipe — the crop puts the identity pixels where 0.25 MP can see them, and
-        # the smaller latents cut step time hugely.
+        # Back to 0.25 MP (Peter, 11 Aug). The 1.0 default lasted a day: it came from the theory
+        # that 496px trains below H3's 768 short-edge canvas and must therefore starve detail —
+        # the same out-of-distribution argument that was being made about previews at the time.
+        # A day of real runs did not bear it out, and 0.25 is four times cheaper per step.
+        # The canvas number is about what the model RENDERS; it turned out to say much less than
+        # expected about what it can be TRAINED on.
         "DATASET_MEGAPIXELS": "0.25",
         "MINIMAX_LOWNOISE_PCT": "60", "MINIMAX_LOGNORM": True,
         # The experiment knobs all ship OFF, so the preset is the plain baseline every A/B is
@@ -789,27 +826,42 @@ MINIMAX_BUILT_IN_PRESETS = {
         # The one experiment that graduated: the limiter ships ON. Validated on a real A/B
         # (8 Aug) — the last trained block always hogs 2-4x the median block's movement and
         # over-edits fine detail (distorted eyes); capping it fixed epoch-1 quality outright
-        # with zero cost to the healthy blocks. Default is the TIGHT 1.25 notch (validated at
-        # 1.5) — one extra safety notch for the wide release; the pack median is untouched
-        # either way, so tighter costs nothing but clamps the caboose sooner.
-        "MINIMAX_BLOCK_LIMIT": "1.25 x median (default)",
-        # High-LR smoothing: warmup keeps full-size Adam strides off the zero-init adapter
-        # (the epoch-1 damage); EMA saves the smoothed center of the stride zigzag instead
-        # of a raw corner of it.
-        "MINIMAX_LR_WARMUP": "2 epochs", "MINIMAX_EMA": "0.99 (recommended)",
-        # The governor makes the LR box a ceiling: distortion tracks MOVEMENT per epoch
-        # (~0.15 clean, ~0.23 visible — measured 8 Aug across LoRA and LoKR runs), and the
-        # governor throttles the effective LR to hold that rate whatever the network type.
-        # 0.22 is Peter's speed/quality call after real runs at 0.15 ("worked well but takes
-        # a lot of steps") — just under the visible-damage line, with the raw-metric limiter
-        # holding the tail at <= 1.25x that. Drop to 0.15 for extra margin on a hard dataset.
-        "MINIMAX_GOVERNOR": "0.22 / epoch (default)",
+        # Per-step clip and LR warmup are RETIRED (Peter, 10 Aug) and hidden — both were
+        # after-the-fact answers to epoch-1 overshoot, which the Adapter-relative LR ramp
+        # removes at its root by holding the step/size ratio steady. Kept as keys so old
+        # presets and saved configs still load; the command builder never emits them.
+        "MINIMAX_BLOCK_LIMIT": "Off",
+        "MINIMAX_LR_WARMUP": "Off",
+        # EMA stays available but OFF by default: it saves the smoothed centre of the stride
+        # zigzag instead of a raw corner of it, which is worth having when a run is pushed hard
+        # and unnecessary when it is not.
+        "MINIMAX_EMA": "Off",
         "MINIMAX_DISTILL": False,
     },
-    # The separate "Fast (adaptive LR)" preset was retired 9 Aug: the governor made it
-    # redundant — speed now comes from the movement budget (0.22 vs 0.15), not from letting
-    # adaptive LR off the leash, and one preset with the full protection stack (limiter +
-    # warmup + EMA + governor) is the recipe every real run validated.
+    # (An earlier "Fast (adaptive LR)" preset was retired 9 Aug when its recipe drifted from the
+    # main one. The Fast preset below avoids that by DERIVING from Defaults — see the comment.)
+}
+
+# --- MiniMax H3 Fast ------------------------------------------------------------------------
+# Peter's rank-8 recipe (11 Aug): the run that reached full likeness in ~400 steps and came out
+# noticeably more flexible than the rank-16 ones. Low rank cannot memorise backgrounds and
+# framing in the time available, so it is forced to encode the subject instead.
+#
+# Built by SPREADING Defaults rather than copying it, so a change to the shipped recipe cannot
+# silently leave this one behind — which is exactly how the last Fast preset earned its
+# retirement. Keyed off the first entry rather than the title, because the title has been
+# renamed twice already.
+_MM_DEFAULTS_KEY = next(iter(MINIMAX_BUILT_IN_PRESETS))
+MINIMAX_BUILT_IN_PRESETS["✨ MiniMax H3 Fast (LoRA 8, 40 epochs)"] = {
+    **MINIMAX_BUILT_IN_PRESETS[_MM_DEFAULTS_KEY],
+    "NETWORK_DIM": 8, "NETWORK_ALPHA": 8,
+    "MAX_TRAIN_EPOCHS": 40,
+    "LEARNING_RATE": 2e-4,
+    # Flat, not ramped. The ramp exists to stop a full-size stride landing on a near-zero
+    # adapter; at rank 8 there are half as many directions to move, and the measured run that
+    # this preset reproduces had no ramp at all.
+    "MINIMAX_ADAPTER_RAMP": "Off",
+    "ADAPTIVE_LR": False,
 }
 
 # Directory for dataset configurations
@@ -830,6 +882,7 @@ def load_last_used():
     defaults = {
         "image_prep_source": "",
         "image_folder": "",  # Start tab: training image folder (shared with Captions)
+        "image_folder2": "",  # Multi Concept (MiniMax): second subject, TRAINING ONLY
         "caption_trigger": "trigger_word",
         "dataset_cache_dir": CACHE_DIR,
         "sample_prompt": "A high quality photo",
@@ -1421,6 +1474,9 @@ class LoRATrainerGUI:
                    self.dataset_megapixels_var, self.dataset_batch_size_var,
                    self.dataset_enable_bucket_var, self.dataset_no_upscale_var):
             _v.trace_add("write", _auto_save_ds)
+        # Multi Concept adds [[datasets]] blocks, so its toggle and folders have to rewrite the
+        # TOML too — they are created later (Training tab), hence the deferred hook-up.
+        self._auto_save_ds = _auto_save_ds
 
         # Initialize settings with default values, including conversion settings
         # Klein 9B Base is the only supported architecture. A few legacy keys
@@ -2082,6 +2138,8 @@ class LoRATrainerGUI:
             "prep_replace_originals": bool(self.delete_originals_var.get()),
             "prep_megapixels": self.prep_megapixels_var.get(),
             "image_folder": self.image_folder_var.get(),
+            "image_folder2": (self._concept_folder_vars[0].get()
+                              if getattr(self, "_concept_folder_vars", None) else ""),
             "caption_trigger": self.caption_text_var.get(),
             "dataset_cache_dir": self.dataset_cache_dir_var.get(),
         })
@@ -3052,16 +3110,19 @@ class LoRATrainerGUI:
                      fg=COLORS["text_primary"], bg=COLORS["bg_surface"]).pack(
                 anchor=tk.W, padx=20, pady=(16, 2 if description else 10)
             )
+        desc_label = None
         if description:
-            tk.Label(card, text=description,
-                     font=(FONT_FAMILY, 10),
-                     fg=COLORS["text_explain"], bg=COLORS["bg_surface"],
-                     wraplength=760, justify=tk.LEFT).pack(
-                anchor=tk.W, padx=20, pady=(0, 10)
-            )
+            desc_label = tk.Label(card, text=description,
+                                  font=(FONT_FAMILY, 10),
+                                  fg=COLORS["text_explain"], bg=COLORS["bg_surface"],
+                                  wraplength=760, justify=tk.LEFT)
+            desc_label.pack(anchor=tk.W, padx=20, pady=(0, 10))
 
         content = tk.Frame(card, bg=COLORS["bg_surface"])
         content.pack(fill=tk.X, padx=20, pady=(0, 16))
+        # Stashed so a caller can reword the description later (the Samples tab retitles its
+        # cards per model family). None when the card was built without one.
+        content._desc_label = desc_label
         return content
 
     def _add_field_to_section(self, parent, key, label_text, input_type, row):
@@ -3347,6 +3408,130 @@ class LoRATrainerGUI:
 
         self._add_youtube_help_button(scrollable_frame, "start", prominent=True)
 
+    def _browse_concept_folder(self):
+        """Folder picker for the second Multi Concept subject.
+
+        Deliberately NOT wired to image_folder_var: that one is the Start tab's, and Captions,
+        Image Prep, the Look filter, the gallery scorer and the loss watch all follow it."""
+        folder = filedialog.askdirectory(
+            initialdir=(self._concept_folder_vars[0].get()
+                        or self.image_folder_var.get()
+                        or self._pref_initialdir("input_dataset_dir")
+                        or os.getcwd()))
+        if folder:
+            self._concept_folder_vars[0].set(folder)
+
+    def _sync_distill_weight_state(self):
+        """Grey the teacher-weight box while identity-first is running the show.
+
+        In that mode phase 1 is teacher-ONLY (weight forced to 1.0) and phase 2 is
+        photographs-only, so the box changes nothing. Leaving it live invites people to tune a
+        dial that is not connected to anything."""
+        w = self.entries.get("MINIMAX_DISTILL_WEIGHT")
+        p1 = self.entries.get("MINIMAX_DISTILL_PHASE1")
+        if w is None or p1 is None:
+            return
+        _blended = str(p1.get()).startswith("Off")
+        try:
+            if _blended:
+                w.config(state="readonly")
+                # Hand back whatever the user had before identity-first took the dial over.
+                _stash = getattr(self, "_distill_weight_stash", None)
+                if _stash:
+                    w.set(_stash)
+                    self._distill_weight_stash = None
+            else:
+                # Show 1.0, because that is what phase 1 ACTUALLY runs at — leaving 0.8 sitting
+                # there greyed out told the user something untrue about their own run. (Phase 2
+                # then drops the teacher entirely; the log line says so at the switch.)
+                if str(w.get()) != "1.0" and not getattr(self, "_distill_weight_stash", None):
+                    self._distill_weight_stash = str(w.get())
+                w.set("1.0")
+                w.config(state="disabled")
+        except tk.TclError:
+            pass
+
+    # The recipe Multi Concept switches you into (Peter, 11 Aug). Applied ONCE, when the box is
+    # ticked — not locked. Locking caption dropout to a theory is what broke the last version of
+    # this mode, so these are starting points the user can still argue with.
+    # Deliberately NOT here: Adapter-relative LR. It is an LR strategy, and the two presets own
+    # that choice (Defaults on, Fast flat) - a box describing how your DATA is laid out has no
+    # business overruling the preset the user just loaded.
+    _MULTICONCEPT_DEFAULTS = {
+        "MINIMAX_CAPTION_DROPOUT": "0.10 (strong)",
+        "MINIMAX_DISTILL_REFS": "4",
+        "MINIMAX_DISTILL_PHASE1": "2 epochs",
+    }
+
+    def _warn_if_no_ref_dit(self):
+        """Identity-learn runs on ref2va. Say so when it is switched ON, not at Start.
+
+        validate_inputs already blocks the launch, but by then the user has captioned, cached
+        and pressed Start - and the remedy is a 21 GB download, so an hour of setup can be spent
+        before anything says the run cannot happen."""
+        if self._krea2_pref("minimax_ref_dit"):
+            return
+        messagebox.showinfo(
+            "Identity mode needs one more model",
+            "Learning identity from your dataset runs on the ref2va model - a separate 21 GB "
+            "file, and the only H3 build that accepts reference images. Fizgig does not "
+            "download it by default.\n\n"
+            "Preferences → MiniMax H3 → DiT (reference): paste the path if you "
+            "already have the file, or tick \"Include the reference DiT\" beside \"Download "
+            "models for me\" and let Fizgig fetch it.\n\n"
+            "Carry on setting the run up either way - Start will stop and remind you if the "
+            "path is still empty.")
+
+    def _on_minimax_distill_clicked(self):
+        """Only on a real click: setting the var programmatically must stay silent."""
+        if self.minimax_distill_var.get():
+            self._warn_if_no_ref_dit()
+
+    def _on_minimax_multiconcept_clicked(self):
+        """User CLICKED the box — apply the recipe, then refresh the rows.
+
+        Separate from _on_minimax_multiconcept_toggle because that one also runs on an
+        architecture switch and on every preset load; applying the recipe there would silently
+        overwrite settings the user had changed, every time they visited the tab."""
+        if self.minimax_multiconcept_var.get():
+            _changed = []
+            for _k, _v in self._MULTICONCEPT_DEFAULTS.items():
+                _w = self.entries.get(_k)
+                if _w is not None and str(_w.get()) != _v:
+                    _w.set(_v)
+                    _changed.append(f"{_k.replace('MINIMAX_', '').lower()}={_v}")
+            if hasattr(self, "minimax_distill_var") and not self.minimax_distill_var.get():
+                self.minimax_distill_var.set(True)
+                _changed.append("identity-learn=on")
+            if _changed:
+                self.update_console("[multi concept] applied: " + ", ".join(_changed)
+                                    + "  (all still editable)\n")
+        self._on_minimax_multiconcept_toggle()
+        self._sync_distill_weight_state()
+        if self.minimax_multiconcept_var.get() and self.minimax_distill_var.get():
+            self._warn_if_no_ref_dit()
+
+    def _on_minimax_multiconcept_toggle(self):
+        """Show the extra folder row. Caption dropout is deliberately NOT touched.
+
+        It used to be forced off here, on the theory that training a few percent of steps against
+        the EMPTY prompt teaches the model to produce a subject with no trigger — the mechanism by
+        which two subjects bleed. Peter's own A/B said otherwise (11 Aug): with distillation off,
+        one folder WITH dropout beat two folders without it. Whatever dropout costs in bleed, it
+        appears to be worth more as regularisation at this scale. The dial goes back to the user
+        rather than being locked to a theory the data does not support."""
+        on = bool(self.minimax_multiconcept_var.get()) and self._is_minimax_arch()
+        for w in (getattr(self, "_minimax_mc_dir_frame", None),
+                  getattr(self, "_minimax_mc_hint", None)):
+            if w is not None:
+                self._set_widget_visible(w, on)
+        # The "no reference steering" warning only makes sense in multi-concept with distill off.
+        _nd = getattr(self, "_minimax_mc_nodistill_hint", None)
+        if _nd is not None:
+            _distill = bool(getattr(self, "minimax_distill_var", None)
+                            and self.minimax_distill_var.get())
+            self._set_widget_visible(_nd, on and not _distill)
+
     def _browse_image_folder(self):
         """Folder picker for the Start tab (unified image folder).
 
@@ -3382,9 +3567,7 @@ class LoRATrainerGUI:
         # saved value isn't a known architecture (e.g. a removed/renamed entry).
         _saved_arch = "Flux 2 Klein Base 9B"
         try:
-            _candidate = self.last_used.get("architecture", _saved_arch)
-            if _candidate == "Krea 2 (experimental)":   # pre-rename saves (2026-07-28)
-                _candidate = "Krea 2"
+            _candidate = _canon_arch(self.last_used.get("architecture", _saved_arch))
             if _candidate in ARCHITECTURE_LIST:
                 _saved_arch = _candidate
         except Exception:
@@ -3420,21 +3603,15 @@ class LoRATrainerGUI:
             arch_combo.bind("<<ComboboxSelected>>", self._on_architecture_selected)
             ToolTip(arch_combo, "Model family to train (Klein 9B, Krea 2 or MiniMax H3)")
 
-            # MiniMax renders its previews as a SINGLE video frame, which the H3 VAE decoder was
-            # not trained to produce — every workaround is a compromise (see vae.py). Previews
-            # are honest about relative progress but understate quality, so say so where the
-            # family is chosen rather than leaving people to mistrust their own run.
+            # Previews track likeness honestly but are not the place to compare quality — say
+            # so where the family is chosen, along with the Pause/Resume route that makes
+            # judging in ComfyUI practical on one GPU.
             self._minimax_sample_note = tk.Label(
                 model_card,
-                text=("⏱ MiniMax samples render as short CLIPS by default — they take longer "
-                      "than stills, and longer clips take longer still. Everything about this "
-                      "is tuned on the SAMPLES tab: render less often (Generate every N "
-                      "epochs), smaller (Width/Height), shorter (Sample length — 'Still' is "
-                      "the old fast mode), or untick sample generation entirely. Clips scrub "
-                      "in the gallery and sample the video regime the model was trained in; "
-                      "final judgement still belongs in ComfyUI. 📖 Every MiniMax control on "
-                      "this tab has a full write-up in the README — worth a read before your "
-                      "first run."),
+                text=("⏱ Previews track LIKENESS, not quality. Judge quality in ComfyUI — Pause "
+                      "frees the GPU, so you can check an epoch there and Resume.\n"
+                      "Defaults are 1024×1024 stills; Sample length gives clips. 📖 Full "
+                      "write-ups in the README."),
                 font=(FONT_FAMILY, 9), fg=COLORS["warning"], bg=COLORS["bg_surface"],
                 wraplength=760, justify=tk.LEFT,
             )
@@ -3770,76 +3947,16 @@ class LoRATrainerGUI:
                        "the scores with your dataset. Batch size 1.",
                   foreground="#95A5A6", font=(FONT_FAMILY, 8, "italic"), justify=tk.LEFT, wraplength=720)
         self._krea2_losswatch_hint.grid(row=24, column=0, columnspan=2, sticky=tk.W, padx=5, pady=(0, 4))
-        # --- Low-noise training share (MiniMax H3 only) -----------------------------------
-        # One number, uncapped: what fraction of steps train below sigma 0.5. Converted to the
-        # trainer's shift by minimax_lownoise_to_shift. Hidden for other families by
-        # _apply_training_arch_visibility.
-        self._minimax_shift_label = ttk.Label(training_content, text="Low-noise training:")
-        self._minimax_shift_label.grid(row=26, column=0, sticky=tk.W, padx=5, pady=(8, 2))
-        self._minimax_shift_frame = ttk.Frame(training_content)
-        self._minimax_shift_frame.grid(row=26, column=1, columnspan=2, sticky=tk.W, padx=5, pady=(8, 2))
-        self.entries["MINIMAX_LOWNOISE_PCT"] = ttk.Entry(self._minimax_shift_frame, width=8)
-        self.entries["MINIMAX_LOWNOISE_PCT"].insert(
-            0, str(self.settings.get("MINIMAX_LOWNOISE_PCT", "60")))
-        self.entries["MINIMAX_LOWNOISE_PCT"].pack(side=tk.LEFT)
-        ttk.Label(self._minimax_shift_frame, text="% of steps").pack(side=tk.LEFT, padx=(4, 0))
-        # Live readout: the number you type is the thing you care about, but the schedule it
-        # produces is worth seeing — especially at the extremes, where a couple of percent of
-        # change swings the shift enormously.
-        self._minimax_shift_match = tk.Label(self._minimax_shift_frame, text="",
-                                             font=(FONT_FAMILY, 9), bg=COLORS["bg_surface"])
-        self._minimax_shift_match.pack(side=tk.LEFT, padx=(10, 0))
-        self.minimax_lognorm_var = tk.BooleanVar(
-            value=bool(self.settings.get("MINIMAX_LOGNORM", True)))
-        ttk.Checkbutton(self._minimax_shift_frame, text="mid-concentrated",
-                        variable=self.minimax_lognorm_var,
-                        command=lambda: self._refresh_minimax_shift_match()).pack(side=tk.LEFT,
-                                                                                 padx=(10, 0))
-        self.entries["MINIMAX_LOWNOISE_PCT"].bind(
-            "<KeyRelease>", lambda _e: self._refresh_minimax_shift_match())
-        self._minimax_shift_hint = ttk.Label(
-            training_content,
-            text="How much of the run trains on nearly-clean images — where fine detail and "
-                 "likeness are learned. 60% with mid-concentrated ticked is the tuned default. "
-                 "Full write-up in the README.",
-            foreground="#95A5A6", font=(FONT_FAMILY, 8, "italic"), justify=tk.LEFT, wraplength=720)
-        self._minimax_shift_hint.grid(row=27, column=0, columnspan=2, sticky=tk.W, padx=5, pady=(0, 4))
-        # --- Blocks to Train (MiniMax only, experimental) ---------------------------------
-        self._minimax_blocks_label = ttk.Label(training_content, text="Blocks to Train:")
-        self._minimax_blocks_label.grid(row=28, column=0, sticky=tk.W, padx=5, pady=(8, 2))
-        self._minimax_blocks_frame = ttk.Frame(training_content)
-        self._minimax_blocks_frame.grid(row=28, column=1, columnspan=2, sticky=tk.W, padx=5, pady=(8, 2))
-        # Editable, not readonly — the presets are starting points and the real control is typing
-        # a spec. Anything the trainer's parser takes is legal here.
-        self.entries["MINIMAX_BLOCKS"] = ttk.Combobox(
-            self._minimax_blocks_frame, values=MINIMAX_BLOCK_OPTIONS, width=34)
-        self.entries["MINIMAX_BLOCKS"].pack(side=tk.LEFT)
-        self._select_combo_by_token(self.entries["MINIMAX_BLOCKS"],
-                                    self.settings.get("MINIMAX_BLOCKS", "all"))
-        # Live readout: a typed spec is easy to fat-finger, and "trained 3 blocks when you meant
-        # 30" is invisible in the output. Says how many blocks the box currently means.
-        self._minimax_blocks_count = tk.Label(self._minimax_blocks_frame, text="",
-                                              font=(FONT_FAMILY, 9), bg=COLORS["bg_surface"])
-        self._minimax_blocks_count.pack(side=tk.LEFT, padx=(10, 0))
-        self.entries["MINIMAX_BLOCKS"].bind(
-            "<KeyRelease>", lambda _e: self._refresh_minimax_blocks_count())
-        self.entries["MINIMAX_BLOCKS"].bind(
-            "<<ComboboxSelected>>", lambda _e: self._refresh_minimax_blocks_count())
-        self._minimax_blocks_hint = ttk.Label(
-            training_content,
-            text="EXPERIMENT — train only a subset of the 50 blocks. Type ranges and single "
-                 "blocks, comma-separated, like 3-12, 22, 31-33 (blocks 0-49). No recommended "
-                 "answer yet. Full write-up in the README.",
-            foreground="#95A5A6", font=(FONT_FAMILY, 8, "italic"), justify=tk.LEFT, wraplength=720)
-        self._minimax_blocks_hint.grid(row=29, column=0, columnspan=2, sticky=tk.W, padx=5, pady=(0, 4))
-        self._refresh_minimax_blocks_count()
 
-        # --- Per-block limiter (MiniMax only) ----------------------------------------------
+        # --- Per-step movement clip (MiniMax only) -----------------------------------------
         # Whichever block sits LAST in the trained range absorbs 2-4x the median block's
         # movement from epoch 1 (measured across four runs; cutting blocks just moves the hot
-        # spot to the new last block). The limiter caps any block's total movement at N x the
-        # median block, projected back after every step — self-targeting, so it needs no range.
-        self._minimax_limiter_label = ttk.Label(training_content, text="Per-block limiter:")
+        # spot to the new last block). This caps any block's movement WITHIN A SINGLE STEP at
+        # N x the median block's step. The 3.5.0 version capped CUMULATIVE movement instead,
+        # which also scaled down everything the block had legitimately learned — measured as a
+        # real likeness ceiling (on was visibly worse than off, off corrupted). Clipping the
+        # step prevents the overshoot instead of undoing history, so there is nothing to trade.
+        self._minimax_limiter_label = ttk.Label(training_content, text="Per-step movement clip:")
         self._minimax_limiter_label.grid(row=37, column=0, sticky=tk.W, padx=5, pady=(8, 0))
         self._minimax_limiter_frame = ttk.Frame(training_content)
         self._minimax_limiter_frame.grid(row=37, column=1, sticky=tk.W, padx=5, pady=(8, 0))
@@ -3847,16 +3964,18 @@ class LoRATrainerGUI:
             self._minimax_limiter_frame, values=["Off", "1.1 x median (tightest)",
                                                  "1.25 x median (default)",
                                                  "1.5 x median",
-                                                 "2.0 x median (loose)"],
+                                                 "2.0 x median (loose)",
+                                                 "2.5 x median",
+                                                 "3.0 x median (safety net only)"],
             width=26, state="readonly")
         self.entries["MINIMAX_BLOCK_LIMIT"].set(
-            str(self.settings.get("MINIMAX_BLOCK_LIMIT", "1.25 x median (default)")))
+            str(self.settings.get("MINIMAX_BLOCK_LIMIT", "Off")))
         self.entries["MINIMAX_BLOCK_LIMIT"].pack(side=tk.LEFT)
         self._minimax_limiter_hint = ttk.Label(
             training_content,
-            text="STRONGLY RECOMMENDED ON — stops any single block hogging the learning, the "
-                 "classic source of distortion. Turn off only for a deliberate A/B. Full "
-                 "write-up in the README.",
+            text="STRONGLY RECOMMENDED ON — stops any single block overshooting in a step, the "
+                 "classic source of distortion. Only the offending step is shortened, so it "
+                 "costs nothing that was already learned. Full write-up in the README.",
             foreground="#95A5A6", font=(FONT_FAMILY, 8, "italic"), justify=tk.LEFT, wraplength=720)
         self._minimax_limiter_hint.grid(row=38, column=0, columnspan=2, sticky=tk.W, padx=5, pady=(0, 4))
 
@@ -3868,11 +3987,19 @@ class LoRATrainerGUI:
         self._minimax_distill_frame.grid(row=35, column=0, columnspan=2, sticky=tk.W, padx=5, pady=(8, 0))
         self._minimax_distill_cb = ttk.Checkbutton(
             self._minimax_distill_frame, text="Learn identity from my dataset (reference distillation)",
-            variable=self.minimax_distill_var)
+            variable=self.minimax_distill_var, command=self._on_minimax_distill_clicked)
         self._minimax_distill_cb.pack(side=tk.LEFT)
+        # Multi Concept shows a warning while identity-learn is OFF (no reference steering), so
+        # that hint has to refresh when this checkbox moves, not only when the mode is toggled.
+        self.minimax_distill_var.trace_add(
+            "write", lambda *_a: self._on_minimax_multiconcept_toggle())
         ttk.Label(self._minimax_distill_frame, text="   teacher ").pack(side=tk.LEFT)
         self.entries["MINIMAX_DISTILL_WEIGHT"] = ttk.Combobox(
-            self._minimax_distill_frame, values=["0.6", "0.7", "0.8", "0.9", "1.0"], width=5)
+            # 0.4/0.5 added 11 Aug — an even split is a reasonable thing to want and the list
+            # stopped at 0.6, so it could not be asked for. 1.0 removes the photo term entirely,
+            # which caps the LoRA at what reference mode can already do.
+            self._minimax_distill_frame,
+            values=["0.4", "0.5", "0.6", "0.7", "0.8", "0.9", "1.0"], width=5)
         self.entries["MINIMAX_DISTILL_WEIGHT"].set(
             str(self.settings.get("MINIMAX_DISTILL_WEIGHT", "0.8")))
         self.entries["MINIMAX_DISTILL_WEIGHT"].pack(side=tk.LEFT)
@@ -3882,6 +4009,20 @@ class LoRATrainerGUI:
         self.entries["MINIMAX_DISTILL_REFS"].set(
             str(self.settings.get("MINIMAX_DISTILL_REFS", "2")))
         self.entries["MINIMAX_DISTILL_REFS"].pack(side=tk.LEFT)
+        # Identity-first: teacher-ONLY for the first stretch, then photos-only. A hard switch,
+        # not a blend — the point is where the adapter STARTS, so what phase 2 forgets about the
+        # teacher does not matter. Auto sizes phase 1 from the dataset (~650 steps, which is
+        # where the teacher error was measured to converge on a real run).
+        ttk.Label(self._minimax_distill_frame, text="   identity-first ").pack(side=tk.LEFT)
+        self.entries["MINIMAX_DISTILL_PHASE1"] = ttk.Combobox(
+            self._minimax_distill_frame, state="readonly", width=22,
+            values=["Auto (from dataset size)", "Off — blend throughout",
+                    "2 epochs", "4 epochs", "8 epochs", "16 epochs", "30 epochs"])
+        self.entries["MINIMAX_DISTILL_PHASE1"].set(
+            str(self.settings.get("MINIMAX_DISTILL_PHASE1", "Auto (from dataset size)")))
+        self.entries["MINIMAX_DISTILL_PHASE1"].pack(side=tk.LEFT)
+        self.entries["MINIMAX_DISTILL_PHASE1"].bind(
+            "<<ComboboxSelected>>", lambda _e: self._sync_distill_weight_state())
         self._minimax_distill_hint = ttk.Label(
             training_content,
             text="EXPERIMENT — teaches your LoRA to reproduce identity from the trigger word "
@@ -3891,85 +4032,70 @@ class LoRATrainerGUI:
             foreground="#95A5A6", font=(FONT_FAMILY, 8, "italic"), justify=tk.LEFT, wraplength=720)
         self._minimax_distill_hint.grid(row=36, column=0, columnspan=2, sticky=tk.W, padx=5, pady=(0, 4))
 
-        # --- Base Precision (MiniMax only) -------------------------------------------------
-        # Auto picks the quantisation and the block-swap count TOGETHER. Deciding swap alone,
-        # with the precision already fixed by which file you loaded, gives mid-range cards the
-        # worst of both: the int8 base is ~21 GB, so a 24 GB card parks 38 of 50 blocks on CPU
-        # and crosses PCIe every step for ~4x the runtime, when the same file loaded 4-bit is
-        # ~11 GB and needs no swap at all.
-        self._minimax_quant_label = ttk.Label(training_content, text="Base Precision:")
-        self._minimax_quant_label.grid(row=39, column=0, sticky=tk.W, padx=5, pady=(8, 0))
-        self._minimax_quant_frame = ttk.Frame(training_content)
-        self._minimax_quant_frame.grid(row=39, column=1, sticky=tk.W, padx=5, pady=(8, 0))
-        self.entries["MINIMAX_BASE_QUANT"] = ttk.Combobox(
-            self._minimax_quant_frame, values=list(MINIMAX_BASE_QUANT_OPTIONS), width=30,
-            state="readonly")
-        self.entries["MINIMAX_BASE_QUANT"].set(
-            str(self.settings.get("MINIMAX_BASE_QUANT", MINIMAX_BASE_QUANT_OPTIONS[0])))
-        self.entries["MINIMAX_BASE_QUANT"].pack(side=tk.LEFT)
-        self._minimax_quant_hint = ttk.Label(
-            training_content,
-            text="Auto reads your FREE VRAM at launch and picks the base precision and block "
-                 "swap together — int8 is the most accurate, 4-bit fits smaller cards. Full "
-                 "write-up in the README.",
-            foreground="#95A5A6", font=(FONT_FAMILY, 8, "italic"), justify=tk.LEFT, wraplength=720)
-        self._minimax_quant_hint.grid(row=40, column=0, columnspan=2, sticky=tk.W, padx=5, pady=(0, 4))
 
-        # --- High-LR smoothing (MiniMax only): warmup + EMA --------------------------------
-        # The two machines that make a high STATIC LR trainable. Damage at e.g. 1e-4 comes from
-        # oversized Adam strides: worst at epoch 1 (zero-init adapters, steepest surface) and
-        # rough thereafter (the weights zigzag around the good solution). Warmup fixes the first,
-        # EMA the second — together they keep the speed of the high LR without its roughness.
-        self._minimax_smooth_label = ttk.Label(training_content, text="High-LR smoothing:")
-        self._minimax_smooth_label.grid(row=41, column=0, sticky=tk.W, padx=5, pady=(8, 0))
-        self._minimax_smooth_frame = ttk.Frame(training_content)
-        self._minimax_smooth_frame.grid(row=41, column=1, sticky=tk.W, padx=5, pady=(8, 0))
-        ttk.Label(self._minimax_smooth_frame, text="Warmup ").pack(side=tk.LEFT)
-        self.entries["MINIMAX_LR_WARMUP"] = ttk.Combobox(
-            self._minimax_smooth_frame, values=["Off", "1 epoch", "2 epochs", "3 epochs"],
-            width=10, state="readonly")
-        self.entries["MINIMAX_LR_WARMUP"].set(
-            str(self.settings.get("MINIMAX_LR_WARMUP", "2 epochs")))
-        self.entries["MINIMAX_LR_WARMUP"].pack(side=tk.LEFT)
-        ttk.Label(self._minimax_smooth_frame, text="   EMA ").pack(side=tk.LEFT)
-        self.entries["MINIMAX_EMA"] = ttk.Combobox(
-            self._minimax_smooth_frame, values=["Off", "0.98 (light)", "0.99 (recommended)",
-                                                "0.995 (strong)"],
-            width=18, state="readonly")
-        self.entries["MINIMAX_EMA"].set(
-            str(self.settings.get("MINIMAX_EMA", "0.99 (recommended)")))
-        self.entries["MINIMAX_EMA"].pack(side=tk.LEFT)
-        self._minimax_smooth_hint = ttk.Label(
-            training_content,
-            text="Warmup eases the first epochs in; EMA saves a smoothed average of the "
-                 "weights. Neither costs speed — leave both on. Full write-up in the README.",
-            foreground="#95A5A6", font=(FONT_FAMILY, 8, "italic"), justify=tk.LEFT, wraplength=720)
-        self._minimax_smooth_hint.grid(row=42, column=0, columnspan=2, sticky=tk.W, padx=5, pady=(0, 4))
 
-        # --- Movement governor (MiniMax only) ----------------------------------------------
-        # The dose-response finding (8 Aug): visible distortion tracks the median block's
-        # MOVEMENT per epoch, not the LR number — ~0.15/epoch clean, ~0.23 visibly distorted,
-        # and the same LR produces 10x the movement on LoKR vs LoRA. The governor measures the
-        # movement live and throttles the effective LR to hold the clean rate.
-        self._minimax_governor_label = ttk.Label(training_content, text="Movement governor:")
-        self._minimax_governor_label.grid(row=43, column=0, sticky=tk.W, padx=5, pady=(8, 0))
-        self._minimax_governor_frame = ttk.Frame(training_content)
-        self._minimax_governor_frame.grid(row=43, column=1, sticky=tk.W, padx=5, pady=(8, 0))
-        self.entries["MINIMAX_GOVERNOR"] = ttk.Combobox(
-            self._minimax_governor_frame, values=["Off", "0.10 / epoch (gentle)",
-                                                  "0.15 / epoch (extra safe)",
-                                                  "0.22 / epoch (default)"],
-            width=24, state="readonly")
-        self.entries["MINIMAX_GOVERNOR"].set(
-            str(self.settings.get("MINIMAX_GOVERNOR", "0.22 / epoch (default)")))
-        self.entries["MINIMAX_GOVERNOR"].pack(side=tk.LEFT)
-        self._minimax_governor_hint = ttk.Label(
+
+
+        # --- Multi Concept (MiniMax only) ---------------------------------------------------
+        # Two subjects in ONE folder get cross-referenced by reference distillation: the pairing
+        # rotation runs per [[datasets]] block, so a single block marks subject A's answers
+        # against photos of subject B — which blends them rather than separating them. Giving
+        # each subject its own folder makes the rotation per-subject for free.
+        self.minimax_multiconcept_var = tk.BooleanVar(
+            value=bool(self.settings.get("MINIMAX_MULTICONCEPT", False)))
+        self._minimax_mc_frame = ttk.Frame(training_content)
+        self._minimax_mc_frame.grid(row=49, column=0, columnspan=2, sticky=tk.W, padx=5,
+                                    pady=(8, 0))
+        self._minimax_mc_cb = ttk.Checkbutton(
+            self._minimax_mc_frame, text="Multi Concept — a second subject in its own folder",
+            variable=self.minimax_multiconcept_var,
+            command=self._on_minimax_multiconcept_clicked)
+        self._minimax_mc_cb.pack(side=tk.LEFT)
+
+        # A LIST even though the UI shows one — a third concept is then a widget, not a rewrite.
+        self._concept_folder_vars = [tk.StringVar(
+            value=str(self.last_used.get("image_folder2", "") or ""))]
+        self._minimax_mc_dir_frame = ttk.Frame(training_content)
+        self._minimax_mc_dir_frame.grid(row=50, column=0, columnspan=2, sticky=tk.EW, padx=5,
+                                        pady=(2, 0))
+        ttk.Label(self._minimax_mc_dir_frame, text="Subject 2 folder:").pack(side=tk.LEFT,
+                                                                             padx=(20, 6))
+        self._minimax_mc_entry = ttk.Entry(self._minimax_mc_dir_frame,
+                                           textvariable=self._concept_folder_vars[0],
+                                           state="readonly", width=52)
+        self._minimax_mc_entry.pack(side=tk.LEFT, fill=tk.X, expand=True)
+        ttk.Button(self._minimax_mc_dir_frame, text="Browse…",
+                   command=self._browse_concept_folder).pack(side=tk.LEFT, padx=(6, 0))
+        ttk.Button(self._minimax_mc_dir_frame, text="Clear",
+                   command=lambda: self._concept_folder_vars[0].set("")).pack(side=tk.LEFT,
+                                                                             padx=(4, 0))
+        self._minimax_mc_hint = ttk.Label(
             training_content,
-            text="The speed limit that makes the Learning Rate box safe: it holds how far the "
-                 "weights actually move each epoch at the clean rate, so the LR you set is a "
-                 "ceiling, not a dose. Full write-up in the README.",
-            foreground="#95A5A6", font=(FONT_FAMILY, 8, "italic"), justify=tk.LEFT, wraplength=720)
-        self._minimax_governor_hint.grid(row=44, column=0, columnspan=2, sticky=tk.W, padx=5, pady=(0, 4))
+            text="Each folder needs its OWN trigger word, in every caption — that is the only "
+                 "thing telling the two apart. Caption and prep both folders yourself first; "
+                 "this box is training-only. Ticking the mode also sets the settings that suit "
+                 "it (identity-learn on, 4 references, identity-first 2 epochs, dropout 0.10, "
+                 "adapter-relative LR off) — all still yours to change.",
+            foreground="#95A5A6", font=(FONT_FAMILY, 8, "italic"), justify=tk.LEFT,
+            wraplength=720)
+        self._minimax_mc_hint.grid(row=51, column=0, columnspan=2, sticky=tk.W, padx=5,
+                                   pady=(0, 4))
+        # Only shown when Multi Concept is on AND identity-learn is off — see the toggle handler.
+        self._minimax_mc_nodistill_hint = ttk.Label(
+            training_content,
+            text="Identity-learn is off, so the reference steering that keeps two subjects "
+                 "apart is not running — separation rests on your trigger words alone.",
+            foreground=COLORS["warning"], font=(FONT_FAMILY, 8, "italic"), justify=tk.LEFT,
+            wraplength=720)
+        self._minimax_mc_nodistill_hint.grid(row=52, column=0, columnspan=2, sticky=tk.W,
+                                             padx=5, pady=(0, 4))
+        # These change the [[datasets]] blocks, so the TOML has to be rewritten when they move.
+        # Without this the mode looks enabled and silently trains the old single-folder config.
+        if hasattr(self, "_auto_save_ds"):
+            self.minimax_multiconcept_var.trace_add("write", self._auto_save_ds)
+            for _cv in self._concept_folder_vars:
+                _cv.trace_add("write", self._auto_save_ds)
+                _cv.trace_add("write", lambda *_a: self._save_last_used_paths())
 
         # --- Slow blocks (MiniMax only, experimental): depth-dependent LR -------------------
         self._minimax_slow_label = ttk.Label(training_content, text="Slower LR for blocks:")
@@ -4022,7 +4148,6 @@ class LoRATrainerGUI:
             foreground="#95A5A6", font=(FONT_FAMILY, 8, "italic"), justify=tk.LEFT, wraplength=720)
         self._minimax_adaln_hint.grid(row=32, column=0, columnspan=2, sticky=tk.W, padx=5, pady=(0, 4))
 
-        self._refresh_minimax_shift_match()
 
         # Answers "when do changes take effect?" (issue #40) right where people wonder it.
         ttk.Label(training_content,
@@ -4354,6 +4479,188 @@ class LoRATrainerGUI:
         # call ran before it was created, so this applies the NF4→force-GC-on lock
         # when a saved config has 4-bit already enabled.
         self._on_quant_4bit_toggle()
+
+        # === MiniMax H3 rows that belong in OTHER sections ===============================
+        # Created here rather than up in Training Parameters because Tkinter cannot re-parent
+        # a widget, and these two content frames do not exist until this point in the method.
+        # Section display order follows CollapsibleFrame construction order, so the sections
+        # themselves must not be reordered to make the parents available earlier.
+        # Base Precision -> Memory & Precision; the rest -> Other Options.
+
+        # --- Base Precision (MiniMax only) -------------------------------------------------
+        # Auto picks the quantisation and the block-swap count TOGETHER. Deciding swap alone,
+        # with the precision already fixed by which file you loaded, gives mid-range cards the
+        # worst of both: the int8 base is ~21 GB, so a 24 GB card parks 38 of 50 blocks on CPU
+        # and crosses PCIe every step for ~4x the runtime, when the same file loaded 4-bit is
+        # ~11 GB and needs no swap at all.
+        self._minimax_quant_label = ttk.Label(memory_content, text="Base Precision:")
+        self._minimax_quant_label.grid(row=16, column=0, sticky=tk.W, padx=5, pady=(8, 0))
+        self._minimax_quant_frame = ttk.Frame(memory_content)
+        self._minimax_quant_frame.grid(row=16, column=1, sticky=tk.W, padx=5, pady=(8, 0))
+        self.entries["MINIMAX_BASE_QUANT"] = ttk.Combobox(
+            self._minimax_quant_frame, values=list(MINIMAX_BASE_QUANT_OPTIONS), width=30,
+            state="readonly")
+        self.entries["MINIMAX_BASE_QUANT"].set(
+            str(self.settings.get("MINIMAX_BASE_QUANT", MINIMAX_BASE_QUANT_OPTIONS[0])))
+        self.entries["MINIMAX_BASE_QUANT"].pack(side=tk.LEFT)
+        self._minimax_quant_hint = ttk.Label(
+            memory_content,
+            text="Auto reads your FREE VRAM at launch and picks the base precision and block "
+                 "swap together — int8 is the most accurate, 4-bit fits smaller cards. Full "
+                 "write-up in the README.",
+            foreground="#95A5A6", font=(FONT_FAMILY, 8, "italic"), justify=tk.LEFT, wraplength=720)
+        self._minimax_quant_hint.grid(row=17, column=0, columnspan=2, sticky=tk.W, padx=5, pady=(0, 4))
+
+        # --- Weight averaging (MiniMax only): EMA ------------------------------------------
+        # Damage at a high static LR comes from oversized Adam strides: worst at epoch 1
+        # (zero-init adapters, steepest surface) and rough thereafter (the weights zigzag around
+        # the good solution). EMA addresses the second by saving a smoothed average.
+        #
+        # WARMUP is retired (Peter, 10 Aug): the Adapter-relative LR ramp is the better answer to
+        # the epoch-1 problem — it holds the step/size RATIO steady instead of guessing an epoch
+        # count, so it eases in by construction and keeps doing so. The widget is kept (the
+        # launch dict and presets still carry the key) but is never packed and is forced Off.
+        self._minimax_smooth_label = ttk.Label(scheduler_content, text="Weight averaging (EMA):")
+        self._minimax_smooth_label.grid(row=25, column=0, sticky=tk.W, padx=5, pady=(8, 0))
+        self._minimax_smooth_frame = ttk.Frame(scheduler_content)
+        self._minimax_smooth_frame.grid(row=25, column=1, sticky=tk.W, padx=5, pady=(8, 0))
+        self.entries["MINIMAX_LR_WARMUP"] = ttk.Combobox(     # retired — never packed
+            self._minimax_smooth_frame, values=["Off", "1 epoch", "2 epochs", "3 epochs"],
+            width=10, state="readonly")
+        self.entries["MINIMAX_LR_WARMUP"].set("Off")
+        self.entries["MINIMAX_EMA"] = ttk.Combobox(
+            self._minimax_smooth_frame, values=["Off", "0.98 (light)", "0.99 (recommended)",
+                                                "0.995 (strong)"],
+            width=18, state="readonly")
+        self.entries["MINIMAX_EMA"].set(str(self.settings.get("MINIMAX_EMA", "Off")))
+        self.entries["MINIMAX_EMA"].pack(side=tk.LEFT)
+        self._minimax_smooth_hint = ttk.Label(
+            scheduler_content,
+            text="Saves a smoothed average of the weights, so checkpoints come out crisper "
+                 "when you push the LR hard. Costs no speed. Full write-up in the README.",
+            foreground="#95A5A6", font=(FONT_FAMILY, 8, "italic"), justify=tk.LEFT, wraplength=720)
+        self._minimax_smooth_hint.grid(row=26, column=0, columnspan=2, sticky=tk.W, padx=5, pady=(0, 4))
+
+        # --- Adapter-relative LR ramp (MiniMax only, EXPERIMENT, default Off) ---------------
+        # From a real run: an adapter at ||dW||~53 took a full 2e-4 for ten epochs with no
+        # distortion and gave the best likeness of the project, while a fresh adapter is
+        # visibly damaged by half that. Same step, 9% perturbation vs 150% — a LoRA starts at
+        # zero, so step/size is worst at step 1 and improves from there. This holds that RATIO
+        # steady, which ramps the LR up toward the box value as the adapter grows.
+        self._minimax_ramp_label = ttk.Label(scheduler_content, text="Adapter-relative LR:")
+        self._minimax_ramp_label.grid(row=27, column=0, sticky=tk.W, padx=5, pady=(8, 0))
+        self._minimax_ramp_frame = ttk.Frame(scheduler_content)
+        self._minimax_ramp_frame.grid(row=27, column=1, sticky=tk.W, padx=5, pady=(8, 0))
+        self.entries["MINIMAX_ADAPTER_RAMP"] = ttk.Combobox(
+            self._minimax_ramp_frame, values=["Off", "0.003 (slow build)",
+                                              "0.005 (recommended)", "0.01 (fast build)"],
+            width=24, state="readonly")
+        self.entries["MINIMAX_ADAPTER_RAMP"].set(
+            str(self.settings.get("MINIMAX_ADAPTER_RAMP", "Off")))
+        self.entries["MINIMAX_ADAPTER_RAMP"].pack(side=tk.LEFT)
+        self._minimax_ramp_hint = ttk.Label(
+            scheduler_content,
+            text="Makes the Learning Rate box a CEILING the run climbs toward instead of a rate "
+                 "it starts at, so set the LR to where you want to end up. Full write-up in the "
+                 "README.",
+            foreground="#95A5A6", font=(FONT_FAMILY, 8, "italic"), justify=tk.LEFT, wraplength=720)
+        self._minimax_ramp_hint.grid(row=28, column=0, columnspan=2, sticky=tk.W, padx=5, pady=(0, 4))
+
+        # --- Caption dropout (MiniMax only) -------------------------------------------------
+        # A fraction of steps train the image against the EMPTY prompt instead of its caption.
+        # On a single-concept set that is healthy regularisation — it stops the LoRA leaning on
+        # the trigger token alone. On a MULTI-concept set it is the opposite: those steps teach
+        # the model to produce the concept with no trigger at all, which is exactly how one
+        # subject leaks into the other's prompts. Was hardcoded at 0.05 (the CLI default) with
+        # no way to change it from the GUI.
+        self._minimax_capdrop_label = ttk.Label(scheduler_content, text="Caption dropout:")
+        self._minimax_capdrop_label.grid(row=29, column=0, sticky=tk.W, padx=5, pady=(8, 0))
+        self._minimax_capdrop_frame = ttk.Frame(scheduler_content)
+        self._minimax_capdrop_frame.grid(row=29, column=1, sticky=tk.W, padx=5, pady=(8, 0))
+        self.entries["MINIMAX_CAPTION_DROPOUT"] = ttk.Combobox(
+            self._minimax_capdrop_frame,
+            values=["Off", "0.05 (default)", "0.10 (strong)"],
+            width=24, state="readonly")
+        self.entries["MINIMAX_CAPTION_DROPOUT"].set(
+            str(self.settings.get("MINIMAX_CAPTION_DROPOUT", "0.05 (default)")))
+        self.entries["MINIMAX_CAPTION_DROPOUT"].pack(side=tk.LEFT)
+        self._minimax_capdrop_hint = ttk.Label(
+            scheduler_content,
+            text="Trains a few percent of steps with no caption, so the LoRA does not lean "
+                 "entirely on the trigger word.",
+            foreground="#95A5A6", font=(FONT_FAMILY, 8, "italic"), justify=tk.LEFT, wraplength=720)
+        self._minimax_capdrop_hint.grid(row=30, column=0, columnspan=2, sticky=tk.W, padx=5,
+                                        pady=(0, 4))
+
+        # --- Blocks to Train (MiniMax only, experimental) ---------------------------------
+        self._minimax_blocks_label = ttk.Label(scheduler_content, text="Blocks to Train:")
+        self._minimax_blocks_label.grid(row=31, column=0, sticky=tk.W, padx=5, pady=(8, 2))
+        self._minimax_blocks_frame = ttk.Frame(scheduler_content)
+        self._minimax_blocks_frame.grid(row=31, column=1, columnspan=2, sticky=tk.W, padx=5, pady=(8, 2))
+        # Editable, not readonly — the presets are starting points and the real control is typing
+        # a spec. Anything the trainer's parser takes is legal here.
+        self.entries["MINIMAX_BLOCKS"] = ttk.Combobox(
+            self._minimax_blocks_frame, values=MINIMAX_BLOCK_OPTIONS, width=34)
+        self.entries["MINIMAX_BLOCKS"].pack(side=tk.LEFT)
+        self._select_combo_by_token(self.entries["MINIMAX_BLOCKS"],
+                                    self.settings.get("MINIMAX_BLOCKS", "all"))
+        # Live readout: a typed spec is easy to fat-finger, and "trained 3 blocks when you meant
+        # 30" is invisible in the output. Says how many blocks the box currently means.
+        self._minimax_blocks_count = tk.Label(self._minimax_blocks_frame, text="",
+                                              font=(FONT_FAMILY, 9), bg=COLORS["bg_surface"])
+        self._minimax_blocks_count.pack(side=tk.LEFT, padx=(10, 0))
+        self.entries["MINIMAX_BLOCKS"].bind(
+            "<KeyRelease>", lambda _e: self._refresh_minimax_blocks_count())
+        self.entries["MINIMAX_BLOCKS"].bind(
+            "<<ComboboxSelected>>", lambda _e: self._refresh_minimax_blocks_count())
+        self._minimax_blocks_hint = ttk.Label(
+            scheduler_content,
+            text="EXPERIMENT — train only a subset of the 50 blocks. Type ranges and single "
+                 "blocks, comma-separated, like 3-12, 22, 31-33 (blocks 0-49). No recommended "
+                 "answer yet. Full write-up in the README.",
+            foreground="#95A5A6", font=(FONT_FAMILY, 8, "italic"), justify=tk.LEFT, wraplength=720)
+        self._minimax_blocks_hint.grid(row=32, column=0, columnspan=2, sticky=tk.W, padx=5, pady=(0, 4))
+        self._refresh_minimax_blocks_count()
+
+        # --- Low-noise training share (MiniMax H3 only) -----------------------------------
+        # One number, uncapped: what fraction of steps train below sigma 0.5. Converted to the
+        # trainer's shift by minimax_lownoise_to_shift. Hidden for other families by
+        # _apply_training_arch_visibility.
+        self._minimax_shift_label = ttk.Label(scheduler_content, text="Low-noise training:")
+        self._minimax_shift_label.grid(row=33, column=0, sticky=tk.W, padx=5, pady=(8, 2))
+        self._minimax_shift_frame = ttk.Frame(scheduler_content)
+        self._minimax_shift_frame.grid(row=33, column=1, columnspan=2, sticky=tk.W, padx=5, pady=(8, 2))
+        self.entries["MINIMAX_LOWNOISE_PCT"] = ttk.Entry(self._minimax_shift_frame, width=8)
+        self.entries["MINIMAX_LOWNOISE_PCT"].insert(
+            0, str(self.settings.get("MINIMAX_LOWNOISE_PCT", "60")))
+        self.entries["MINIMAX_LOWNOISE_PCT"].pack(side=tk.LEFT)
+        ttk.Label(self._minimax_shift_frame, text="% of steps").pack(side=tk.LEFT, padx=(4, 0))
+        # Live readout: the number you type is the thing you care about, but the schedule it
+        # produces is worth seeing — especially at the extremes, where a couple of percent of
+        # change swings the shift enormously.
+        self._minimax_shift_match = tk.Label(self._minimax_shift_frame, text="",
+                                             font=(FONT_FAMILY, 9), bg=COLORS["bg_surface"])
+        self._minimax_shift_match.pack(side=tk.LEFT, padx=(10, 0))
+        self.minimax_lognorm_var = tk.BooleanVar(
+            value=bool(self.settings.get("MINIMAX_LOGNORM", True)))
+        ttk.Checkbutton(self._minimax_shift_frame, text="mid-concentrated",
+                        variable=self.minimax_lognorm_var,
+                        command=lambda: self._refresh_minimax_shift_match()).pack(side=tk.LEFT,
+                                                                                 padx=(10, 0))
+        self.entries["MINIMAX_LOWNOISE_PCT"].bind(
+            "<KeyRelease>", lambda _e: self._refresh_minimax_shift_match())
+        self._minimax_shift_hint = ttk.Label(
+            scheduler_content,
+            text="How much of the run trains on nearly-clean images — where fine detail and "
+                 "likeness are learned. 60% with mid-concentrated ticked is the tuned default. "
+                 "Full write-up in the README.",
+            foreground="#95A5A6", font=(FONT_FAMILY, 8, "italic"), justify=tk.LEFT, wraplength=720)
+        self._minimax_shift_hint.grid(row=34, column=0, columnspan=2, sticky=tk.W, padx=5, pady=(0, 4))
+
+        # Block A's initial populate — it used to sit at the tail of Training Parameters,
+        # which is now BEFORE the widget exists; the readout would have stayed blank until
+        # the user typed in the box.
+        self._refresh_minimax_shift_match()
 
 
         # === Timestep & Noise Schedule Section (Collapsed by default) ===
@@ -4783,6 +5090,29 @@ class LoRATrainerGUI:
             self.minimax_distill_var.set(bool(preset["MINIMAX_DISTILL"]))
         if "MINIMAX_LOGNORM" in preset and hasattr(self, "minimax_lognorm_var"):
             self.minimax_lognorm_var.set(bool(preset["MINIMAX_LOGNORM"]))
+        # Multi Concept: a BooleanVar plus a LIST of folders, so neither is reachable by the
+        # generic self.entries loop above. Restore the folders BEFORE the toggle so the handler
+        # that rewrites the TOML and locks caption dropout sees the finished state.
+        if "MINIMAX_CONCEPT_DIRS" in preset:
+            _dirs = preset.get("MINIMAX_CONCEPT_DIRS") or []
+            if isinstance(_dirs, str):                     # tolerate an older single-string save
+                _dirs = [_dirs] if _dirs.strip() else []
+            for _i, _v in enumerate(getattr(self, "_concept_folder_vars", [])):
+                _v.set(str(_dirs[_i]).strip() if _i < len(_dirs) else "")
+        if "MINIMAX_MULTICONCEPT" in preset and hasattr(self, "minimax_multiconcept_var"):
+            self.minimax_multiconcept_var.set(bool(preset["MINIMAX_MULTICONCEPT"]))
+        # Re-run unconditionally: a preset that carries MINIMAX_CAPTION_DROPOUT (the Defaults one
+        # does) would otherwise leave the box showing 0.05 while Multi Concept is on. Training
+        # was never at risk - the command builder locks it either way - but the UI would lie.
+        if hasattr(self, "minimax_multiconcept_var"):
+            try:
+                self._on_minimax_multiconcept_toggle()
+            except Exception:
+                pass
+        try:
+            self._sync_distill_weight_state()
+        except Exception:
+            pass
 
         # Model Area to Train (training preset dropdown)
         if "TARGET_LAYERS" in preset and hasattr(self, 'training_preset_var'):
@@ -4869,6 +5199,7 @@ class LoRATrainerGUI:
             # snapshot just restored. Older snapshots have no architecture — they simply skip this.
             _arch = snapshot.pop("__architecture__", None)
             _switched = ""
+            _arch = _canon_arch(_arch) if _arch else _arch
             if _arch and _arch in ARCHITECTURES and _arch != self.architecture_var.get():
                 self.architecture_var.set(_arch)
                 self.on_architecture_changed()
@@ -4969,13 +5300,16 @@ class LoRATrainerGUI:
             "queued_at": _time.strftime("%Y-%m-%d %H:%M"),
             "architecture": self.architecture_var.get(),
             "image_folder": self.image_folder_var.get().strip(),
+            # A queued Multi Concept run loses its second subject without this.
+            "concept_folders": [v.get().strip() for v in
+                                getattr(self, "_concept_folder_vars", [])],
             "preset": self._collect_preset_values(),
             "samples": samples,
         }
 
     def _apply_queue_item(self, item):
         """Load a queue item's settings back into the GUI (arch first — it swaps the UI)."""
-        arch = item.get("architecture", "")
+        arch = _canon_arch(item.get("architecture", ""))
         if isinstance(arch, str) and arch and arch in ARCHITECTURES and self.architecture_var.get() != arch:
             self.architecture_var.set(arch)
             try:
@@ -4986,6 +5320,11 @@ class LoRATrainerGUI:
         folder = str(item.get("image_folder") or "").strip()
         if folder:
             self.image_folder_var.set(folder)   # traces regenerate Fizgig_train.toml
+        # Multi Concept's extra folders ride separately: they are not the Start folder and must
+        # not overwrite it. Restored before the toggle so the TOML rewrite sees them.
+        _cf = item.get("concept_folders") or []
+        for _i, _v in enumerate(getattr(self, "_concept_folder_vars", [])):
+            _v.set(str(_cf[_i]).strip() if _i < len(_cf) else "")
         _samples = item.get("samples")
         for k, v in (_samples.items() if isinstance(_samples, dict) else ()):
             entry = self.entries.get(k)
@@ -5520,6 +5859,13 @@ class LoRATrainerGUI:
                 except Exception:
                     pass
 
+        # Multi Concept's folders are a LIST on a dedicated attribute, so neither the entries
+        # loop nor _grab reaches them — and without this "Load Settings From Last Train" brings
+        # the toggle back with no second subject behind it.
+        if getattr(self, "_concept_folder_vars", None):
+            preset["MINIMAX_CONCEPT_DIRS"] = [v.get().strip()
+                                              for v in self._concept_folder_vars]
+
         _grab("preserve_dist_var", "PRESERVE_DISTRIBUTION")
         _grab("fp8_var", "FP8")
         _grab("scaled_var", "SCALED")
@@ -5541,6 +5887,7 @@ class LoRATrainerGUI:
         # above does NOT see it — without this a queued distillation run loses its reference
         # and silently becomes an ordinary run (tests/test_minimax_distill_gui.py).
         _grab("minimax_distill_var", "MINIMAX_DISTILL")
+        _grab("minimax_multiconcept_var", "MINIMAX_MULTICONCEPT")
         _grab("minimax_lognorm_var", "MINIMAX_LOGNORM")
         _grab("grad_checkpoint_var", "GRADIENT_CHECKPOINTING")
         _grab("fp8_text_encoder_var", "FP8_TEXT_ENCODER")
@@ -6061,7 +6408,7 @@ class LoRATrainerGUI:
         for w in (self.labels["NETWORK_TYPE"], self._network_type_rowf):
             self._set_widget_visible(w, native)
         self._network_type_hint.config(
-            text="LoKR: higher quality" if is_minimax
+            text="LoRA recommended for MiniMax" if is_minimax
             else "LoKR: higher quality · LoRA: ~20% faster training")
 
         # Detail Focus is the inverse: MiniMax ONLY. Klein and Krea 2 already derive their shift
@@ -6071,19 +6418,38 @@ class LoRATrainerGUI:
                   self._minimax_distill_frame, self._minimax_distill_hint,
                   self._minimax_quant_label, self._minimax_quant_frame,
                   self._minimax_quant_hint,
-                  self._minimax_limiter_label, self._minimax_limiter_frame,
-                  self._minimax_limiter_hint,
                   self._minimax_smooth_label, self._minimax_smooth_frame,
                   self._minimax_smooth_hint,
-                  self._minimax_governor_label, self._minimax_governor_frame,
-                  self._minimax_governor_hint):
+                  self._minimax_ramp_label, self._minimax_ramp_frame, self._minimax_ramp_hint,
+                  self._minimax_capdrop_label, self._minimax_capdrop_frame,
+                  self._minimax_capdrop_hint,
+                  self._minimax_mc_frame,
+                  ):
             self._set_widget_visible(w, is_minimax)
-        # Retired MiniMax controls (Peter, 9 Aug) — never shown under any family. AdaLN can't
-        # deploy on the pruned builds; depth-split LR was superseded by the limiter + governor.
-        # The command builder locks both regardless of saved settings.
+        # The Multi Concept sub-rows are owned by its own toggle handler (they are hidden even
+        # under MiniMax until the box is ticked), so route them through it rather than the loop.
+        if is_minimax:
+            self._on_minimax_multiconcept_toggle()
+            self._sync_distill_weight_state()
+        else:
+            for w in (self._minimax_mc_dir_frame, self._minimax_mc_hint,
+                      self._minimax_mc_nodistill_hint):
+                self._set_widget_visible(w, False)
+        # Retired MiniMax controls — never shown under any family. AdaLN can't deploy on the
+        # pruned builds; depth-split LR was superseded by the limiter (9 Aug). The per-step clip
+        # and LR warmup joined them 10 Aug: the Adapter-relative LR ramp addresses the same
+        # epoch-1 overshoot at its root by holding the step/size ratio steady, so a movement cap
+        # and a fixed warmup count are both guesses at a problem that no longer needs them. The
+        # command builder locks every one of these regardless of saved settings.
         for w in (self._minimax_adaln_cb, self._minimax_adaln_hint,
-                  self._minimax_slow_label, self._minimax_slow_frame, self._minimax_slow_hint):
+                  self._minimax_slow_label, self._minimax_slow_frame, self._minimax_slow_hint,
+                  self._minimax_limiter_label, self._minimax_limiter_frame,
+                  self._minimax_limiter_hint):
             self._set_widget_visible(w, False)
+        if is_minimax:
+            for _k, _off in (("MINIMAX_BLOCK_LIMIT", "Off"), ("MINIMAX_LR_WARMUP", "Off")):
+                if str(self.entries[_k].get()) != _off:
+                    self.entries[_k].set(_off)     # a preset or saved config must not revive it
         # Adaptive LR is hidden under MiniMax: ticking it silently disabled the governor +
         # warmup (they defer to it). The var is forced off so the greyed-LR-box state and the
         # curated launch dict can't carry a stale True into a run.
@@ -8853,12 +9219,16 @@ class LoRATrainerGUI:
         outer = tk.Frame(scrollable_frame, bg=COLORS["bg_deep"])
         outer.pack(fill=tk.BOTH, expand=True)
 
-        self._add_tab_banner(
+        # Subtitle kept for reconfiguring per family — the "(Distilled 4-step)" parenthetical is
+        # Klein's preview stack and means nothing on the other two.
+        self._samples_banner = self._add_tab_banner(
             outer,
             "Sample Previews",
             "Preview prompts rendered periodically during training (Distilled 4-step). "
             "Samples land in <output_dir>/sample/ and the Gallery button below opens the viewer.",
         )
+        _bkids = self._samples_banner.winfo_children()
+        self._samples_banner_sub = _bkids[1] if len(_bkids) > 1 else None
 
         # Grid holder — video warning / master checkbox / settings block all row-managed
         # so update_samples_ui_for_architecture() can still .grid() / .grid_remove() them.
@@ -8974,6 +9344,7 @@ class LoRATrainerGUI:
         self.sample_ref_image_var = tk.StringVar(value=self.last_used.get("sample_ref_image", ""))
         _ref_row = tk.Frame(prompt_card, bg=COLORS["bg_surface"])
         _ref_row.grid(row=6, column=1, columnspan=2, sticky=tk.EW, pady=4)
+        self._sample_ref_row = _ref_row        # hidden wholesale for MiniMax (no ref path)
         self.sample_ref_entry = ttk.Entry(_ref_row, textvariable=self.sample_ref_image_var, state="readonly")
         self.sample_ref_entry.pack(side=tk.LEFT, fill=tk.X, expand=True)
         self.sample_ref_browse_btn = ttk.Button(_ref_row, text="Browse…", command=self._browse_sample_ref)
@@ -8995,11 +9366,13 @@ class LoRATrainerGUI:
         # Shown/hidden by update_samples_ui_for_architecture.
         self.sample_frames_label = ttk.Label(prompt_card, text="Sample length:")
         self.sample_frames_label.grid(row=8, column=0, sticky=tk.W, padx=(0, 10), pady=4)
-        # Default 22 frames (Peter, 9 Aug): a run saves a checkpoint every epoch, so previews
-        # are a heartbeat, not the verdict — ~1s of clip shows likeness arriving at a fraction
-        # of the render cost. 124 (the trained minimum) stays one click away for a full read.
+        # Default: STILL (Peter, 11 Aug). Previews are a heartbeat between per-epoch
+        # checkpoints, not the verdict, and a still renders in seconds where a clip takes
+        # minutes — at 1024 it is 1024 video rows against 17408 for a 56-frame clip. The
+        # softness that once argued for clips was four dtype/integration divergences from
+        # ComfyUI, since fixed. Pick a clip length when motion is what you need to see.
         self.sample_frames_var = tk.StringVar(
-            value=self.last_used.get("sample_frames", "22 frames (~1s)"))
+            value=self.last_used.get("sample_frames", "Still (1 frame)"))
         self.sample_frames_combo = ttk.Combobox(
             prompt_card, textvariable=self.sample_frames_var, state="readonly", width=34,
             values=["Still (1 frame)", "22 frames (~1s)", "56 frames (~2.3s)",
@@ -9007,13 +9380,9 @@ class LoRATrainerGUI:
         self.sample_frames_combo.grid(row=8, column=1, columnspan=2, sticky=tk.W, pady=4)
         self.sample_frames_var.trace_add("write", lambda *a: self._save_last_used_paths())
         self._sample_frames_hint = tk.Label(prompt_card,
-                 text="Clips render every sample as a short video you can SCRUB in the gallery "
-                      "(no autoplay) — the regime the model was trained in, so previews finally "
-                      "match ComfyUI. Clips take longer to render than stills, and longer clips "
-                      "take longer still: set how often with 'Generate every N epochs' on this "
-                      "tab, and how big with the Width/Height boxes above — both apply to "
-                      "clips. The gallery card, likeness scoring and the Visualiser use the "
-                      "clip's middle frame.",
+                 text="Samples render as short clips you can scrub in the gallery — the regime "
+                      "H3 was trained in. Longer clips cost minutes each, so set the cadence "
+                      "with 'Generate every N epochs'. Full write-up in the README.",
                  font=(FONT_FAMILY, 9, "italic"), fg=COLORS["text_explain"],
                  bg=COLORS["bg_surface"], wraplength=560, justify=tk.LEFT)
         self._sample_frames_hint.grid(row=9, column=1, columnspan=2, sticky=tk.W, pady=(0, 4))
@@ -9116,6 +9485,11 @@ class LoRATrainerGUI:
             "Architecture-specific knobs. Distilled models disable Negative Prompt; "
             "non-distilled models disable CFG Scale.",
         )
+        self._samples_arch_card = arch_card       # description reworded per family
+        # The whole card is hidden for MiniMax (every row in it is inapplicable), so keep the
+        # OUTER frame — _start_section_card returns the inner content frame, and it is the outer
+        # that was packed into sample_settings_frame.
+        self._samples_arch_outer = arch_card.master.master
         arch_card.grid_columnconfigure(1, weight=1)
 
         def _arch_note(parent, text):
@@ -9129,7 +9503,9 @@ class LoRATrainerGUI:
         _flow_frame.grid(row=0, column=1, columnspan=2, sticky=tk.W, pady=4)
         self.sample_flow_shift_entry = ttk.Entry(_flow_frame, textvariable=self.sample_flow_shift_var, width=10)
         self.sample_flow_shift_entry.pack(side=tk.LEFT)
-        _arch_note(_flow_frame, "Base samples only — Distilled uses its own schedule").pack(side=tk.LEFT, padx=(10, 0))
+        self._sample_flow_note = _arch_note(
+            _flow_frame, "Base samples only — Distilled uses its own schedule")
+        self._sample_flow_note.pack(side=tk.LEFT, padx=(10, 0))
         self.sample_flow_shift_row = 0
 
         # (Guidance Scale removed — Klein Base has no guidance embed and Distilled
@@ -9143,7 +9519,8 @@ class LoRATrainerGUI:
         _neg_frame.grid(row=1, column=1, columnspan=2, sticky=tk.W, pady=4)
         self.sample_negative_entry = ttk.Entry(_neg_frame, textvariable=self.sample_negative_var, width=50)
         self.sample_negative_entry.pack(side=tk.LEFT)
-        _arch_note(_neg_frame, "Base samples only — Distilled ignores it").pack(side=tk.LEFT, padx=(10, 0))
+        self._sample_neg_note = _arch_note(_neg_frame, "Base samples only — Distilled ignores it")
+        self._sample_neg_note.pack(side=tk.LEFT, padx=(10, 0))
         self.sample_negative_row = 1
 
         self.sample_cfg_label = ttk.Label(arch_card, text="CFG Scale:")
@@ -9153,7 +9530,8 @@ class LoRATrainerGUI:
         _cfg_frame.grid(row=2, column=1, columnspan=2, sticky=tk.W, pady=4)
         self.sample_cfg_scale_entry = ttk.Entry(_cfg_frame, textvariable=self.sample_cfg_scale_var, width=10)
         self.sample_cfg_scale_entry.pack(side=tk.LEFT)
-        _arch_note(_cfg_frame, "Base samples only — Distilled uses no CFG").pack(side=tk.LEFT, padx=(10, 0))
+        self._sample_cfg_note = _arch_note(_cfg_frame, "Base samples only — Distilled uses no CFG")
+        self._sample_cfg_note.pack(side=tk.LEFT, padx=(10, 0))
         self.sample_cfg_row = 2
 
         # Card 4: Viewer
@@ -9161,6 +9539,9 @@ class LoRATrainerGUI:
             self.sample_settings_frame, "Viewer",
             "Browse generated samples without leaving the app, or open the folder in Explorer.",
         )
+        # Anchor for re-showing the Advanced card: pack() alone would re-add it at the BOTTOM,
+        # below Viewer, so it has to go back in before this one.
+        self._samples_viewer_outer = viewer_card.master.master
 
         viewer_buttons = tk.Frame(viewer_card, bg=COLORS["bg_surface"])
         viewer_buttons.pack(anchor=tk.W)
@@ -9451,6 +9832,9 @@ class LoRATrainerGUI:
 
             # Grey out / relabel the Klein-only sample controls when Krea 2 is selected.
             self._apply_samples_klein_only(config.get("is_krea2", False))
+            # ...then let MiniMax override the wording that is still Klein's. Runs AFTER, so the
+            # Klein/Krea 2 paths above are untouched.
+            self._apply_samples_minimax(bool(config.get("is_minimax")))
 
             # Sample length (clip) row — MiniMax only: the other families' preview stacks are
             # image pipelines with no frames axis.
@@ -9464,6 +9848,81 @@ class LoRATrainerGUI:
 
         # Update sample output path label
         self.update_sample_output_label()
+
+    def _apply_samples_minimax(self, is_minimax):
+        """Reword the Samples tab for MiniMax H3, and hide what belongs to the other families.
+
+        The tab was written for Klein and still says so: the banner advertises a Distilled
+        4-step preview, and every Advanced row is annotated 'Base samples only — Distilled ...'.
+        None of that exists on H3, which renders clips on the model being trained, CFG-free, on
+        a fixed shift-12 schedule. Runs after _apply_samples_klein_only so Klein and Krea 2 keep
+        exactly the text they had; this only rewrites when MiniMax is the selected family."""
+        _MM = {
+            "banner": "Preview prompts rendered periodically during training, as short clips on "
+                      "the model being trained. Samples land in <output_dir>/sample/ and the "
+                      "Gallery button below opens the viewer.",
+            "advanced": "H3 renders CFG-free on a fixed schedule, so the knobs it does not use "
+                        "are greyed out.",
+            "flow": "Fixed at 12 for H3 — the schedule every shipped workflow uses",
+            "neg": "Unused — H3 samples render without CFG",
+            "cfg": "H3 renders without CFG; the shipped workflow does the same",
+            "steps": "20 steps matches the shipped H3 workflow",
+        }
+        _KLEIN = {
+            "banner": "Preview prompts rendered periodically during training (Distilled 4-step). "
+                      "Samples land in <output_dir>/sample/ and the Gallery button below opens "
+                      "the viewer.",
+            "advanced": "Architecture-specific knobs. Distilled models disable Negative Prompt; "
+                        "non-distilled models disable CFG Scale.",
+            "flow": "Base samples only — Distilled uses its own schedule",
+            "neg": "Base samples only — Distilled ignores it",
+            "cfg": "Base samples only — Distilled uses no CFG",
+        }
+        _t = _MM if is_minimax else _KLEIN
+
+        if getattr(self, "_samples_banner_sub", None) is not None:
+            self._samples_banner_sub.configure(text=_t["banner"])
+        _adv = getattr(self, "_samples_arch_card", None)
+        if _adv is not None and getattr(_adv, "_desc_label", None) is not None:
+            _adv._desc_label.configure(text=_t["advanced"])
+
+        # The whole Advanced card goes for MiniMax: Flow Shift is fixed at 12, and Negative
+        # Prompt and CFG Scale are both inert on a CFG-free family — three greyed rows under a
+        # heading is just a card asking to be misread.
+        _adv_outer = getattr(self, "_samples_arch_outer", None)
+        if _adv_outer is not None:
+            if is_minimax:
+                _adv_outer.pack_forget()
+            elif not _adv_outer.winfo_manager():
+                _anchor = getattr(self, "_samples_viewer_outer", None)
+                if _anchor is not None and _anchor.winfo_manager():
+                    _adv_outer.pack(fill=tk.X, padx=36, pady=(0, 16), before=_anchor)
+                else:
+                    _adv_outer.pack(fill=tk.X, padx=36, pady=(0, 16))
+        for _attr, _key in (("_sample_flow_note", "flow"), ("_sample_neg_note", "neg"),
+                            ("_sample_cfg_note", "cfg")):
+            _w = getattr(self, _attr, None)
+            if _w is not None:
+                _w.configure(text=_t[_key])
+        # Steps note: _apply_samples_klein_only owns the Klein/Krea 2 wording, so only override.
+        if is_minimax and hasattr(self, "sample_steps_note"):
+            self.sample_steps_note.configure(text=_MM["steps"])
+
+        # Klein's sample-model choice and its RAM cache have no MiniMax equivalent — previews
+        # always render on the resident training DiT. The Reference row goes too: it exists
+        # because Klein is an EDIT model (and Krea 2 has a vision path); H3 has neither, and its
+        # own r2v reference conditioning is a training feature, not a sample one. Hide rather
+        # than grey — a disabled control still reads as "something I could turn on".
+        for _attr in ("use_distilled_check", "cache_sample_model_label",
+                      "cache_sample_model_combo",
+                      "sample_ref_label", "_sample_ref_row", "sample_ref_note"):
+            _w = getattr(self, _attr, None)
+            if _w is None:
+                continue
+            try:
+                (_w.grid_remove if is_minimax else _w.grid)()
+            except tk.TclError:
+                pass          # packed, not gridded — leave it alone
 
     def _apply_samples_klein_only(self, is_krea2):
         """Mark the Klein-only sample controls when Krea 2 is selected.
@@ -15196,8 +15655,9 @@ class LoRATrainerGUI:
             "helper models (Florence-2 captioner, face model for the Look "
             "Filter and likeness scoring, EN→ZH translator — ~1.6 GB) so nothing stalls to "
             "download later. No HuggingFace account needed — none of these are gated. The "
-            "optional reference DiT is NOT included (another 21 GB most setups never use) — "
-            "grab it from its own Download link above if you want reference distillation.")
+            "reference DiT is left out unless you tick it above: another 21 GB, and it is only "
+            "used by identity mode.",
+            optional_label="Include the reference DiT (+21 GB)")
 
         # Card 4: Actions
         actions_card = self._start_section_card(outer, "Actions", None)
@@ -15444,7 +15904,7 @@ class LoRATrainerGUI:
         """Open a link. Central so the pod image's browser handling stays in one place."""
         webbrowser.open(url)
 
-    def _add_fetch_models_row(self, frame, row, family, blurb):
+    def _add_fetch_models_row(self, frame, row, family, blurb, optional_label=None):
         """'Download them all for me' row at the foot of a model-paths card.
 
         The per-row Download links open a browser and leave you to save the file and paste the
@@ -15460,6 +15920,13 @@ class LoRATrainerGUI:
                           fg=COLORS["text_secondary"], bg=COLORS["bg_surface"])
         status.pack(side=tk.LEFT, padx=(12, 0))
         setattr(self, f"_fetch_status_{family}", status)
+        if optional_label:
+            # Off by default: the only optional MiniMax weight is the 21 GB ref2va DiT, which a
+            # first setup does not need and most runs never use. The point is that the fetcher
+            # CAN get it - before this, its own Download link was the only route.
+            var = tk.BooleanVar(value=False)
+            setattr(self, f"_fetch_optional_{family}", var)
+            ttk.Checkbutton(bar, text=optional_label, variable=var).pack(side=tk.LEFT, padx=(16, 0))
         tk.Label(frame, text=blurb, font=(FONT_FAMILY, 9, "italic"), fg=COLORS["text_explain"],
                  bg=COLORS["bg_surface"], wraplength=760, justify=tk.LEFT
                  ).grid(row=row + 1, column=0, columnspan=3, sticky=tk.W, pady=(0, 2))
@@ -15589,6 +16056,9 @@ class LoRATrainerGUI:
             # Re-running is cheap — everything here is a no-op once present.
             cmd = [sys.executable, "-m", "fizgig.scripts.fetch_models", "--progress",
                    "--family", "tools", "--family", family]
+            _opt = getattr(self, f"_fetch_optional_{family}", None)
+            if _opt is not None and _opt.get():
+                cmd.append("--include-optional")
             env = dict(os.environ)
             env["PYTHONPATH"] = os.path.join(FIZGIG_DIR, "src")
             env["PYTHONUNBUFFERED"] = "1"
@@ -20941,11 +21411,72 @@ class LoRATrainerGUI:
 
     # endregion
 
+    @staticmethod
+    def _cache_dir_for(cache_root: str, image_dir: str) -> str:
+        """`<cache_root>/<folder name>-<hash of full path>` — one cache dir per image folder.
+
+        The trainer builds its item list by GLOBBING the cache directory, so two datasets sharing
+        one folder would train on each other's leftovers; the dataset layer refuses outright
+        (dataset/config.py: "cache_directory must be unique for each dataset"). The hash keeps it
+        stable per folder and unique across same-named folders, and normalises case and trailing
+        slash — which is also why the GUI must treat `C:\\A` and `c:/a/` as the SAME folder when
+        validating Multi Concept."""
+        import hashlib
+        norm = image_dir.lower().replace("\\", "/").rstrip("/")
+        h = hashlib.sha1(norm.encode("utf-8")).hexdigest()[:8]
+        nm = "".join(c if (c.isalnum() or c in "-_") else "_"
+                     for c in os.path.basename(image_dir.rstrip("/\\"))) or "dataset"
+        return os.path.join(cache_root, f"{nm}-{h}")
+
+    def _dataset_folders(self) -> list:
+        """Every image folder that should become a `[[datasets]]` block, in order.
+
+        Normally just the Start-tab folder. Multi Concept (MiniMax only) appends the extra
+        concept folders, so each subject gets its own block — which is what makes reference
+        distillation pair each image only with OTHERS OF ITS OWN SUBJECT (the rotation in
+        scripts/minimax_cache_text.py runs per dataset block).
+
+        The Start folder stays the single source of truth for Captions, Image Prep, the Look
+        filter and the gallery; only the TOML writer and validation ever see this list."""
+        folders = [self.image_folder_var.get().strip()]
+        if (getattr(self, "minimax_multiconcept_var", None) is not None
+                and self.minimax_multiconcept_var.get() and self._is_minimax_arch()):
+            for var in getattr(self, "_concept_folder_vars", []):
+                extra = var.get().strip()
+                # Skip blanks and duplicates — the dataset layer hard-fails on a repeated
+                # cache_directory, and two spellings of one path hash to the same place.
+                if not extra:
+                    continue
+                norm = extra.lower().replace("\\", "/").rstrip("/")
+                if norm in [f.lower().replace("\\", "/").rstrip("/") for f in folders]:
+                    continue
+                folders.append(extra)
+        return [f for f in folders if f]
+
     def auto_save_dataset_config_silent(self):
-        """Silently auto-save dataset config on startup if all required fields are valid"""
+        """Write the dataset TOML on startup and on every relevant edit (no Save button)."""
         if _persist_disabled():
             return
         try:
+            built = self._build_dataset_toml_text()
+            if built is None:
+                return
+            dataset_name, toml_content = built
+            output_path = os.path.join(DATASET_DIR, f"{dataset_name}.toml")
+            with open(output_path, "w", encoding="utf-8") as f:
+                f.write(toml_content)
+            self._dataset_config_var.set(output_path)
+            self.settings["DATASET_CONFIG"] = output_path
+        except Exception:
+            pass  # Silently fail - user can manually save if needed
+
+    def _build_dataset_toml_text(self):
+        """-> (dataset_name, toml text), or None when the config is not writable yet.
+
+        Split out of auto_save_dataset_config_silent so the CONTENT can be tested without
+        touching the filesystem: the writer is guarded by _persist_disabled(), and defeating
+        that guard in a test is how the real prefs got clobbered once already."""
+        if True:
             dataset_name = self.dataset_name_var.get().strip()
             dataset_type = self.dataset_type_var.get()
 
@@ -21012,12 +21543,7 @@ class LoRATrainerGUI:
             if cache_dir and not is_jsonl and not is_video:
                 _cache_img_dir = self.image_folder_var.get().strip()
                 if _cache_img_dir:
-                    import hashlib
-                    _h = hashlib.sha1(_cache_img_dir.lower().replace("\\", "/").rstrip("/")
-                                      .encode("utf-8")).hexdigest()[:8]
-                    _nm = "".join(c if (c.isalnum() or c in "-_") else "_"
-                                  for c in os.path.basename(_cache_img_dir.rstrip("/\\"))) or "dataset"
-                    cache_dir = os.path.join(cache_dir, f"{_nm}-{_h}")
+                    cache_dir = self._cache_dir_for(cache_dir, _cache_img_dir)
 
             # MiniMax uses ONE dataset at the Target Megapixels you set, exactly like Klein and
             # Krea 2. It briefly mirrored ai-toolkit's resolution: [512, 768, 1024], which copies
@@ -21038,8 +21564,24 @@ class LoRATrainerGUI:
                     video_dir = self.dataset_video_dir_var.get().strip().replace("\\", "/")
                     toml_lines.append(f'video_directory = "{video_dir}"')
                 else:
-                    image_dir = self.image_folder_var.get().strip().replace("\\", "/")
-                    toml_lines.append(f'image_directory = "{image_dir}"')
+                    # One block per concept folder. Normally a single folder, so the output is
+                    # byte-identical to the old single-block writer; Multi Concept adds a block
+                    # per extra folder, each with its OWN cache directory (which is what keeps
+                    # the reference rotation inside one subject).
+                    _folders = self._dataset_folders()
+                    _root = (self.prefs_vars["cache_dir"].get().strip()
+                             if "cache_dir" in self.prefs_vars else "")
+                    for _i, _folder in enumerate(_folders):
+                        if _i:                       # the first block's header is already down
+                            toml_lines.append("")
+                            toml_lines.append("[[datasets]]")
+                        toml_lines.append(
+                            f'image_directory = "{_folder.replace(chr(92), "/")}"')
+                        _cd = self._cache_dir_for(_root, _folder) if _root else ""
+                        if _cd:
+                            toml_lines.append(
+                                f'cache_directory = "{_cd.replace(chr(92), "/")}"')
+                    cache_dir = ""                   # emitted per block above
 
             if cache_dir:
                 toml_lines.append(f'cache_directory = "{cache_dir.replace(chr(92), "/")}"')
@@ -21054,20 +21596,7 @@ class LoRATrainerGUI:
                 except ValueError:
                     pass
 
-            toml_content = "\n".join(toml_lines) + "\n"
-
-            # Save to file (silently overwrite if exists)
-            output_path = os.path.join(DATASET_DIR, f"{dataset_name}.toml")
-
-            with open(output_path, 'w', encoding='utf-8') as f:
-                f.write(toml_content)
-
-            # Set as active dataset
-            self._dataset_config_var.set(output_path)
-            self.settings["DATASET_CONFIG"] = output_path
-
-        except Exception:
-            pass  # Silently fail - user can manually save if needed
+            return dataset_name, "\n".join(toml_lines) + "\n"
 
     def show_context_menu(self, event):
         """Show context menu on right-click"""
@@ -21269,6 +21798,36 @@ class LoRATrainerGUI:
                                   "model from the one above and the only H3 build that takes "
                                   "reference images.")
                 _check_num("References each", self.entries["MINIMAX_DISTILL_REFS"].get(), int, 1)
+            # Multi Concept: each extra folder becomes its own [[datasets]] block, so it has to
+            # exist, be distinct, and carry its own captions. The dataset layer refuses two
+            # blocks sharing a cache_directory, and the cache path hashes a case-folded,
+            # slash-stripped path — so C:\A and c:/a/ are the SAME folder as far as it cares.
+            if (getattr(self, "minimax_multiconcept_var", None)
+                    and self.minimax_multiconcept_var.get()):
+                _seen = {self.image_folder_var.get().strip().lower()
+                         .replace("\\", "/").rstrip("/")}
+                _extra = [v.get().strip() for v in getattr(self, "_concept_folder_vars", [])]
+                if not any(_extra):
+                    errors.append("Multi Concept is on but no second subject folder is set — "
+                                  "pick one, or turn the mode off.")
+                for _f in _extra:
+                    if not _f:
+                        continue
+                    _norm = _f.lower().replace("\\", "/").rstrip("/")
+                    if _norm in _seen:
+                        errors.append(f"Multi Concept: {_f} is the same folder as another "
+                                      f"subject — each needs its own folder.")
+                        continue
+                    _seen.add(_norm)
+                    if not os.path.isdir(_f):
+                        errors.append(f"Multi Concept: folder does not exist: {_f}")
+                        continue
+                    _ext = (self.dataset_caption_ext_var.get().strip() or ".txt")
+                    if not any(fn.lower().endswith(_ext.lower()) for fn in os.listdir(_f)):
+                        errors.append(
+                            f"Multi Concept: no {_ext} captions in {_f}. Caption both folders "
+                            f"before training — each subject needs its own trigger word in "
+                            f"every caption, or they will blend.")
         elif config.get("is_krea2"):
             # Krea 2 reads its own four model paths from Preferences (krea2_*). The
             # Turbo DiT is only required when in-training previews are enabled.
@@ -21691,11 +22250,15 @@ class LoRATrainerGUI:
             "MINIMAX_BLOCKS": minimax_block_spec(self.entries["MINIMAX_BLOCKS"].get()),
             "MINIMAX_TRAIN_ADALN": bool(self.entries["MINIMAX_TRAIN_ADALN"].get()),
             "MINIMAX_DISTILL": bool(self.minimax_distill_var.get()),
+            "MINIMAX_MULTICONCEPT": bool(self.minimax_multiconcept_var.get()),
+            "MINIMAX_CONCEPT_DIRS": [v.get().strip() for v in
+                                     getattr(self, "_concept_folder_vars", [])],
             "MINIMAX_BASE_QUANT": self.entries["MINIMAX_BASE_QUANT"].get(),
             "MINIMAX_BLOCK_LIMIT": self.entries["MINIMAX_BLOCK_LIMIT"].get(),
             "MINIMAX_LR_WARMUP": self.entries["MINIMAX_LR_WARMUP"].get(),
             "MINIMAX_EMA": self.entries["MINIMAX_EMA"].get(),
-            "MINIMAX_GOVERNOR": self.entries["MINIMAX_GOVERNOR"].get(),
+            "MINIMAX_ADAPTER_RAMP": self.entries["MINIMAX_ADAPTER_RAMP"].get(),
+            "MINIMAX_CAPTION_DROPOUT": self.entries["MINIMAX_CAPTION_DROPOUT"].get(),
             "MINIMAX_DISTILL_WEIGHT": str(self.entries["MINIMAX_DISTILL_WEIGHT"].get() or "0.8").strip(),
             "MINIMAX_DISTILL_REFS": str(self.entries["MINIMAX_DISTILL_REFS"].get() or "2").strip(),
             "MINIMAX_SLOW_BLOCKS": str(self.entries["MINIMAX_SLOW_BLOCKS"].get() or "").strip(),
@@ -22210,8 +22773,14 @@ class LoRATrainerGUI:
             return self._build_krea2_cache_command("krea2_cache_latents.py",
                                                    "--vae", self._krea2_pref("krea2_vae"))
         if config.get("is_minimax"):
-            return self._build_krea2_cache_command("minimax_cache_latents.py",
-                                                   "--vae", self._krea2_pref("minimax_vae"))
+            # --skip_existing: re-launching the same dataset should not re-encode every image.
+            # Safe on LATENTS specifically because the skip validates the cached latent against
+            # the CURRENT bucket, not just the filename — change Target Megapixels and it
+            # re-encodes anyway. Deliberately NOT passed to text caching, where the skip is
+            # filename-only and would silently reuse the embedding of an edited caption.
+            return self._build_krea2_cache_command(
+                "minimax_cache_latents.py", "--vae", self._krea2_pref("minimax_vae")) + \
+                ["--skip_existing"]
         arch = self.settings["ARCHITECTURE"]
         python_path = self._venv_python()
         cache_script_path = self._resolve_script(config, "cache_latents_script")
@@ -22673,19 +23242,33 @@ class LoRATrainerGUI:
         # Base Precision. Always sent, including "auto", so the launched command records which
         # base a run used rather than leaving it implicit — these get A/B'd against each other.
         cmd += ["--base_quant", minimax_base_quant(self.settings.get("MINIMAX_BASE_QUANT"))]
-        _bl = str(self.settings.get("MINIMAX_BLOCK_LIMIT", "Off") or "Off").split(" ")[0]
-        if _bl.replace(".", "", 1).isdigit():
-            cmd += ["--block_limit", _bl]
-        # High-LR smoothing: warmup ("2 epochs" -> 2) and EMA ("0.99 (recommended)" -> 0.99).
-        _wu = str(self.settings.get("MINIMAX_LR_WARMUP", "Off") or "Off").split(" ")[0]
-        if _wu.replace(".", "", 1).isdigit():
-            cmd += ["--lr_warmup_epochs", _wu]
+        # Per-step movement clip: RETIRED (Peter, 10 Aug) — the Adapter-relative LR ramp removes
+        # the overshoot at its root rather than capping it after the fact. Never emitted, so an
+        # old preset or a saved config cannot revive it.
+        # Gradient Accumulation (Optimizer section). The field was visible under MiniMax but
+        # never emitted, so it silently did nothing on this family.
+        try:
+            _accum = int(str(self.settings.get("GRADIENT_ACCUMULATION", 1) or 1).strip() or 1)
+        except ValueError:
+            _accum = 1
+        if _accum > 1:
+            cmd += ["--gradient_accumulation_steps", str(_accum)]
+        # LR warmup: RETIRED alongside the clip — the ramp eases the first epochs in by
+        # construction, and does not need an epoch count guessed up front. Never emitted.
+        # EMA stays: "0.99 (recommended)" -> 0.99.
         _em = str(self.settings.get("MINIMAX_EMA", "Off") or "Off").split(" ")[0]
         if _em.replace(".", "", 1).isdigit():
             cmd += ["--ema_decay", _em]
-        _gv = str(self.settings.get("MINIMAX_GOVERNOR", "Off") or "Off").split(" ")[0]
-        if _gv.replace(".", "", 1).isdigit():
-            cmd += ["--movement_budget", _gv]
+        _ar = str(self.settings.get("MINIMAX_ADAPTER_RAMP", "Off") or "Off").split(" ")[0]
+        if _ar.replace(".", "", 1).isdigit():
+            cmd += ["--adapter_ramp", _ar]
+        # Caption dropout. ALWAYS sent, including 0 — the trainer's own default is 0.05, so
+        # "Off" has to be stated explicitly or it silently keeps dropping captions.
+        # Whatever the box says, including under Multi Concept — the builder used to force it to
+        # 0 there, which quietly made every multi-concept run a dropout-off run and confounded
+        # the very comparison it was meant to help.
+        _cd = str(self.settings.get("MINIMAX_CAPTION_DROPOUT", "0.05") or "0.05").split(" ")[0]
+        cmd += ["--caption_dropout", _cd if _cd.replace(".", "", 1).isdigit() else "0"]
         # Gradient Checkpointing. The flag used to not be sent at all here, so the checkbox was
         # decorative on this family. Ticked (the default) means AUTO — the planner decides from
         # free VRAM, exactly like Blocks Swap and Base Precision, and in practice that is "on"
@@ -22719,6 +23302,12 @@ class LoRATrainerGUI:
         if self.settings.get("MINIMAX_DISTILL"):
             cmd += ["--distill",
                     "--distill_weight", str(self.settings.get("MINIMAX_DISTILL_WEIGHT", "0.8"))]
+            # Identity-first phase length. "Auto" -> -1 (the trainer sizes it from the dataset),
+            # "Off" -> 0 (blended throughout), otherwise the leading number of epochs.
+            _p1 = str(self.settings.get("MINIMAX_DISTILL_PHASE1", "Auto") or "Auto")
+            _p1n = "-1" if _p1.startswith("Auto") else ("0" if _p1.startswith("Off")
+                                                        else _p1.split(" ")[0])
+            cmd += ["--distill_phase1_epochs", _p1n if _p1n.lstrip("-").isdigit() else "-1"]
         # AdaLN LOCKED off (Peter, 9 Aug): the pruned builds everyone deploys on cannot load
         # AdaLN LoRA keys, so training it only wastes capacity. Checkbox hidden; always opt out.
         cmd.append("--no_train_adaln")

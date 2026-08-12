@@ -81,13 +81,21 @@ def setup_parser() -> argparse.ArgumentParser:
                    help="EXPERIMENT: reference distillation. Instead of only reconstructing each "
                         "photo, the LoRA is taught to behave — from text alone — as the model "
                         "does when SHOWN a reference. The references are OTHER images from this "
-                        "same dataset, paired by minimax_cache_text --reference_count. Train and "
-                        "deploy on the ref2va checkpoint.")
+                        "same dataset, paired by minimax_cache_text --reference_count. The whole "
+                        "run trains on ref2va (it is the only build that accepts references), "
+                        "but the resulting LoRA deploys fine on the ordinary fl2va model.")
     p.add_argument("--distill_weight", type=float, default=0.8, metavar="W",
                    help="Teacher share of the loss (default 0.8); the remaining 1-W is the "
                         "ordinary flow loss against the real photo. 1.0 is pure distillation, "
                         "which caps the LoRA at exactly the teacher's habits; a little photo "
-                        "keeps real photographic detail reachable.")
+                        "keeps real photographic detail reachable. Ignored when "
+                        "--distill_phase1_epochs is active.")
+    p.add_argument("--distill_phase1_epochs", type=int, default=-1, metavar="N",
+                   help="Identity-first: train the first N epochs against the TEACHER ONLY, then "
+                        "drop the teacher and train on the photographs alone. -1 (default) picks "
+                        "N from the dataset size so phase 1 is ~650 gradient steps, which is "
+                        "where the teacher objective converges. 0 = off (blended loss "
+                        "throughout, using --distill_weight).")
     p.add_argument("--slow_blocks", default=None, metavar="SPEC",
                    help="EXPERIMENT: train these blocks at a reduced learning rate (same syntax "
                         "as --train_blocks). A perturbation in a late block reaches the output "
@@ -97,7 +105,18 @@ def setup_parser() -> argparse.ArgumentParser:
     p.add_argument("--slow_block_lr_scale", type=float, default=1.0, metavar="X",
                    help="LR multiplier for --slow_blocks (e.g. 0.2 = one fifth). 1.0 disables.")
     p.add_argument("--block_limit", type=float, default=0.0,
-                   help="Per-block movement limiter: cap any block's total relative movement at N x the median block (1.25 recommended). 0 = off.")
+                   help="Per-step movement clip: cap any block's movement in a SINGLE step at "
+                        "N x the median block's step (1.25 recommended). Prevents the overshoot "
+                        "rather than undoing accumulated learning. 0 = off.")
+    p.add_argument("--adapter_ramp", type=float, default=0.0, metavar="R",
+                   help="Adapter-relative LR: hold each step at fraction R of the adapter's "
+                        "current size, so the LR starts low and climbs toward --learning_rate "
+                        "as the adapter grows (0.005 = ~0.5%% growth per step). Dimensionless, "
+                        "so it needs no dataset or network-type calibration. 0 = off.")
+    p.add_argument("--gradient_accumulation_steps", type=int, default=1, metavar="N",
+                   help="Sum the gradient over N batches before each optimizer step (effective "
+                        "batch N). Same wall-clock per epoch; each step is aimed by N images "
+                        "instead of one, so a large stride carries far less sampling noise.")
     p.add_argument("--lr_warmup_epochs", type=float, default=0.0, metavar="N",
                    help="Ramp the LR linearly from 0 to the configured rate over the first N "
                         "epochs (fractions allowed). Static LR only — ignored under adaptive. "
@@ -106,11 +125,6 @@ def setup_parser() -> argparse.ArgumentParser:
                    help="Keep an exponential moving average of the adapter and save/preview THAT "
                         "instead of the raw weights (0.99 recommended). Training still runs on "
                         "the raw weights. 0 = off.")
-    p.add_argument("--movement_budget", type=float, default=0.0, metavar="B",
-                   help="Movement governor: throttle the LR so the median block moves ~B per "
-                        "epoch (0.15 = the measured clean rate). Makes the configured LR a "
-                        "ceiling instead of a dose — safe for any network type. 0 = off. "
-                        "Ignored under adaptive LR.")
     p.add_argument("--no_train_adaln", dest="train_adaln", action="store_false",
                    help="EXPERIMENT: drop the per-block AdaLN adapters. AdaLN is a function of "
                         "the TIMESTEP only, so it cannot encode identity — yet on the pruned "
@@ -215,13 +229,15 @@ def main():
         train_blocks=args.train_blocks,
         distill=args.distill,
         distill_weight=args.distill_weight,
+        distill_phase1_epochs=args.distill_phase1_epochs,
         train_adaln=args.train_adaln,
         slow_blocks=args.slow_blocks,
         slow_block_lr_scale=args.slow_block_lr_scale,
         block_limit=args.block_limit,
+        adapter_ramp=args.adapter_ramp,
+        gradient_accumulation_steps=args.gradient_accumulation_steps,
         lr_warmup_epochs=args.lr_warmup_epochs,
         ema_decay=args.ema_decay,
-        movement_budget=args.movement_budget,
         quantize=not args.no_quantize,
         shift=args.shift,
         blocks_to_swap=args.blocks_to_swap,

@@ -212,7 +212,7 @@ def build_image_processor(tokenizer_dir=None):
     return AutoImageProcessor.from_pretrained(tokenizer_dir or _bundled_tokenizer_dir())
 
 
-def build_reference_tokens(tokenizer, image_processor, caption, images, max_length: int = 512):
+def build_reference_tokens(tokenizer, image_processor, caption, images, max_length: int = None):
     """The r2v prompt presentation: `<Picture i>: <vision block>` per image, then the caption.
 
     Returns (input_ids [1, L], token_tags [L], pixel_values, image_grid_thw). Mirrors
@@ -239,8 +239,10 @@ def build_reference_tokens(tokenizer, image_processor, caption, images, max_leng
             ids += label + vision_ids
             tags += [TEXT_TAG] * len(label) + [VIDEO_TAG] * len(vision_ids)
 
-    prompt_ids = tokenizer(caption, add_special_tokens=False,
-                           truncation=True, max_length=max_length)["input_ids"]
+    _tk = dict(add_special_tokens=False)
+    if max_length:                                  # None -> no cap, matching ComfyUI
+        _tk.update(truncation=True, max_length=max_length)
+    prompt_ids = tokenizer(caption, **_tk)["input_ids"]
     ids += prompt_ids
     tags += [TEXT_TAG] * len(prompt_ids)
     if not ids:                                     # empty prompt with no reference
@@ -277,19 +279,27 @@ class MiniMaxH3TextEncoder:
         return 151643 if pid is None else int(pid)
 
     @torch.no_grad()
-    def encode(self, caption: str, max_length: int = 512) -> torch.Tensor:
+    def encode(self, caption: str, max_length: int = None) -> torch.Tensor:
         """Encode one caption to [1, L, 5120]. Memoized by caption text for the caching pass.
 
         Text conditioning does not depend on resolution or on anything else that varies between
         dataset blocks, so a caption that appears more than once — repeated text, or several
         dataset entries over the same folder — is encoded once. Under the nvfp4-resident encoder
-        a forward dequantizes 351 weights, so a repeat is far from free."""
+        a forward dequantizes 351 weights, so a repeat is far from free.
+
+        max_length=None means NO TRUNCATION, matching ComfyUI (its MiniMax tokenizer sets
+        max_length=99999999, pad_to_max_length=False). This used to cap at 512, which silently
+        dropped the tail of a long prompt — and worse, the text length sets the media clock
+        ORIGIN for the video rows, so a truncated prompt also shifted the render onto a
+        different temporal grid than the same prompt in ComfyUI."""
         hit = self._cache.get(caption)
         if hit is not None:
             return hit.clone()                             # callers must not share storage
         # H3: raw prompt text, NO special tokens (no chat template).
-        ids = self.tokenizer(caption, add_special_tokens=False, return_tensors="pt",
-                             truncation=True, max_length=max_length)["input_ids"].to(self.device)
+        _tk = dict(add_special_tokens=False, return_tensors="pt")
+        if max_length:                                     # None/0 -> no cap, as ComfyUI does
+            _tk.update(truncation=True, max_length=max_length)
+        ids = self.tokenizer(caption, **_tk)["input_ids"].to(self.device)
         if ids.shape[1] == 0:                              # empty caption -> single pad token
             ids = torch.tensor([[self._pad_id()]], device=self.device)
         out = self.model(input_ids=ids)                    # norm=Identity -> raw layer-50 output
@@ -299,7 +309,7 @@ class MiniMaxH3TextEncoder:
         return emb
 
     @torch.no_grad()
-    def encode_with_reference(self, caption: str, images, max_length: int = 512):
+    def encode_with_reference(self, caption: str, images, max_length: int = None):
         """r2v conditioning: `<Picture i>:` vision blocks + caption -> ([1, L, 5120], tags [L]).
 
         Requires the encoder to have been built with build_qwen3vl_te() — the text-only
@@ -343,7 +353,7 @@ class MiniMaxH3TextEncoder:
     # caption path achieves, not merely "look close".
 
     @torch.no_grad()
-    def encode_batch(self, captions, max_length: int = 512, batch_size: int = 8):
+    def encode_batch(self, captions, max_length: int = None, batch_size: int = 8):
         """Encode many captions, returning [1, L_i, 5120] each — same values as encode(), fewer
         forwards.
 
@@ -367,8 +377,10 @@ class MiniMaxH3TextEncoder:
             idxs = todo[start:start + batch_size]
             toks = []
             for i in idxs:
-                t = self.tokenizer(captions[i], add_special_tokens=False, return_tensors="pt",
-                                   truncation=True, max_length=max_length)["input_ids"][0]
+                _tk = dict(add_special_tokens=False, return_tensors="pt")
+                if max_length:                      # None -> no cap, matching ComfyUI
+                    _tk.update(truncation=True, max_length=max_length)
+                t = self.tokenizer(captions[i], **_tk)["input_ids"][0]
                 toks.append(t if t.numel() else torch.tensor([pad_id]))
             L = max(t.numel() for t in toks)
             ids = torch.full((len(toks), L), pad_id, dtype=torch.long)

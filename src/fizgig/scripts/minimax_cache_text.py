@@ -123,8 +123,29 @@ def _cache_reference_conditioning(args, datasets, all_files, all_paths, encoder)
 
         logger.info("[reference] dataset %d: %d images, %d reference(s) each (rotation) — every "
                     "image is used as a reference %d time(s)", ds_i, n, kk, kk)
+
+        # Clear this dataset's OLD reference slots first. The trainer picks a slot by existence
+        # (image_dataset: `[i for i in range(8) if os.path.exists(...ref{i}...)]`), so re-caching
+        # with FEWER references used to leave the higher-numbered files behind and they could
+        # still be drawn — silently training against a pairing from a previous configuration.
+        # Safe because the pass below rewrites slots 0..kk-1 for every image in this dataset;
+        # nothing is deleted that is not about to be regenerated. Scoped to this cache dir, so a
+        # second subject's references are untouched.
+        if cache_dir and os.path.isdir(cache_dir):
+            _stale = [p for p in _glob.glob(os.path.join(_glob.escape(cache_dir),
+                                                         f"*{ARCHITECTURE_MINIMAX}_teref*.safetensors"))]
+            for _p in _stale:
+                try:
+                    os.remove(_p)
+                except OSError as _e:
+                    logger.warning("[reference] could not clear %s (%s)", _p, _e)
+            if _stale:
+                logger.info("[reference] cleared %d stale reference slot file(s) in %s",
+                            len(_stale), cache_dir)
+
         process_batches(args, [ds], [all_files[ds_i]], [all_paths[ds_i]],
-                        lambda batch: encode_and_save_reference_text(encoder, batch, reference_for))
+                        lambda batch: encode_and_save_reference_text(encoder, batch, reference_for),
+                        index_offset=ds_i)
 
 
 def main():
