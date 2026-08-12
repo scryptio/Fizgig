@@ -6,11 +6,12 @@ cd /d "%~dp0"
 echo [AMD-ROCm] Setting environment variables...
 set "MIOPEN_FIND_MODE=2"
 set "FLASH_ATTENTION_TRITON_AMD_ENABLE=TRUE"
-set "PYTORCH_ALLOC_CONF=max_split_size_mb:512,garbage_collection_threshold:0.8"
+REM expandable_segments mirrors upstream train scripts' CUDA alloc policy (ROCm key).
+set "PYTORCH_ALLOC_CONF=expandable_segments:True,max_split_size_mb:512,garbage_collection_threshold:0.8"
 set "TORCH_ROCM_AOTRITON_ENABLE_EXPERIMENTAL=1"
 set "FIZGIG_GPU_BACKEND=rocm"
 
-REM BNB_ROCM_VERSION / ROCM_PATH / HIP_PATH — written by install_fizgig_rocm.bat
+REM BNB_ROCM_VERSION / ROCM_PATH / HIP_PATH - written by install_fizgig_rocm.bat
 REM to match the installed PyTorch ROCm SDK (e.g. 715 for ROCm 7.15).
 if exist "%~dp0rocm_env.bat" (
     call "%~dp0rocm_env.bat"

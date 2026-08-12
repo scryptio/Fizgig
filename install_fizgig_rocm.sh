@@ -3,7 +3,7 @@
 # HIGHLY EXPERIMENTAL: Linux AMD training is best-effort only (driver resets, gfx gaps,
 # desktop+compute contention). Use Windows ROCm or NVIDIA Linux for production workloads.
 # Detects gfx target, installs PyTorch/ROCm from AMD multi-arch wheels into venv,
-# then Fizgig deps from requirements-global.txt.
+# then Fizgig deps from requirements.txt (CUDA torch/bnb lines filtered out).
 # Prerequisites: amdgpu driver, /dev/kfd, user in render/video groups; sudo for libnuma-dev / pythonX.Y-dev.
 set -euo pipefail
 
@@ -511,6 +511,15 @@ echo "  Klein 9B and Krea 2 LoRA Studio"
 echo "  *** HIGHLY EXPERIMENTAL — Linux AMD is best-effort only ***"
 echo "============================================================"
 echo
+echo "PyTorch / ROCm wheels are from AMD indexes — not built by Fizgig."
+echo "  Channel: ${ROCM_CHANNEL}  (stable → ${ROCM_INDEX} ; nightly → ${ROCM_NIGHTLY_INDEX})"
+echo "  Default pin: torch==${TORCH_PIN}  rocm-sdk==${ROCM_SDK_PIN}"
+echo
+echo "Shared deps come from requirements.txt with CUDA torch/bnb lines filtered out."
+echo "bitsandbytes>=0.50.0 is installed separately (ROCm 7.14 / libbitsandbytes_rocm714.so)."
+echo
+echo "Optional status-bar VRAM: sudo apt install amdrocm-amdsmi  (or dnf equivalent)."
+echo
 
 if [[ ! -e /dev/kfd ]]; then
     echo "ERROR: /dev/kfd not found — AMD ROCm kernel driver is not loaded."
@@ -636,13 +645,16 @@ case "$ARCH" in
 esac
 
 echo
-echo "Installing Fizgig dependencies..."
+echo "Installing Fizgig dependencies from requirements.txt (CUDA torch/bnb lines stripped)..."
+SHARED_REQS="$(mktemp)"
+python filter_requirements_rocm.py requirements.txt "$SHARED_REQS"
 python -m uv pip install --link-mode copy --index-strategy unsafe-best-match \
-    -r requirements-global.txt
+    -r "$SHARED_REQS"
+rm -f "$SHARED_REQS"
 
 echo
-echo "Installing bitsandbytes (ROCm 7.14 — libbitsandbytes_rocm714.so)..."
-python -m pip install -U -r requirements-rocm-linux.txt
+echo "Installing bitsandbytes (ROCm 7.14 - libbitsandbytes_rocm714.so)..."
+python -m uv pip install --link-mode copy -U "bitsandbytes>=0.50.0"
 
 echo
 echo "Verifying bitsandbytes ROCm 7.14 library..."
@@ -695,7 +707,7 @@ if hit:
     print(f"OK  VRAM monitor: {used / (1024**3):.1f} / {total / (1024**3):.1f} GB in use")
 else:
     print("WARN VRAM monitor: amd-smi unavailable or returned no data.")
-    print("     Optional: sudo apt install amdrocm-amdsmi (see requirements-rocm-linux.txt)")
+    print("     Optional: sudo apt install amdrocm-amdsmi (see README)")
 PY
 
 echo

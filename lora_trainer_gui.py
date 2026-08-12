@@ -2249,7 +2249,7 @@ class LoRATrainerGUI:
         """Bottom status panel: stacked VRAM + system-RAM gradient fill bars (with
         per-run peak ticks) on the left, the live sample override on the right,
         and a remembered hide/show toggle. A daemon thread does the reads so the
-        Tk redraw never stalls on an nvidia-smi / typeperf call."""
+        Tk redraw never stalls on an nvidia-smi call."""
         container = tk.Frame(master, bg=COLORS["bg_deep"])
         container.pack(side=tk.BOTTOM, fill=tk.X)
         self._status_container = container
@@ -2389,10 +2389,34 @@ class LoRATrainerGUI:
             pass
 
     def _read_vram(self):
-        """Return (used_bytes, total_bytes) for GPU 0, or None."""
+        """Return (used_bytes, total_bytes) for GPU 0, or None. Prefers pynvml
+        (fast); falls back to a one-shot nvidia-smi query. AMD ROCm paths are
+        tried only when NVIDIA readers return nothing."""
         try:
-            from fizgig.utils.vram_monitor import read_gpu_vram
-            return read_gpu_vram()
+            import pynvml
+            if not getattr(self, "_nvml_init", False):
+                pynvml.nvmlInit()
+                self._nvml_handle = pynvml.nvmlDeviceGetHandleByIndex(0)
+                self._nvml_init = True
+            m = pynvml.nvmlDeviceGetMemoryInfo(self._nvml_handle)
+            return int(m.used), int(m.total)
+        except Exception:
+            pass
+        try:
+            import subprocess
+            out = subprocess.run(
+                ["nvidia-smi", "--query-gpu=memory.used,memory.total",
+                 "--format=csv,noheader,nounits"],
+                capture_output=True, text=True, timeout=4,
+                creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
+            )
+            used, total = out.stdout.strip().splitlines()[0].split(",")
+            return int(used) * 1024 * 1024, int(total) * 1024 * 1024
+        except Exception:
+            pass
+        try:
+            from fizgig.utils.vram_monitor import read_amd_gpu_vram
+            return read_amd_gpu_vram()
         except Exception:
             return None
 
@@ -2445,7 +2469,7 @@ class LoRATrainerGUI:
     def _poll_status_bar(self):
         vram, ram = getattr(self, "_status_latest", (None, None))
         visible = getattr(self, "_status_bar_visible", True)
-        if vram and vram[1] > 0:
+        if vram:
             u, t = vram
             self._vram_peak = max(self._vram_peak, u)
             if visible:

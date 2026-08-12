@@ -275,17 +275,15 @@ def match_gpu_to_gfx(gpu):
 def detect_gpu():
     log("Attempting to detect AMD GPU...")
     
-    # Try different detection methods in order of preference
+    # Prefer PowerShell CIM (wmic is deprecated on modern Windows).
     amd_gpus = []
-    
-    # Method 1: wmic (fast and works on most systems)
-    log("Trying wmic method...")
-    amd_gpus = detect_gpu_wmic()
-    
-    # Method 2: PowerShell (works on all modern Windows)
+
+    log("Trying PowerShell CIM method...")
+    amd_gpus = detect_gpu_powershell()
+
     if not amd_gpus:
-        log("Trying PowerShell method...")
-        amd_gpus = detect_gpu_powershell()
+        log("Trying wmic method...")
+        amd_gpus = detect_gpu_wmic()
     
     if not amd_gpus:
         log("No AMD GPU detected")

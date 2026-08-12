@@ -118,6 +118,20 @@ comfyui-rocm repository linked above.
 
 ---
 
+## bitsandbytes Windows ROCm wheel (0xDELUXA) — downloaded at install time
+
+The Windows AMD installer (`install_fizgig_rocm.bat`) downloads a **pinned**
+community bitsandbytes wheel from:
+
+https://github.com/0xDELUXA/bitsandbytes_win_rocm
+
+That wheel is **not** built by AMD or Fizgig; it is only fetched on the AMD
+install path. Official ROCm PyTorch wheels similarly come from AMD's nightly
+index (`https://rocm.nightlies.amd.com/whl-multi-arch/`), also disclosed by the
+installer before download.
+
+---
+
 ## Note on model weights
 
 The third-party notices above cover **source code** only. Krea 2 / FLUX.2 model

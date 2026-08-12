@@ -12,18 +12,14 @@ import os
 # Ensure fizgig package is importable
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", ".."))
 
-# GPU allocator policy, set before torch is imported below — the backend is fixed at init.
+# CUDA allocator policy, set before torch is imported below — the backend is fixed at CUDA init.
 # Training churns the allocator: large tensors allocated and freed every step, and on a rotating
 # fine-tune whole windows swap between bf16 and fp8 each epoch. The default allocator carves from
 # fixed-size segments, which fragments under that pattern and worsens as a run goes on.
 # The GUI already sets this and the training subprocess inherits it; this covers headless runs.
 # Respects an existing value, and FIZGIG_NO_EXPANDABLE=1 opts out for A/B testing.
-# Set both CUDA and ROCm env keys — PyTorch reads the one that matches the active backend.
-if os.environ.get("FIZGIG_NO_EXPANDABLE") != "1":
-    if not os.environ.get("PYTORCH_CUDA_ALLOC_CONF"):
-        os.environ["PYTORCH_CUDA_ALLOC_CONF"] = "expandable_segments:True"
-    if not os.environ.get("PYTORCH_ALLOC_CONF"):
-        os.environ["PYTORCH_ALLOC_CONF"] = "expandable_segments:True"
+if not os.environ.get("PYTORCH_CUDA_ALLOC_CONF") and os.environ.get("FIZGIG_NO_EXPANDABLE") != "1":
+    os.environ["PYTORCH_CUDA_ALLOC_CONF"] = "expandable_segments:True"
 
 # OpenMP wait policy, before torch loads libiomp: Intel OpenMP keeps every pool thread
 # actively spinning for 200 ms after each parallel region, so the small per-step CPU ops

@@ -1,13 +1,15 @@
-"""GPU VRAM reads for the status bar.
+"""AMD / ROCm VRAM reads for the status bar (fallback only).
 
-NVIDIA: pynvml (fast) then nvidia-smi.
-AMD on Windows: typeperf ``\\GPU Local Adapter Memory(*)\\Local Usage``.
-AMD on Linux: ``amd-smi`` CLI (ROCm Core / amdrocm-amdsmi), legacy ``rocm-smi``, else torch
-    mem_get_info (allocator-only on HIP).
+The GUI keeps its existing NVIDIA pynvml / nvidia-smi path unchanged and only
+imports this module when those return None.
 
-The PyPI ``amdsmi`` package is stale — AMD SMI now ships with ROCm Core SDK / the
+Windows ROCm: typeperf ``\\GPU Local Adapter Memory(*)\\Local Usage``.
+Linux ROCm: ``amd-smi`` CLI (ROCm Core / amdrocm-amdsmi), legacy ``rocm-smi``,
+else torch mem_get_info (allocator-only on HIP).
+
+The PyPI ``amdsmi`` package is stale - AMD SMI ships with ROCm Core SDK / the
 ``amdrocm-amdsmi`` system package. See:
-https://rocm.docs.amd.com/projects/amdsmi/en/latest/install/install.html
+    https://rocm.docs.amd.com/projects/amdsmi/en/latest/install/install.html
 """
 
 from __future__ import annotations
@@ -19,7 +21,7 @@ import os
 import re
 import subprocess
 import threading
-from typing import Callable, Optional
+from typing import Optional
 
 logger = logging.getLogger(__name__)
 
@@ -336,27 +338,6 @@ def _run_linux_cli(args: list[str], timeout: float = 4) -> Optional[str]:
     return None
 
 
-def _read_vram_nvidia() -> Optional[tuple[int, int]]:
-    try:
-        import pynvml
-        pynvml.nvmlInit()
-        handle = pynvml.nvmlDeviceGetHandleByIndex(0)
-        m = pynvml.nvmlDeviceGetMemoryInfo(handle)
-        return int(m.used), int(m.total)
-    except Exception:
-        pass
-    try:
-        out = subprocess.run(
-            ["nvidia-smi", "--query-gpu=memory.used,memory.total",
-             "--format=csv,noheader,nounits"],
-            capture_output=True, text=True, timeout=4,
-            creationflags=_CREATE_NO_WINDOW,
-        )
-        used, total = out.stdout.strip().splitlines()[0].split(",")
-        return int(used.strip()) * 1024 * 1024, int(total.strip()) * 1024 * 1024
-    except Exception:
-        pass
-    return None
 
 
 _amd_smi_bin: Optional[str] = None
@@ -504,15 +485,6 @@ def _read_vram_rocm_smi() -> Optional[tuple[int, int]]:
     return None
 
 
-def _read_vram_torch_mem_info() -> Optional[tuple[int, int]]:
-    try:
-        import torch
-        if torch.cuda.is_available():
-            free_b, total_b = torch.cuda.mem_get_info(0)
-            return int(total_b - free_b), int(total_b)
-    except Exception:
-        pass
-    return None
 
 
 class _TypeperfVramReader:
@@ -612,55 +584,49 @@ def _is_rocm_backend() -> bool:
         return False
 
 
-def _use_windows_typeperf() -> bool:
-    return os.name == "nt" and _is_rocm_backend()
+def _read_vram_torch_fallback() -> Optional[tuple[int, int]]:
+    """Allocator-visible used/total via HIP (less accurate than typeperf/amd-smi)."""
+    try:
+        import torch
+        if torch.cuda.is_available():
+            free_b, total_b = torch.cuda.mem_get_info(0)
+            return int(total_b - free_b), int(total_b)
+    except Exception:
+        pass
+    return None
 
 
-def _use_linux_rocm() -> bool:
-    return os.name != "nt" and _is_rocm_backend()
+_typeperf_reader: Optional[_TypeperfVramReader] = None
+_typeperf_lock = threading.Lock()
 
 
-def _read_vram_linux_rocm() -> Optional[tuple[int, int]]:
-    return _read_vram_amd_smi_cli() or _read_vram_rocm_smi() or _read_vram_torch_mem_info()
+def _read_vram_windows_typeperf() -> Optional[tuple[int, int]]:
+    global _typeperf_reader
+    with _typeperf_lock:
+        if _typeperf_reader is None:
+            _typeperf_reader = _TypeperfVramReader()
+        reader = _typeperf_reader
+    return reader.read()
 
 
-class VramMonitor:
-    """Pick the best VRAM read path once, then reuse it."""
+def read_amd_gpu_vram() -> Optional[tuple[int, int]]:
+    """AMD-only VRAM read for the GUI fallback / ROCm installer probes.
 
-    def __init__(self, reader: Callable[[], Optional[tuple[int, int]]]) -> None:
-        self._reader = reader
+    Windows: typeperf (then torch). Linux: amd-smi, then rocm-smi, then torch.
+    """
+    if os.name == "nt":
+        # Prefer typeperf whenever this AMD fallback is invoked. FIZGIG_GPU_BACKEND
+        # from run_fizgig_rocm.bat makes intent explicit; torch is a last resort.
+        hit = _read_vram_windows_typeperf()
+        if hit:
+            return hit
+        if _is_rocm_backend():
+            return _read_vram_torch_fallback()
+        return None
 
-    @classmethod
-    def create(cls) -> "VramMonitor":
-        if _use_windows_typeperf():
-            logger.debug("VRAM monitor: Windows typeperf (AMD ROCm)")
-            return cls(_TypeperfVramReader().read)
-        if _use_linux_rocm():
-            logger.debug("VRAM monitor: Linux amd-smi / rocm-smi (AMD ROCm)")
-            return cls(_read_vram_linux_rocm)
-        logger.debug("VRAM monitor: NVIDIA pynvml / nvidia-smi / torch fallback")
-
-        def _nvidia():
-            return _read_vram_nvidia() or _read_vram_torch_mem_info()
-
-        return cls(_nvidia)
-
-    def read(self) -> Optional[tuple[int, int]]:
-        try:
-            return self._reader()
-        except Exception as exc:
-            logger.debug("VRAM read failed: %s", exc)
-            return None
-
-
-_monitor: Optional[VramMonitor] = None
-_monitor_lock = threading.Lock()
-
-
-def read_gpu_vram() -> Optional[tuple[int, int]]:
-    """Return ``(used_bytes, total_bytes)`` for GPU 0, or ``None``."""
-    global _monitor
-    with _monitor_lock:
-        if _monitor is None:
-            _monitor = VramMonitor.create()
-    return _monitor.read()
+    hit = _read_vram_amd_smi_cli() or _read_vram_rocm_smi()
+    if hit:
+        return hit
+    if _is_rocm_backend():
+        return _read_vram_torch_fallback()
+    return None

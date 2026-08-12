@@ -8,11 +8,12 @@ source venv/bin/activate
 
 export MIOPEN_FIND_MODE=2
 export FLASH_ATTENTION_TRITON_AMD_ENABLE=TRUE
-export PYTORCH_ALLOC_CONF=max_split_size_mb:512,garbage_collection_threshold:0.8
+# expandable_segments mirrors upstream train scripts' CUDA alloc policy (ROCm key).
+export PYTORCH_ALLOC_CONF=expandable_segments:True,max_split_size_mb:512,garbage_collection_threshold:0.8
 export TORCH_ROCM_AOTRITON_ENABLE_EXPERIMENTAL=1
 export FIZGIG_GPU_BACKEND=rocm
 
-# BNB_ROCM_VERSION / ROCM_PATH / HIP_PATH — written by install_fizgig_rocm_linux.sh / write_rocm_env.py
+# BNB_ROCM_VERSION / ROCM_PATH / HIP_PATH — written by install_fizgig_rocm.sh / write_rocm_env.py
 if [[ -f rocm_env.sh ]]; then
     # shellcheck source=rocm_env.sh
     source rocm_env.sh

@@ -11,14 +11,11 @@ import sys
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", ".."))
 
-# GPU allocator policy, set before torch is imported below (the backend is fixed at init).
+# CUDA allocator policy, set before torch is imported below (the backend is fixed at CUDA init).
 # The 33B base + per-step tensor churn fragments the default allocator; expandable segments hold
 # the NF4 base within a 5090's budget. GUI sets this too; this covers headless runs.
-if os.environ.get("FIZGIG_NO_EXPANDABLE") != "1":
-    if not os.environ.get("PYTORCH_CUDA_ALLOC_CONF"):
-        os.environ["PYTORCH_CUDA_ALLOC_CONF"] = "expandable_segments:True"
-    if not os.environ.get("PYTORCH_ALLOC_CONF"):
-        os.environ["PYTORCH_ALLOC_CONF"] = "expandable_segments:True"
+if not os.environ.get("PYTORCH_CUDA_ALLOC_CONF") and os.environ.get("FIZGIG_NO_EXPANDABLE") != "1":
+    os.environ["PYTORCH_CUDA_ALLOC_CONF"] = "expandable_segments:True"
 os.environ.setdefault("KMP_BLOCKTIME", "0")
 os.environ.setdefault("OMP_WAIT_POLICY", "PASSIVE")
 

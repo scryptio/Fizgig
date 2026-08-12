@@ -1,6 +1,6 @@
 @echo off
 REM Fizgig ROCm Windows installer.
-REM Uses detect_gpu.py (GPL-3.0, from comfyui-rocm — see THIRD_PARTY_NOTICES.md)
+REM Uses detect_gpu.py (GPL-3.0, from comfyui-rocm - see THIRD_PARTY_NOTICES.md)
 REM and portable-Python / ROCm-wheel patterns adapted from comfyui-rocm install.bat:
 REM   https://github.com/patientx/comfyui-rocm
 setlocal enabledelayedexpansion
@@ -11,13 +11,28 @@ set "Q=>nul 2>&1"
 set "PY312="
 set "PY312_SOURCE="
 
+REM Pinned stack confirmed working on RDNA (multi-arch nightlies). Override if needed.
+set "ROCM_INDEX=https://rocm.nightlies.amd.com/whl-multi-arch/"
+if not defined TORCH_PIN set "TORCH_PIN=2.12.0+rocm7.15.0a20260728"
+if not defined TORCHVISION_PIN set "TORCHVISION_PIN=0.27.0+rocm7.15.0a20260728"
+if not defined ROCM_SDK_DEVEL_PIN set "ROCM_SDK_DEVEL_PIN=7.15.0a20260728"
+set "BNB_WHEEL=https://github.com/0xDELUXA/bitsandbytes_win_rocm/releases/download/0.50.0.dev0-py3.12-rocm7.15-win_amd64_all/bitsandbytes-0.50.0.dev0-cp312-cp312-win_amd64.whl"
+
 echo ============================================================
-echo   Fizgig Installer — AMD ROCm (Windows)
+echo   Fizgig Installer - AMD ROCm (Windows)
 echo   Klein 9B and Krea 2 LoRA Studio
 echo ============================================================
 echo.
-echo Uses up-to-date ROCm nightly PyTorch wheels (not Zluda).
 echo Requires Python 3.12 ^(the ROCm bitsandbytes wheel is cp312-only^).
+echo.
+echo PyTorch / ROCm wheels come from AMD nightlies - not built by Fizgig:
+echo   Index:  !ROCM_INDEX!
+echo   torch==!TORCH_PIN!
+echo   torchvision==!TORCHVISION_PIN!
+echo   rocm-sdk-devel==!ROCM_SDK_DEVEL_PIN!
+echo.
+echo bitsandbytes is a community Windows ROCm wheel ^(0xDELUXA^) - neither AMD nor Fizgig:
+echo   !BNB_WHEEL!
 echo.
 
 call :resolve_python312
@@ -55,7 +70,7 @@ if not exist "venv" (
     echo Creating virtual environment with Python 3.12...
     "!PY312!" -m venv venv
     if errorlevel 1 (
-        echo venv module failed — trying virtualenv...
+        echo venv module failed - trying virtualenv...
         "!PY312!" -m pip install virtualenv %Q%
         "!PY312!" -m virtualenv venv
         if errorlevel 1 (
@@ -76,7 +91,7 @@ if errorlevel 1 (
 REM Sanity-check the venv is actually 3.12 (not whatever `python` on PATH defaults to).
 python -c "import sys; v=sys.version_info; assert v.major==3 and v.minor==12, f'Expected 3.12, got {v.major}.{v.minor}'; print(f'Venv OK: Python {sys.version.split()[0]}')"
 if errorlevel 1 (
-    echo ERROR: venv is not Python 3.12 — delete venv\ and re-run.
+    echo ERROR: venv is not Python 3.12 - delete venv\ and re-run.
     pause
     exit /b 1
 )
@@ -115,40 +130,52 @@ for %%G in (gfx942 gfx950) do (
 
 if !USE_LEGACY_URL!==1 (
     if /I "!arch!"=="gfx942" (
+        set "LEGACY_INDEX=https://rocm.nightlies.amd.com/v2-staging/gfx942-dcgpu/"
         echo Installing ROCm PyTorch for MI300/MI325 ^(gfx942^)...
-        python -m pip install rocm[devel,libraries] --index-url https://rocm.nightlies.amd.com/v2-staging/gfx942-dcgpu/
+        echo Source: !LEGACY_INDEX!
+        python -m uv pip install --link-mode copy --index-strategy unsafe-best-match --index-url "!LEGACY_INDEX!" "rocm[devel,libraries]"
         if errorlevel 1 goto :install_failed
         rocm-sdk init
-        python -m pip install --index-url https://rocm.nightlies.amd.com/v2-staging/gfx942-dcgpu/ torch torchvision
+        python -m uv pip install --link-mode copy --index-strategy unsafe-best-match --index-url "!LEGACY_INDEX!" torch torchvision
         if errorlevel 1 goto :install_failed
     )
     if /I "!arch!"=="gfx950" (
+        set "LEGACY_INDEX=https://rocm.nightlies.amd.com/v2-staging/gfx950-dcgpu/"
         echo Installing ROCm PyTorch for MI350/MI355 ^(gfx950^)...
-        python -m pip install rocm[devel,libraries] --index-url https://rocm.nightlies.amd.com/v2-staging/gfx950-dcgpu/
+        echo Source: !LEGACY_INDEX!
+        python -m uv pip install --link-mode copy --index-strategy unsafe-best-match --index-url "!LEGACY_INDEX!" "rocm[devel,libraries]"
         if errorlevel 1 goto :install_failed
         rocm-sdk init
-        python -m pip install --index-url https://rocm.nightlies.amd.com/v2-staging/gfx950-dcgpu/ torch torchvision
+        python -m uv pip install --link-mode copy --index-strategy unsafe-best-match --index-url "!LEGACY_INDEX!" torch torchvision
         if errorlevel 1 goto :install_failed
     )
-    goto :install_global
+    goto :install_shared
 )
 
-echo Installing ROCm PyTorch ^(multi-arch nightly^) for !arch!...
-python -m pip install "torch[device-!arch!]" "torchvision[device-!arch!]" rocm-sdk-devel --index-url https://rocm.nightlies.amd.com/whl-multi-arch/
+echo Installing pinned ROCm PyTorch ^(multi-arch^) for !arch!...
+echo Source: !ROCM_INDEX!
+echo   torch[device-!arch!]==!TORCH_PIN!
+echo   torchvision[device-!arch!]==!TORCHVISION_PIN!
+echo   rocm-sdk-devel==!ROCM_SDK_DEVEL_PIN!
+python -m uv pip install --link-mode copy --index-strategy unsafe-best-match --index-url "!ROCM_INDEX!" ^
+    "torch[device-!arch!]==!TORCH_PIN!" ^
+    "torchvision[device-!arch!]==!TORCHVISION_PIN!" ^
+    "rocm-sdk-devel==!ROCM_SDK_DEVEL_PIN!"
 if errorlevel 1 goto :install_failed
 
-:install_global
+:install_shared
 echo.
-echo Installing Fizgig dependencies...
-python -m uv pip install --link-mode copy --index-strategy unsafe-best-match -r requirements-global.txt
+echo Installing Fizgig dependencies from requirements.txt ^(CUDA torch/bnb lines stripped^)...
+python filter_requirements_rocm.py requirements.txt "%TEMP%\fizgig_rocm_shared_reqs.txt"
 if errorlevel 1 goto :install_failed
-
-echo Installing triton-windows ^(torch.compile^)...
-python -m pip install triton-windows onnxruntime
+python -m uv pip install --link-mode copy --index-strategy unsafe-best-match -r "%TEMP%\fizgig_rocm_shared_reqs.txt"
 if errorlevel 1 goto :install_failed
+del "%TEMP%\fizgig_rocm_shared_reqs.txt" %Q%
 
-echo Installing bitsandbytes ^(ROCm wheel^)...
-python -m pip install https://github.com/0xDELUXA/bitsandbytes_win_rocm/releases/download/0.50.0.dev0-py3.12-rocm7.15-win_amd64_all/bitsandbytes-0.50.0.dev0-cp312-cp312-win_amd64.whl
+echo.
+echo Installing bitsandbytes ^(community Windows ROCm wheel - neither AMD nor Fizgig^)...
+echo Source: !BNB_WHEEL!
+python -m uv pip install --link-mode copy "!BNB_WHEEL!"
 if errorlevel 1 goto :install_failed
 
 echo.
@@ -186,7 +213,7 @@ exit /b 0
 
 
 REM ---------------------------------------------------------------------------
-REM Resolve Python 3.12 — never trust bare `python` when 3.14+ is the default.
+REM Resolve Python 3.12 - never trust bare `python` when 3.14+ is the default.
 REM Order: py -3.12  >  python3.12  >  where python3.12  >  existing python312\
 REM ---------------------------------------------------------------------------
 :resolve_python312
@@ -195,7 +222,7 @@ if exist "%~dp0python312\python.exe" (
     if defined PY312 exit /b 0
 )
 
-REM Python launcher — handles multi-version installs (py list).
+REM Python launcher - handles multi-version installs (py list).
 where py >nul 2>&1
 if not errorlevel 1 (
     py -3.12 -V %Q%
@@ -241,7 +268,7 @@ exit /b 0
 
 REM ---------------------------------------------------------------------------
 REM Download portable Python 3.12.10 (embed + dev libs), same pattern as comfyui-rocm.
-REM Stored in python312\ — reused on later installs.
+REM Stored in python312\ - reused on later installs.
 REM ---------------------------------------------------------------------------
 :download_python312
 set "PYDIR=%~dp0python312"

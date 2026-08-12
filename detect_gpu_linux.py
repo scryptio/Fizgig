@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Detect AMD GPU gfx target on Linux for ROCm PyTorch wheel installs.
 
-Prints a single gfx code (e.g. gfx1100) to stdout for install_fizgig_rocm_linux.sh.
+Prints a single gfx code (e.g. gfx1100) to stdout for install_fizgig_rocm.sh.
 Diagnostics go to stderr. Prefers discrete GPU agents over integrated/APU when both
 are present.
 """
