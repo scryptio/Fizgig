@@ -18,6 +18,33 @@ DEFAULT_BNB_LINUX = "714"  # libbitsandbytes_rocm714.so - matches stable repo.am
 DEFAULT_BNB_WIN = "715"  # Windows 0xDELUXA wheel / pinned multi-arch torch (+rocm7.15)
 
 
+def _bnb_lib_ext() -> str:
+    return ".dll" if sys.platform == "win32" else ".so"
+
+
+def _bitsandbytes_lib_dir() -> Path | None:
+    try:
+        import bitsandbytes
+    except Exception:
+        return None
+    return Path(bitsandbytes.__file__).resolve().parent
+
+
+def _bitsandbytes_rocm_lib(bnb_suffix: str) -> Path | None:
+    lib_dir = _bitsandbytes_lib_dir()
+    if lib_dir is None:
+        return None
+    lib = lib_dir / f"libbitsandbytes_rocm{bnb_suffix}{_bnb_lib_ext()}"
+    return lib if lib.is_file() else None
+
+
+def _bitsandbytes_rocm_libs_available() -> list[Path]:
+    lib_dir = _bitsandbytes_lib_dir()
+    if lib_dir is None:
+        return []
+    return sorted(lib_dir.glob(f"libbitsandbytes_rocm*{_bnb_lib_ext()}"))
+
+
 def _linux_rocm_core_path() -> Path:
     for p in sorted((SCRIPT_DIR / "venv" / "lib").glob("python*/site-packages/_rocm_sdk_core")):
         if p.is_dir():
@@ -60,45 +87,45 @@ def bnb_rocm_version_from_torch() -> str:
     )
 
 
-def _bitsandbytes_rocm_lib(bnb_suffix: str) -> Path | None:
-    try:
-        import bitsandbytes
-    except Exception:
-        return None
-    so = Path(bitsandbytes.__file__).resolve().parent / f"libbitsandbytes_rocm{bnb_suffix}.so"
-    return so if so.is_file() else None
-
-
 def main() -> int:
     is_linux = sys.platform.startswith("linux")
     default_bnb = DEFAULT_BNB_LINUX if is_linux else DEFAULT_BNB_WIN
+    lib_ext = _bnb_lib_ext()
     try:
         probed = bnb_rocm_version_from_torch()
         import torch
         src = f"torch {torch.__version__}"
         bnb = probed
-        so = _bitsandbytes_rocm_lib(bnb)
-        if so is None and is_linux and probed != DEFAULT_BNB_LINUX:
+        bnb_lib = _bitsandbytes_rocm_lib(bnb)
+        if bnb_lib is None and is_linux and probed != DEFAULT_BNB_LINUX:
             fallback = _bitsandbytes_rocm_lib(DEFAULT_BNB_LINUX)
             if fallback is not None:
                 print(
-                    f"WARN: libbitsandbytes_rocm{bnb}.so missing; "
+                    f"WARN: libbitsandbytes_rocm{bnb}{lib_ext} missing; "
                     f"using BNB_ROCM_VERSION={DEFAULT_BNB_LINUX} ({fallback.name})",
                     file=sys.stderr,
                 )
                 bnb = DEFAULT_BNB_LINUX
-                so = fallback
-        if so is None:
+                bnb_lib = fallback
+        if bnb_lib is None:
+            available = _bitsandbytes_rocm_libs_available()
             print(
-                f"WARN: no matching libbitsandbytes_rocm*.so for ROCm {probed}; "
+                f"WARN: no matching libbitsandbytes_rocm*{lib_ext} for ROCm {probed}; "
                 f"using BNB_ROCM_VERSION={default_bnb}",
                 file=sys.stderr,
             )
+            if available:
+                print(
+                    "      Available:",
+                    ", ".join(p.name for p in available),
+                    file=sys.stderr,
+                )
             bnb = default_bnb
+            bnb_lib = _bitsandbytes_rocm_lib(bnb)
         elif is_linux and probed == DEFAULT_BNB_LINUX:
             src = f"{src} (Linux ROCm 7.14 / bnb {bnb})"
         else:
-            src = f"{src} (bnb {bnb} / {so.name})"
+            src = f"{src} (bnb {bnb} / {bnb_lib.name})"
     except Exception as exc:
         print(f"WARN: {exc}; using default BNB_ROCM_VERSION={default_bnb}")
         bnb = default_bnb
