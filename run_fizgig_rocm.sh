@@ -58,26 +58,5 @@ export LD_LIBRARY_PATH
 
 echo "[AMD-ROCm] BNB_ROCM_VERSION=${BNB_ROCM_VERSION:-}  ROCM_PATH=${ROCM_PATH:-}"
 
-DEBUG=0
-for _arg in "$@"; do
-    case "$_arg" in
-        --debug|-d) DEBUG=1 ;;
-    esac
-done
-if [[ "${FIZGIG_ROCM_DEBUG:-}" == 1 || "${FIZGIG_ROCM_DEBUG:-}" == true ]]; then
-    DEBUG=1
-fi
-
-if [[ "$DEBUG" == 1 ]]; then
-    export FIZGIG_ROCM_DEBUG=1
-    export HIP_LAUNCH_BLOCKING="${HIP_LAUNCH_BLOCKING:-1}"
-    export AMD_SERIALIZE_KERNEL="${AMD_SERIALIZE_KERNEL:-3}"
-    export MIOPEN_ENABLE_LOGGING="${MIOPEN_ENABLE_LOGGING:-1}"
-    export MIOPEN_LOG_LEVEL="${MIOPEN_LOG_LEVEL:-6}"
-    echo "[AMD-ROCm] Debug mode: HIP_LAUNCH_BLOCKING=${HIP_LAUNCH_BLOCKING}  AMD_SERIALIZE_KERNEL=${AMD_SERIALIZE_KERNEL}"
-    echo "[AMD-ROCm] Debug mode: logs under logs/rocm_debug_*.log (override with FIZGIG_ROCM_LOG=...)"
-    exec python -u rocm_debug_launch.py
-fi
-
 python lora_trainer_gui.py &
 disown
