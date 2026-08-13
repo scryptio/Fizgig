@@ -31,13 +31,13 @@ RUN python3 -m venv $VIRTUAL_ENV
 ENV PATH="$VIRTUAL_ENV/bin:$PATH"
 
 COPY requirements.txt /tmp/requirements.txt
+COPY uv_install_deps.py /tmp/uv_install_deps.py
 # The cache purge has to happen in THIS layer: a later RUN would delete the files but the layer
 # holding them stays in the image. uv keeps its own wheel cache and ignores PIP_NO_CACHE_DIR,
 # which is how a first build shipped 7.8 GB of wheels alongside the 7.8 GB venv they installed.
 RUN pip install --upgrade pip uv \
-    && uv pip install --link-mode=copy --index-strategy unsafe-best-match \
-         -r /tmp/requirements.txt \
-    && rm -rf /root/.cache /tmp/requirements.txt
+    && python3 /tmp/uv_install_deps.py /tmp/requirements.txt "$VIRTUAL_ENV" \
+    && rm -rf /root/.cache /tmp/requirements.txt /tmp/uv_install_deps.py
 
 # ---------------------------------------------------------------------------- runtime
 FROM ubuntu:22.04

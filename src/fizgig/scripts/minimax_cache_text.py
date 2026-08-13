@@ -37,7 +37,8 @@ def setup_parser() -> argparse.ArgumentParser:
                              "dequantizes 351 weights per FORWARD, so this is the dial that "
                              "matters: 1 caption/forward costs ~1.2 s, 16 costs barely more. "
                              "Right-padding makes batching exactly equivalent to one-at-a-time "
-                             "for this causal stack (tests/diag_batch_encode.py).")
+                             "for this causal stack (tests/diag_batch_encode.py). Lowered "
+                             "automatically when free VRAM is tight once the encoder is loaded.")
     parser.add_argument("--num_workers", type=int, default=None, help="Number of workers")
     parser.add_argument("--skip_existing", action="store_true", help="Skip existing cache files")
     parser.add_argument("--keep_cache", action="store_true", help="Keep stale cache files")
@@ -148,6 +149,46 @@ def _cache_reference_conditioning(args, datasets, all_files, all_paths, encoder)
                         index_offset=ds_i)
 
 
+def _report_headroom(device, batch_size):
+    """Say what the encoder took and what is left, and shrink the batch when it is tight.
+
+    Overcommitting VRAM does not raise on Windows — the driver pages the overflow into system
+    RAM, so the pass does not fail, it crawls, with nothing on screen to explain why. This is the
+    one place that can see it: free VRAM measured AFTER the encoder is resident.
+
+    Thresholds are measured, not guessed (tests/diag_minimax_te_peak.py, nvfp4 encoder, 42-token
+    captions): resident 12.78 GB, and the forward peaks 1.64 GB above that at batch 1 rising to
+    only 1.87 GB at batch 16. The spike is the per-forward nvfp4 dequant of 351 weights, so it is
+    almost independent of the batch — dropping the batch buys ~0.2 GB, not gigabytes. Which makes
+    it a last-ditch lever rather than the fix, and worth pulling only inside that 1.9 GB band
+    where a fifth of a gigabyte decides whether the card pages.
+    """
+    if torch.device(device).type != "cuda" or not torch.cuda.is_available():
+        return batch_size
+    try:
+        free_b, total_b = torch.cuda.mem_get_info(torch.device(device).index or 0)
+    except Exception:
+        return batch_size
+    free_gb, resident_gb = free_b / (1024 ** 3), torch.cuda.memory_allocated(device) / (1024 ** 3)
+    logger.info(f"[vram] text encoder resident {resident_gb:.1f} GB, "
+                f"{free_gb:.1f} GB of {total_b / (1024 ** 3):.1f} GB free")
+    if free_gb >= 2.5:                      # clears the measured batch-16 spike with room over
+        return batch_size
+    small = 1 if free_gb < 1.9 else 2
+    if small < batch_size:
+        logger.info(f"[vram] tight — encoding {small} caption(s) per forward instead of "
+                    f"{batch_size}. Costs about a second per image, once.")
+        batch_size = small
+    if free_gb < 1.9:                       # below the smallest forward this encoder can do
+        logger.warning(
+            "[vram] only %.1f GB free with the encoder loaded, and a single forward needs about "
+            "1.7 GB. Windows pages instead of failing here, so caching can appear frozen for a "
+            "very long time rather than stopping with an error. Close anything else using the "
+            "GPU — ComfyUI, and browsers, which can hold a couple of GB on hardware "
+            "acceleration — then run this again.", free_gb)
+    return batch_size
+
+
 def main():
     args = setup_parser().parse_args()
     device = torch.device(args.device or ("cuda" if torch.cuda.is_available() else "cpu"))
@@ -166,7 +207,9 @@ def main():
     encoder = load_minimax_h3_te(args.text_encoder, device=device, compute_dtype=torch.bfloat16,
                                  quantize=not args.no_quantize, with_vision=bool(_refs))
 
-    process_batches(args, datasets, all_files, all_paths, lambda batch: encode_and_save_text(encoder, batch))
+    args.batch_size = _report_headroom(device, args.batch_size or 16)
+    process_batches(args, datasets, all_files, all_paths,
+                    lambda batch: encode_and_save_text(encoder, batch, args.batch_size))
 
     # r2v conditioning for the teacher. Written AFTER the plain cache and to sibling files, so
     # a run without --reference_count is byte-identical to before.

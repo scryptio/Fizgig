@@ -156,7 +156,13 @@ def load_minimax_h3_dit(path: str, device="cuda", compute_dtype=torch.bfloat16,
                                     child.in_features, child.out_features,
                                     bias=child.bias is not None, rot=rot,
                                     compute_dtype=compute_dtype))
-                        elif _is_nf4_target(f"{full}.weight"):
+                        elif (_is_nf4_target(f"{full}.weight")
+                              and not _is_adaln(f"{full}.weight")):
+                            # _is_adaln has to be tested HERE as well as at the weight below.
+                            # The two decisions are one decision: an fp32 AdaLN that still got a
+                            # Linear4bit shell is a 4-bit module holding a dense Parameter, and
+                            # bitsandbytes only finds out on the first forward — deep inside a
+                            # checkpointed block, as `assert module.weight.shape[1] == 1`.
                             q = Linear4bit(child.in_features, child.out_features,
                                            bias=child.bias is not None,
                                            compute_dtype=compute_dtype, quant_type="nf4")

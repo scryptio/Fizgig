@@ -167,13 +167,18 @@ def encode_and_save_reference_text(encoder, batch: List[ItemInfo], reference_for
                                       latent, caption=item.caption, reference=name)
 
 
-def encode_and_save_text(encoder, batch: List[ItemInfo]) -> None:
+def encode_and_save_text(encoder, batch: List[ItemInfo], batch_size: int = None) -> None:
     """Encode a caption batch through the Qwen3-VL-32B TE and save each (L, 5120) state.
 
     One forward for the whole batch rather than one per caption: the nvfp4-resident encoder
     dequantizes 351 weights per FORWARD, so this is where the caching pass spends its time.
     encode_batch right-pads, which is exactly equivalent for a causal stack (verified in
-    tests/diag_batch_encode.py) and memoizes, so a repeated caption costs nothing."""
-    embeds = encoder.encode_batch([item.caption for item in batch])
+    tests/diag_batch_encode.py) and memoizes, so a repeated caption costs nothing.
+
+    batch_size is the captions per FORWARD. Passing it through matters: encode_batch re-chunks
+    internally at its own default of 8, so without this the caller's --batch_size only decided
+    how many items arrived here, never how many went through the model at once."""
+    kw = {} if batch_size is None else {"batch_size": int(batch_size)}
+    embeds = encoder.encode_batch([item.caption for item in batch], **kw)
     for item, hidden in zip(batch, embeds):
         save_text_encoder_output_cache_minimax(item, hidden[0])

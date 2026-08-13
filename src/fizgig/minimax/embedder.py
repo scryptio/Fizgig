@@ -289,13 +289,32 @@ def qwen3vl_key_map(key: str) -> str:
 class MiniMaxH3TextEncoder:
     """Loads the bf16 TE, NF4 on GPU, and encodes captions to [1, L, 5120] bf16."""
 
-    def __init__(self, model, tokenizer, device="cuda", compute_dtype=torch.bfloat16):
+    def __init__(self, model, tokenizer, device="cuda", compute_dtype=torch.bfloat16,
+                 cpu_embed=False):
         self.model = model.eval()
         self.tokenizer = tokenizer
         self.device = device
         self.compute_dtype = compute_dtype
+        self.cpu_embed = cpu_embed     # embed_tokens left on CPU; see _text_forward()
         self._cache = {}          # caption -> CPU embedding; see encode()
         self._image_processor = None   # built on first r2v encode; see encode_with_reference()
+
+    def _text_forward(self, ids):
+        """Token ids -> last_hidden_state, on whichever side the embedding table lives.
+
+        cpu_embed=False is the original call verbatim: ids to the device, `input_ids=`.
+
+        cpu_embed=True leaves the 151936 x 5120 table on the CPU — ~1.5 GB of VRAM that served
+        one lookup per forward — so the gather happens there and only its `[B, L, 5120]` result
+        crosses to the GPU, passed as `inputs_embeds=`. The decoder stack sees the identical
+        tensor either way; a gather is memory-bound and trivial at caption lengths.
+
+        Text-only path. The vision build scatters image embeddings into the `<|image_pad|>` slots
+        from input_ids, so it never takes the cpu_embed branch (see load_minimax_h3_te)."""
+        if not self.cpu_embed:
+            return self.model(input_ids=ids.to(self.device)).last_hidden_state
+        emb = self.model.embed_tokens(ids.to("cpu")).to(self.device)
+        return self.model(inputs_embeds=emb).last_hidden_state
 
     def _pad_id(self) -> int:
         """The tokenizer's pad id, or Qwen's default. NOT `pad_token_id or <default>` — a pad id
@@ -325,11 +344,11 @@ class MiniMaxH3TextEncoder:
         _tk = dict(add_special_tokens=False, return_tensors="pt")
         if max_length:                                     # None/0 -> no cap, as ComfyUI does
             _tk.update(truncation=True, max_length=max_length)
-        ids = self.tokenizer(caption, **_tk)["input_ids"].to(self.device)
+        ids = self.tokenizer(caption, **_tk)["input_ids"]
         if ids.shape[1] == 0:                              # empty caption -> single pad token
-            ids = torch.tensor([[self._pad_id()]], device=self.device)
-        out = self.model(input_ids=ids)                    # norm=Identity -> raw layer-50 output
-        emb = out.last_hidden_state.to(self.compute_dtype)  # [1, L, 5120]
+            ids = torch.tensor([[self._pad_id()]])
+        # norm=Identity -> raw layer-50 output
+        emb = self._text_forward(ids).to(self.compute_dtype)  # [1, L, 5120]
         # keep it on CPU: a few hundred KB per caption, and GPU memory is the scarce thing here
         self._cache[caption] = emb.detach().to("cpu")
         return emb
@@ -412,7 +431,7 @@ class MiniMaxH3TextEncoder:
             ids = torch.full((len(toks), L), pad_id, dtype=torch.long)
             for r, t in enumerate(toks):
                 ids[r, : t.numel()] = t
-            hs = self.model(input_ids=ids.to(self.device)).last_hidden_state
+            hs = self._text_forward(ids)
             for r, i in enumerate(idxs):
                 emb = hs[r, : toks[r].numel()].unsqueeze(0).to(self.compute_dtype)
                 self._cache[captions[i]] = emb.detach().to("cpu")
@@ -481,8 +500,15 @@ class Nvfp4Linear(nn.Linear):
 
 def load_minimax_h3_te(path: str, device="cuda", compute_dtype=torch.bfloat16,
                        quantize=True, tokenizer_dir=None,
-                       te_quant="auto", with_vision=False) -> MiniMaxH3TextEncoder:
+                       te_quant="auto", with_vision=False,
+                       cpu_embed=True) -> MiniMaxH3TextEncoder:
     """Build the Qwen3-VL-32B TE. Language-only by default (visual.* skipped).
+
+    cpu_embed keeps the ~1.5 GB embedding table in system RAM and gathers there, which is free
+    at caption lengths and is the difference between fitting a 16 GB card and being paged out by
+    the driver. It is forced OFF with the vision tower: that build scatters image embeddings into
+    the `<|image_pad|>` slots from input_ids, and feeding it inputs_embeds would drop the pixels
+    silently.
 
     with_vision=True builds the FULL stack instead — needed for r2v reference conditioning,
     where the prompt carries `<Picture i>` vision blocks. The vision tower is left in bf16: it
@@ -499,6 +525,8 @@ def load_minimax_h3_te(path: str, device="cuda", compute_dtype=torch.bfloat16,
     """
     from bitsandbytes.nn import Linear4bit, Params4bit
     from transformers import AutoTokenizer
+
+    cpu_embed = bool(cpu_embed) and not with_vision
 
     with MemoryEfficientSafeOpen(path) as _probe:
         _is_cq = any(k.endswith(".comfy_quant") for k in _probe.keys())
@@ -597,7 +625,13 @@ def load_minimax_h3_te(path: str, device="cuda", compute_dtype=torch.bfloat16,
                 setattr(parent, leaf, p)
             else:
                 keep = w.to(torch.float32) if w.dtype == torch.float32 else w.to(compute_dtype)
-                setattr(parent, leaf, nn.Parameter(keep.to(dev), requires_grad=False))
+                # embed_tokens is excluded from _NF4_SUFFIXES on purpose, so it lands unquantized
+                # — 151936 x 5120 in bf16 is ~1.5 GB. It serves one gather per forward, so on the
+                # text-only path it stays in system RAM and never reaches the card at all. That
+                # margin is what lets a 16 GB card clear the caching pass without the driver
+                # paging the encoder back out over PCIe.
+                tgt = torch.device("cpu") if (cpu_embed and name == "embed_tokens.weight") else dev
+                setattr(parent, leaf, nn.Parameter(keep.to(tgt), requires_grad=False))
 
     # Computed (non-checkpoint) buffers stayed on meta from the meta-build. The rotary
     # embedding's inv_freq is the load-bearing one — rebuild it on the real device. A general
@@ -622,4 +656,5 @@ def load_minimax_h3_te(path: str, device="cuda", compute_dtype=torch.bfloat16,
 
     tok = AutoTokenizer.from_pretrained(tokenizer_dir or _bundled_tokenizer_dir())
     _add_h3_special_tokens(tok)
-    return MiniMaxH3TextEncoder(model, tok, device=device, compute_dtype=compute_dtype)
+    return MiniMaxH3TextEncoder(model, tok, device=device, compute_dtype=compute_dtype,
+                                cpu_embed=cpu_embed)

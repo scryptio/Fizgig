@@ -1749,6 +1749,111 @@ class UnsupportedLoRAFormat(RuntimeError):
     decompositions that would need separate module classes."""
 
 
+class LoRAFamilyMismatch(RuntimeError):
+    """Raised when a LoRA's trained-for family doesn't match the family a caller
+    (Royale / Explorer / Repair Studio) is about to load it against. Callers should
+    catch this the same way they catch UnsupportedLoRAFormat — a clean single-line
+    message, no traceback — since it's an expected user-facing outcome, not a bug."""
+
+
+# Family display names, keyed by the same "klein" / "krea2" / "minimax" strings the
+# GUI's *_family_var StringVars already use — lets callers compare lora_family_from_file's
+# result against a family_var.get() directly with no translation step.
+FAMILY_DISPLAY_NAMES = {
+    "klein": "Klein 9B",
+    "krea2": "Krea 2",
+    "minimax": "MiniMax H3",
+}
+
+# Families that actually have an inference-side selector (Royale, Explorer, Repair Studio all
+# offer only these two radios). MiniMax H3 is train-only right now — no engine, no pipeline, no
+# widget for it in any of those tabs — so a caller auto-following lora_family_from_file's result
+# must refuse rather than tk.StringVar.set() a value neither radio button carries (issue #62
+# follow-up: the var still holds it, both radios go blank, and the family that actually loads is
+# whichever one the "else" branch of the caller's own is_krea2 ternary falls back to).
+INFERENCE_FAMILIES = ("klein", "krea2")
+
+# Klein 9B's block depth (Klein9BParams in klein/model.py: depth=8, depth_single_blocks=24).
+# double_blocks/single_blocks (native/kohya) and transformer_blocks/single_transformer_blocks
+# (diffusers) are BFL naming shared with other Flux variants at different depths — Flux.1
+# dev/schnell is 19+38, full Flux.2 is 8+48 — so the family can't be read off the block-name
+# substring alone; the deepest block index actually present has to fall inside Klein's own
+# shape. A negative lookbehind keeps "single_transformer_blocks.N" from also matching the
+# double/transformer_blocks pattern (it contains "transformer_blocks.N" as a substring).
+_KLEIN_MAX_DOUBLE_BLOCKS = 8
+_KLEIN_MAX_SINGLE_BLOCKS = 24
+_KLEIN_DOUBLE_BLOCK_RE = re.compile(r"(?<!single_)(?:double_blocks|transformer_blocks)[._](\d+)")
+_KLEIN_SINGLE_BLOCK_RE = re.compile(r"single_(?:transformer_)?blocks[._](\d+)")
+
+
+def lora_family_from_file(path: str) -> Optional[str]:
+    """Identify which model family a LoRA/LyCORIS file was trained for, from its
+    safetensors header alone — no tensor data read, no pipeline load, microseconds.
+
+    Returns "klein", "krea2", "minimax", or None if the file doesn't match any
+    known signature (callers should not block on None — fail open and let the
+    real loader be the judge, the same as an unreadable/corrupt file). None also
+    covers a file that uses Klein's own block-name segments at a depth Klein 9B
+    doesn't have (a Flux.1 or full-Flux.2 LoRA) — see _KLEIN_MAX_DOUBLE_BLOCKS.
+
+    Krea 2 and MiniMax H3 are each identified by a substring nothing else uses, so a
+    plain membership check is enough for them regardless of whether the file uses
+    Fizgig's own native prefixes (`diffusion_model.`, `transformer.`), the kohya/
+    sd-scripts flattened form (`lora_unet_*`), or another tool's dotted diffusers
+    export. Klein 9B shares its block-name segments with other Flux depths, so it's
+    identified by block count instead (checked last, after Krea 2 and MiniMax H3 are
+    ruled out — diffusers-form Krea 2 also says `transformer_blocks.`).
+    """
+    from fizgig.utils.safetensors import MemoryEfficientSafeOpen
+    try:
+        with MemoryEfficientSafeOpen(path) as f:
+            keys = f.keys()
+    except Exception:
+        return None
+    for k in keys:
+        if "text_fusion" in k or "txtfusion" in k:
+            return "krea2"
+    if _is_diffusers_krea2_lora(keys):
+        return "krea2"
+    for k in keys:
+        if "token_refiner" in k or "adaln_proj" in k:
+            return "minimax"
+    max_double = -1
+    max_single = -1
+    for k in keys:
+        m = _KLEIN_DOUBLE_BLOCK_RE.search(k)
+        if m:
+            max_double = max(max_double, int(m.group(1)))
+            continue
+        m = _KLEIN_SINGLE_BLOCK_RE.search(k)
+        if m:
+            max_single = max(max_single, int(m.group(1)))
+    if max_double < 0 and max_single < 0:
+        return None
+    if max_double < _KLEIN_MAX_DOUBLE_BLOCKS and max_single < _KLEIN_MAX_SINGLE_BLOCKS:
+        return "klein"
+    return None
+
+
+def assert_lora_family_matches(path: str, selected_family: str, tab_label: str) -> None:
+    """Guard for the family/LoRA mismatch in issue #62: check the file's family against
+    what the tab's selector is set to BEFORE a caller commits to a full pipeline load.
+    No-op when the file's family can't be determined (fail open) or already matches.
+
+    Raises LoRAFamilyMismatch with a plain-English message on a real mismatch — callers
+    should catch it alongside UnsupportedLoRAFormat and show it without a traceback.
+    """
+    detected = lora_family_from_file(path)
+    if detected is None or detected == selected_family:
+        return
+    detected_name = FAMILY_DISPLAY_NAMES.get(detected, detected)
+    selected_name = FAMILY_DISPLAY_NAMES.get(selected_family, selected_family)
+    raise LoRAFamilyMismatch(
+        f"This LoRA was trained for {detected_name}, but the {tab_label} family selector "
+        f"is on {selected_name}. Switch it to {detected_name} to use this file."
+    )
+
+
 def ensure_kohya_lora_state_dict(weights_sd: Dict[str, torch.Tensor]) -> Dict[str, torch.Tensor]:
     """Convert the state dict to kohya module-name convention if needed.
     Pass-through for already-kohya files. Raises UnsupportedLoRAFormat for

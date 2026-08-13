@@ -13621,6 +13621,29 @@ class LoRATrainerGUI:
         if not path or not os.path.exists(path):
             messagebox.showerror("Error", "Pick a valid LoRA file first.")
             return
+        # Auto-follow the file's family (issue #62 nice-to-have): detected from the header
+        # alone, microseconds, so do it BEFORE _explorer_ensure_engine() commits to loading
+        # the wrong family's DiT/VAE/TE. Only a genuinely unrecognized file falls through to
+        # the generic error below, same as before.
+        from fizgig.networks.lora import lora_family_from_file, FAMILY_DISPLAY_NAMES, INFERENCE_FAMILIES
+        detected = lora_family_from_file(path)
+        if detected is not None and detected not in INFERENCE_FAMILIES:
+            # The Explorer only offers Klein 9B / Krea 2 radios — setting the var to a
+            # detected MiniMax H3 (or any future train-only family) leaves both radios
+            # blank instead of following it. Refuse rather than land on a family this tab
+            # has no engine for.
+            messagebox.showerror(
+                "Unsupported family",
+                f"{os.path.basename(path)} was trained for {FAMILY_DISPLAY_NAMES.get(detected, detected)}, "
+                f"but the Explorer doesn't support {FAMILY_DISPLAY_NAMES.get(detected, detected)} LoRAs yet.")
+            return
+        selected = "krea2" if self._explorer_is_krea2() else "klein"
+        if detected is not None and detected != selected:
+            self.explorer_family_var.set(detected)
+            self._on_explorer_family_changed()
+            self.explorer_status_var.set(
+                f"Switched family selector to {FAMILY_DISPLAY_NAMES.get(detected, detected)} "
+                f"to match {os.path.basename(path)}.")
         if not self._explorer_ensure_engine():
             return
         try:
@@ -19213,6 +19236,68 @@ class LoRATrainerGUI:
         eng = getattr(self, "royale_engine", None)
         return eng is not None and type(eng).__name__ == "Krea2RepairEngine"
 
+    def _royale_check_lora_families(self, *paths):
+        """Main-thread pre-flight for issue #62: auto-follow the selector to match the batch's
+        detected family BEFORE any worker thread starts, so picking a file never means eating
+        the 9 GB pipeline load just to be told it doesn't match. Uses the exact same
+        _on_royale_family_changed() a manual radio click would, so the engine ends up in the
+        same state either way, and the switch is visible (radio button + status line) rather
+        than silent. Call BEFORE _royale_validate_models(), not after — a switch here resets
+        royale_engine to None, and _royale_validate_models() is what recreates it (and stashes
+        the family-shaped pipeline kwargs); reversing the order leaves the worker thread calling
+        ensure_pipeline() on a None engine with kwargs stashed for the family being switched
+        away from. Both run before the threading.Thread(...).start() that kicks off the heavy
+        work — _royale_load_or_swap_primary still carries a raise-based version of this check
+        for mid-run epoch swaps on the worker thread, where touching Tk state isn't safe.
+
+        Accepts multiple paths (e.g. a whole epoch selection). The target family is decided from
+        the WHOLE batch first — not path-by-path, which would let an already-matching first path
+        mask a mismatched later one when a switch fires mid-loop — so a genuinely mixed-family
+        selection is always caught rather than depending on which order the paths happen to be
+        in. None paths are skipped so callers can pass tuples straight from
+        _royale_current_epoch(). Only shows a dialog when it can't resolve things automatically
+        (a second family in the same selection); an unrecognized file is simply ignored."""
+        from fizgig.networks.lora import lora_family_from_file, FAMILY_DISPLAY_NAMES, INFERENCE_FAMILIES
+        seen = []          # (path, family) for every path with a determinable family
+        checked = set()
+        for path in paths:
+            if not path or path in checked:
+                continue
+            checked.add(path)
+            detected = lora_family_from_file(path)
+            if detected is not None:
+                seen.append((path, detected))
+        if not seen:
+            return True  # nothing recognizable — fail open, let the real loader be the judge
+        target_path, target = seen[0]
+        for path, detected in seen[1:]:
+            if detected != target:
+                messagebox.showerror(
+                    "Mixed LoRA families",
+                    f"{os.path.basename(path)} was trained for {FAMILY_DISPLAY_NAMES.get(detected, detected)}, "
+                    f"but this selection also includes {FAMILY_DISPLAY_NAMES.get(target, target)} files "
+                    f"(e.g. {os.path.basename(target_path)}). Pick LoRAs from a single family.")
+                return False
+        if target not in INFERENCE_FAMILIES:
+            # Royale only offers Klein 9B / Krea 2 radios — setting the var to anything else
+            # (e.g. a detected MiniMax H3 LoRA) leaves both radios blank and silently falls
+            # back to Klein internally (issue #62 review, shootthesound). Refuse outright
+            # instead of following into a family this tab can't actually render.
+            messagebox.showerror(
+                "Unsupported family",
+                f"{os.path.basename(target_path)} was trained for "
+                f"{FAMILY_DISPLAY_NAMES.get(target, target)}, but Royale doesn't support "
+                f"{FAMILY_DISPLAY_NAMES.get(target, target)} LoRAs yet.")
+            return False
+        selected = str(self.royale_family_var.get())
+        if target != selected:
+            target_name = FAMILY_DISPLAY_NAMES.get(target, target)
+            self.royale_family_var.set(target)
+            self._on_royale_family_changed()
+            self.royale_status_var.set(
+                f"Switched family selector to {target_name} to match {os.path.basename(target_path)}.")
+        return True
+
     def _royale_ensure_pipeline_loaded(self):
         """Worker-thread: load the preview pipeline if it isn't already. No Tk calls;
         raises on failure (callers route it to their finish handler). The same load
@@ -19226,7 +19311,14 @@ class LoRATrainerGUI:
     def _royale_load_or_swap_primary(self, eng, path):
         """Point `eng` at `path`. Fast in-place weight swap when the structure matches
         (same-rank epochs); otherwise reset() + rebuild the pipeline + load_primary so a
-        different-rank / unrelated LoRA loads cleanly. Worker-thread safe (no Tk)."""
+        different-rank / unrelated LoRA loads cleanly. Worker-thread safe (no Tk).
+
+        Checks the file's family against the selector BEFORE any of that (issue #62):
+        every Royale entry point (render, comparison, seed-travel, LoRA-strength-travel)
+        already calls this one function inside its own try/except, so one guard here
+        covers all of them without touching each worker."""
+        from fizgig.networks.lora import assert_lora_family_matches
+        assert_lora_family_matches(path, str(self.royale_family_var.get()), "Royale")
         if eng.primary_network is None:
             eng.load_primary(path)
             return
@@ -19268,6 +19360,8 @@ class LoRATrainerGUI:
             if len(cps) > n:
                 idx = sorted({round(i * (len(cps) - 1) / (n - 1)) for i in range(n)})
                 sel = [cps[i] for i in idx]
+        if not self._royale_check_lora_families(*[p for _, p in sel]):
+            return
         if not self._royale_validate_models():
             return
         self._royale_rendering = True
@@ -19849,6 +19943,8 @@ class LoRATrainerGUI:
             frames = int(self.royale_travel_frames_var.get())
         except ValueError:
             frames = 24
+        if not self._royale_check_lora_families(path):
+            return
         if not self._royale_validate_models():
             return
         try:
@@ -19957,6 +20053,8 @@ class LoRATrainerGUI:
             frames = int(self.royale_lora_frames_var.get())
         except ValueError:
             frames = 24
+        if not self._royale_check_lora_families(path):
+            return
         if not self._royale_validate_models():
             return
         try:
@@ -20096,6 +20194,8 @@ class LoRATrainerGUI:
                                                    "to the one you want to showcase.")
                 return
             cols = [(None, path), (label, path)]      # column 0 renders at strength 0 (base model)
+        if not self._royale_check_lora_families(*[p for _, p in cols]):
+            return
         if not self._royale_validate_models():
             return
         try:
@@ -20483,6 +20583,8 @@ class LoRATrainerGUI:
             width = int(self.royale_pt_w_var.get()); height = int(self.royale_pt_h_var.get())
         except ValueError:
             width = height = 512
+        if not self._royale_check_lora_families(path):
+            return
         if not self._royale_validate_models():
             return
         params = dict(
@@ -20619,6 +20721,29 @@ class LoRATrainerGUI:
         if not path or not os.path.exists(path):
             messagebox.showerror("Error", "Pick a valid primary LoRA file first.")
             return
+        # Auto-follow the file's family (issue #62 nice-to-have): detected from the header
+        # alone, microseconds, so do it BEFORE _ensure_repair_engine() commits to loading the
+        # wrong family's DiT/VAE/TE. Only a genuinely unrecognized file falls through to the
+        # generic error below, same as before.
+        from fizgig.networks.lora import lora_family_from_file, FAMILY_DISPLAY_NAMES, INFERENCE_FAMILIES
+        detected = lora_family_from_file(path)
+        if detected is not None and detected not in INFERENCE_FAMILIES:
+            # Repair Studio only offers Klein 9B / Krea 2 radios — setting the var to a
+            # detected MiniMax H3 (or any future train-only family) leaves both radios
+            # blank instead of following it. Refuse rather than land on a family this tab
+            # has no engine for.
+            messagebox.showerror(
+                "Unsupported family",
+                f"{os.path.basename(path)} was trained for {FAMILY_DISPLAY_NAMES.get(detected, detected)}, "
+                f"but Repair Studio doesn't support {FAMILY_DISPLAY_NAMES.get(detected, detected)} LoRAs yet.")
+            return
+        selected = "krea2" if self.repair_family_var.get() == "krea2" else "klein"
+        if detected is not None and detected != selected:
+            self.repair_family_var.set(detected)
+            self._on_repair_family_changed()
+            self.repair_status_var.set(
+                f"Switched family selector to {FAMILY_DISPLAY_NAMES.get(detected, detected)} "
+                f"to match {os.path.basename(path)}.")
         if not self._ensure_repair_engine():
             return
         try:

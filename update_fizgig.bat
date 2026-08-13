@@ -41,7 +41,7 @@ if errorlevel 1 (
     )
 )
 
-"venv\Scripts\python.exe" -m uv pip install --link-mode=copy --index-strategy unsafe-best-match -r requirements.txt
+"venv\Scripts\python.exe" "uv_install_deps.py" "requirements.txt" "venv"
 if errorlevel 1 (
     echo.
     echo ERROR: Failed to install/update dependencies using uv. See output above.

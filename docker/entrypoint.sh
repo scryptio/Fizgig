@@ -98,9 +98,11 @@ fi
 
 # Top up dependencies in case the checkout is newer than the image. Almost always a no-op, and
 # a few seconds when it isn't — far cheaper than making users re-pull 10 GB for a new pin.
+# uv_install_deps.py comes from the fresh checkout above, not the image, so a pin/index-strategy
+# fix to it reaches running pods on their next restart same as any other source change.
 log "Checking dependencies"
-uv pip install --link-mode=copy --index-strategy unsafe-best-match \
-   -r "$APP_DIR/requirements.txt" 2>&1 | tail -2 || log "dependency top-up skipped"
+python3 "$APP_DIR/uv_install_deps.py" "$APP_DIR/requirements.txt" "$VIRTUAL_ENV" \
+   2>&1 | tail -5 || log "dependency top-up skipped"
 
 # ---------------------------------------------------------------- persistent paths
 # Point the portable output dirs at the volume. Model paths are left alone: fetch_models writes

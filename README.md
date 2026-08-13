@@ -28,6 +28,8 @@
 </p>
 
 > ### 📰 Latest news
+> - **The workbench checks your LoRA before it loads 9 GB** (3.6.4) — pick a Krea 2 LoRA with the selector on Klein 9B in **Royale**, **Explorer** or **Repair Studio** and it now switches to match in milliseconds, instead of loading the wrong pipeline and failing 25 seconds later. Installs got faster and lighter on disk in the same release. All of it contributed by **[@FNGarvin](https://github.com/FNGarvin)**. [Release notes](docs/RELEASE_NOTES_v3.6.4.md)
+> - **Pick which graphics card Fizgig uses** (3.6.2) — more than one GPU in the machine? **Preferences** now lists them by name and size, and everything follows your choice: training, caching, samples, the workbench tabs and the VRAM gauge. In the same release, MiniMax text caching needs **1.5 GB less VRAM**, which brings it inside what a 16 GB card can give it — existing caches stay valid. [Release notes](docs/RELEASE_NOTES_v3.6.2.md)
 > - **MiniMax H3 stops asking you to choose between quality and speed** (3.6.0) — the new **✨ MiniMax H3 Fast** preset reaches full likeness in a few hundred steps at dim/alpha 8, and the lower rank tends to come out *more* flexible rather than less. Load it, caption a folder of 35–45 images, press Start — you shouldn't need to touch anything else. **Multi Concept** is new too: two subjects in one LoRA, each with its own folder and its own trigger word. One thing worth knowing — judge quality by **pausing** and loading an epoch in ComfyUI; the image previews are for watching likeness arrive, and can show distortion that simply isn't there in a real render. [Details ↓](#minimax-h3--third-model-family) · [Release notes](docs/RELEASE_NOTES_v3.6.0.md)
 > - **MiniMax H3 now hits real likeness.** H3 LoRAs used to nail pose and framing while staying soft on the face; they don't any more. The change that did it was the **optimizer** — MiniMax trains with `adamw` instead of `adamw8bit`, and it's the new default. Alongside it: a single **% of training in low noise** box replacing Detail Focus, a **mid-concentrated** shape toggle, and new defaults (LoKR 8, dim/alpha 16, 60 epochs, 0.5 MP, 60% low noise). [Details ↓](#minimax-h3--third-model-family)
 > - **MiniMax on 24 GB just got ~4× faster** (3.4.1) — the trainer now picks base precision *and* block swap together instead of swap alone. A 24 GB card used to park 38 of 50 blocks on CPU; it now loads the same file 4-bit and swaps nothing. New **Base Precision** dropdown on the Training tab, Auto by default. [Details ↓](#minimax-h3--third-model-family)
@@ -171,6 +173,17 @@ Two built-in presets ship. **Defaults** is applied the moment you pick the famil
 
 The text encoder is loaded for the one-time caching pass then freed — it never shares VRAM with training.
 
+**Yes, you train on the pruned file.** It comes up a lot, because "pruned" means something else
+in LLM land — weights deleted to shrink a model, which costs quality. Here it doesn't delete
+trainable capacity. It swaps the AdaLN modulation MLP (around 40% of the 33B) for a curve table.
+That branch only ever sees the timestep, so nothing a LoRA learns lives there, and attention, MLP
+and the token refiner are untouched.
+
+Two reasons it's the better base rather than a compromise. The pruned int8 file is what ComfyUI
+runs, so you train against the weights you deploy on. And AdaLN drops from 2688 wide to 8, which
+turns it from an unusable LoRA target into a sane one — on the full bf16 file it is excluded
+entirely.
+
 ### The MiniMax Training tab, control by control
 
 Every control below also has a short hint in the app; this is the full version.
@@ -291,12 +304,19 @@ session picks up where you left off.
 
 ## Install
 
-Clone the repo (or download the ZIP via the green **Code** button and extract):
+Clone the repo:
 
 ```bash
 git clone https://github.com/shootthesound/Fizgig.git
 cd Fizgig
 ```
+
+**Clone it rather than downloading the ZIP.** `update_fizgig.bat` updates you by pulling the
+latest changes with git, and a ZIP arrives without the information git needs, so updating fails
+with `fatal: not a git repository`. If you have already installed from a ZIP, you don't have to
+start over — [issue #67](https://github.com/shootthesound/Fizgig/issues/67) has six commands that
+convert the folder you already have into a proper checkout, leaving your models, LoRAs, caches,
+presets and venv exactly where they are.
 
 **Windows (NVIDIA, one-click)** — double-click `install_fizgig.bat`. It creates a venv, installs CUDA 12.8 PyTorch and all dependencies, pre-downloads the InsightFace models, and verifies CUDA is visible to PyTorch. Launch with `run_fizgig.bat`; update later with `update_fizgig.bat`.
 

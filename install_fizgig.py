@@ -112,21 +112,11 @@ def install_dependencies():
     print(f"Installing dependencies from: {REQUIREMENTS_FILE} (using uv)")
     print("(This may take a few minutes for PyTorch download...)")
 
-    try:
-        # shell=False (list form) with internal Path constants — not injectable.
-        # --link-mode=copy: the uv cache and the venv are often on different drives
-        # (e.g. cache on C:, install on S:), where hardlinking isn't possible — copy
-        # mode avoids the noisy "Failed to hardlink" warning.
-        subprocess.run(
-            [str(python_path), "-m", "uv", "pip", "install", "--link-mode", "copy",
-             "--index-strategy", "unsafe-best-match", "-r", str(REQUIREMENTS_FILE)],
-            check=True
-        )
+    from uv_install_deps import install_requirements
+    if install_requirements(REQUIREMENTS_FILE, VENV_DIR, python_path):
         print("Dependencies installed successfully.")
         return True
-    except subprocess.CalledProcessError as e:
-        print(f"Error installing dependencies: {e}")
-        return False
+    return False
 
 
 def verify_cuda():
