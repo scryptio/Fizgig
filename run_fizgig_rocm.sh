@@ -8,10 +8,13 @@ source venv/bin/activate
 
 export MIOPEN_FIND_MODE=2
 export FLASH_ATTENTION_TRITON_AMD_ENABLE=TRUE
-# expandable_segments mirrors upstream train scripts' CUDA alloc policy (ROCm key).
-export PYTORCH_ALLOC_CONF=expandable_segments:True,max_split_size_mb:512,garbage_collection_threshold:0.8
+# Allocator: upstream GUI honours FIZGIG_NO_EXPANDABLE=1 (A/B opt-out, lora_trainer_gui.py).
+export FIZGIG_NO_EXPANDABLE=1
+export PYTORCH_ALLOC_CONF=max_split_size_mb:512,garbage_collection_threshold:0.8
+export PYTORCH_CUDA_ALLOC_CONF=max_split_size_mb:512,garbage_collection_threshold:0.8
 export TORCH_ROCM_AOTRITON_ENABLE_EXPERIMENTAL=1
 export FIZGIG_GPU_BACKEND=rocm
+# Cache fast-exit: src/fizgig/rocm/cache_exit.py (Linux ROCm only). Opt out: FIZGIG_ROCM_NO_FAST_EXIT=1
 
 # BNB_ROCM_VERSION / ROCM_PATH / HIP_PATH — written by install_fizgig_rocm.sh / write_rocm_env.py
 if [[ -f rocm_env.sh ]]; then
@@ -54,6 +57,27 @@ done
 export LD_LIBRARY_PATH
 
 echo "[AMD-ROCm] BNB_ROCM_VERSION=${BNB_ROCM_VERSION:-}  ROCM_PATH=${ROCM_PATH:-}"
+
+DEBUG=0
+for _arg in "$@"; do
+    case "$_arg" in
+        --debug|-d) DEBUG=1 ;;
+    esac
+done
+if [[ "${FIZGIG_ROCM_DEBUG:-}" == 1 || "${FIZGIG_ROCM_DEBUG:-}" == true ]]; then
+    DEBUG=1
+fi
+
+if [[ "$DEBUG" == 1 ]]; then
+    export FIZGIG_ROCM_DEBUG=1
+    export HIP_LAUNCH_BLOCKING="${HIP_LAUNCH_BLOCKING:-1}"
+    export AMD_SERIALIZE_KERNEL="${AMD_SERIALIZE_KERNEL:-3}"
+    export MIOPEN_ENABLE_LOGGING="${MIOPEN_ENABLE_LOGGING:-1}"
+    export MIOPEN_LOG_LEVEL="${MIOPEN_LOG_LEVEL:-6}"
+    echo "[AMD-ROCm] Debug mode: HIP_LAUNCH_BLOCKING=${HIP_LAUNCH_BLOCKING}  AMD_SERIALIZE_KERNEL=${AMD_SERIALIZE_KERNEL}"
+    echo "[AMD-ROCm] Debug mode: logs under logs/rocm_debug_*.log (override with FIZGIG_ROCM_LOG=...)"
+    exec python -u rocm_debug_launch.py
+fi
 
 python lora_trainer_gui.py &
 disown
