@@ -11,15 +11,13 @@ FIZGIG_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 
 ROCM_INDEX="${ROCM_INDEX:-https://repo.amd.com/rocm/whl-multi-arch/}"
 ROCM_NIGHTLY_INDEX="${ROCM_NIGHTLY_INDEX:-https://rocm.nightlies.amd.com/whl-multi-arch/}"
-# stable = ROCm 7.14 from repo.amd.com (matches libbitsandbytes_rocm714.so / BNB_ROCM_VERSION=714).
-# nightly = TheRock multi-arch index + [device-gfx*] extras; pinned to ROCm 7.14 (not latest 7.16+).
-ROCM_CHANNEL="${ROCM_CHANNEL:-stable}"
+# nightly (default) = TheRock multi-arch + [device-gfx*]; pinned to ROCm 7.14 (not 7.16+).
+# stable = repo.amd.com ROCm 7.14 wheels (torch 2.12.0+rocm7.14.0 today).
+ROCM_CHANNEL="${ROCM_CHANNEL:-nightly}"
 if [[ "$ROCM_CHANNEL" == "stable" ]]; then
     ROCM_SDK_PIN="${ROCM_SDK_PIN:-7.14.0}"
-    # 2.13.0+rocm7.14.0 is cp312-only on stable; 2.12 covers cp310–cp314 (incl. Ubuntu 26.04 / 3.14).
     TORCH_PIN="${TORCH_PIN:-2.12.0+rocm7.14.0}"
 else
-    # Nightly defaults: stay on 7.14 for libbitsandbytes_rocm714.so unless you override both pins.
     ROCM_SDK_PIN="${ROCM_SDK_PIN:-7.14.0}"
     TORCH_PIN="${TORCH_PIN:-}"
     ROCM_META_PIN="${ROCM_META_PIN:-}"
@@ -195,7 +193,7 @@ def vision714_versions() -> list[str]:
 
 
 def vision_for_torch(torch_ver: str) -> str:
-    """TheRock matrix: torch 2.12 -> torchvision 0.27, 2.13 -> 0.28, etc."""
+    """TheRock matrix: torch 2.12 -> 0.27, 2.13 -> 0.28, 2.14 -> 0.29, etc."""
     base = torch_ver.split("+", 1)[0]
     rocm_tag = torch_ver.split("+", 1)[1] if "+" in torch_ver else ""
     m = re.match(r"(\d+)\.(\d+)\.(\d+)(.*)$", base)
@@ -385,6 +383,34 @@ def rocm714_only(versions: list[str]) -> list[str]:
     ]
 
 
+def resolve_torch_pin(requested: str, available: list[str]) -> str:
+    if requested in available:
+        return requested
+    parts = requested.split("+", 1)[0].split(".")
+    if len(parts) >= 2:
+        prefix = f"{parts[0]}.{parts[1]}."
+        cands = [v for v in available if v.startswith(prefix)]
+        if cands:
+            chosen = max(cands, key=semver_tuple)
+            print(f"NOTE: {requested} not on index; using {chosen}", file=sys.stderr)
+            return chosen
+    print(f"ERROR: {requested} not on {index}", file=sys.stderr)
+    print(
+        "       Stable ships torch==2.12.0+rocm7.14.0 today. To try torch 2.14 nightly:",
+        file=sys.stderr,
+    )
+    print(
+        "         ROCM_CHANNEL=nightly TORCH_NIGHTLY_MINOR=2.14 ./install_fizgig_rocm.sh",
+        file=sys.stderr,
+    )
+    print(
+        "       Example pin (check index for newer builds): "
+        "TORCH_PIN=2.14.0a0+rocm7.14.0a20260625",
+        file=sys.stderr,
+    )
+    sys.exit(1)
+
+
 def vision_for_torch(torch_ver: str) -> str:
     base = torch_ver.split("+", 1)[0]
     rocm_tag = torch_ver.split("+", 1)[1] if "+" in torch_ver else ""
@@ -408,20 +434,24 @@ def vision_for_torch(torch_ver: str) -> str:
 
 torch_device_vers = rocm714_only(pip_versions(torch_device_pkg))
 vision_device_vers = rocm714_only(pip_versions(vision_device_pkg))
+torch_vers = rocm714_only(pip_versions("torch"))
 if not torch_device_vers or not vision_device_vers:
     if torch_pin:
-        print(f"TORCH_VER={torch_pin}")
-        print(f"VISION_VER={vision_for_torch(torch_pin)}")
+        torch_ver = resolve_torch_pin(torch_pin, torch_vers)
+        print(f"TORCH_VER={torch_ver}")
+        print(f"VISION_VER={vision_for_torch(torch_ver)}")
     print("STABLE_DEVICE_WHEEL=0")
     sys.exit(0)
 
-torch_ver = torch_pin if torch_pin else max(torch_device_vers, key=semver_tuple)
+if torch_pin:
+    torch_ver = resolve_torch_pin(torch_pin, torch_vers or torch_device_vers)
+else:
+    torch_ver = max(torch_device_vers, key=semver_tuple)
 vision_ver = vision_for_torch(torch_ver)
 vision_prefix = vision_ver.split("+", 1)[0] + "+"
 if vision_ver not in vision_device_vers and not any(v.startswith(vision_prefix) for v in vision_device_vers):
-    if torch_pin:
-        print(f"TORCH_VER={torch_pin}")
-        print(f"VISION_VER={vision_ver}")
+    print(f"TORCH_VER={torch_ver}")
+    print(f"VISION_VER={vision_ver}")
     print("STABLE_DEVICE_WHEEL=0")
     sys.exit(0)
 
@@ -694,15 +724,18 @@ echo "  *** HIGHLY EXPERIMENTAL — Linux AMD is best-effort only ***"
 echo "============================================================"
 echo
 echo "PyTorch / ROCm wheels are from AMD indexes — not built by Fizgig."
-echo "  Channel: ${ROCM_CHANNEL}  (stable → ${ROCM_INDEX} ; nightly → ${ROCM_NIGHTLY_INDEX})"
+echo "  Channel: ${ROCM_CHANNEL}  (default nightly → ${ROCM_NIGHTLY_INDEX})"
 if [[ "$ROCM_CHANNEL" == "stable" ]]; then
     echo "  Stable pin: torch==${TORCH_PIN}  rocm-sdk==${ROCM_SDK_PIN}"
+    echo "  Prefer nightly? Omit ROCM_CHANNEL or use: ROCM_CHANNEL=nightly ./install_fizgig_rocm.sh"
 else
-    echo "  Nightly pin: ROCm ${ROCM_SDK_PIN} (not latest 7.16+) — torch[device-\${ARCH}] minor ${TORCH_NIGHTLY_MINOR} when unpinned"
+    echo "  Nightly pin: ROCm ${ROCM_SDK_PIN} — torch[device-\${ARCH}] minor ${TORCH_NIGHTLY_MINOR} when unpinned"
+    echo "  Stable instead: ROCM_CHANNEL=stable ./install_fizgig_rocm.sh  (torch==2.12.0+rocm7.14.0)"
+    echo "  Try torch 2.14 nightly: TORCH_NIGHTLY_MINOR=2.14  (or TORCH_PIN=2.14.0a0+rocm7.14.0a20260625)"
     echo "  Override: TORCH_PIN=…  ROCM_META_PIN=…  TORCH_NIGHTLY_MINOR=…"
 fi
 echo
-echo "  Nightly install: ROCM_CHANNEL=nightly ./install_fizgig_rocm.sh"
+echo "  Stable install: ROCM_CHANNEL=stable ./install_fizgig_rocm.sh"
 echo "  Docs: https://github.com/ROCm/TheRock/blob/main/RELEASES.md"
 echo
 echo "Shared deps come from requirements.txt with CUDA torch/bnb and nvidia-ml-py filtered out."

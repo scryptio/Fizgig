@@ -316,13 +316,24 @@ chmod +x install_fizgig_rocm.sh
 ./run_fizgig_rocm.sh
 ```
 
-The script detects your gfx target (`detect_gpu_linux.py`). **Stable** (default) installs **ROCm 7.14** PyTorch from `repo.amd.com`, pinned to **`2.12.0+rocm7.14.0`** (covers cp310–cp314; override with `TORCH_PIN=…`). **Nightly** follows [TheRock multi-arch RELEASES.md](https://github.com/ROCm/TheRock/blob/main/RELEASES.md): one index URL plus a `[device-gfx*]` extra for your GPU (e.g. `gfx1201` → `device-gfx1201`):
+The script detects your gfx target (`detect_gpu_linux.py`). **Nightly is the Linux default** — [TheRock multi-arch RELEASES.md](https://github.com/ROCm/TheRock/blob/main/RELEASES.md) index plus a `[device-gfx*]` extra for your GPU (e.g. `gfx1201` → `device-gfx1201`). Unpinned nightly resolves the latest **torch 2.12** + **ROCm 7.14.0a\*** stack (matches `libbitsandbytes_rocm714.so`). Override with `TORCH_PIN=…`, `ROCM_META_PIN=…`, or `TORCH_NIGHTLY_MINOR=…`.
+
+**Stable** (repo.amd.com, no nightly alphas): pin **`torch==2.12.0+rocm7.14.0`** + **`rocm-sdk==7.14.0`** (cp310–cp314):
 
 ```bash
-ROCM_CHANNEL=nightly ./install_fizgig_rocm.sh
+ROCM_CHANNEL=stable ./install_fizgig_rocm.sh
 ```
 
-Nightly pulls pinned **ROCm 7.14** (not latest 7.16+) for `libbitsandbytes_rocm714.so`: `rocm[libraries,devel,device-${ARCH}]==…` + `torch[device-${ARCH}]==…` + `torchvision[device-${ARCH}]` from the nightly index, defaulting to the latest **2.12** + **7.14.0a*** build. Override with `TORCH_PIN=…`, `ROCM_META_PIN=…`, or `TORCH_NIGHTLY_MINOR=…`.
+**Try torch 2.14** (nightly only today — can increase sampling VRAM pressure vs 2.12):
+
+```bash
+ROCM_CHANNEL=nightly TORCH_NIGHTLY_MINOR=2.14 ./install_fizgig_rocm.sh
+# or an explicit pin, e.g.:
+# TORCH_PIN=2.14.0a0+rocm7.14.0a20260625 ROCM_CHANNEL=nightly ./install_fizgig_rocm.sh
+# (paired torchvision ~0.29.0a0+rocm7.14.0a… — installer resolves the match)
+```
+
+Linux ROCm cache scripts import `fizgig.rocm.cache_exit` only when `FIZGIG_GPU_BACKEND=rocm` (set by `run_fizgig_rocm.sh`); NVIDIA and other platforms call `main()` unchanged. Opt out: `FIZGIG_ROCM_NO_FAST_EXIT=1 ./run_fizgig_rocm.sh`.
 
 Then shared deps from `requirements.txt` (filtered) and `bitsandbytes>=0.50.0` for ROCm.
 
