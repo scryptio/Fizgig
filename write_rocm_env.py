@@ -32,22 +32,41 @@ def bnb_rocm_version_from_torch() -> str:
     if rocm:
         m = re.match(r"(\d+)\.(\d+)", str(rocm))
         if m:
-            return f"{m.group(1)}{int(m.group(2))}"
+            major = int(m.group(1))
+            minor = int(m.group(2))
+            # bitsandbytes wheels ship 64/70/71/714/72 — ignore ROCm 10.x style tags.
+            if major >= 7 and major <= 9:
+                return f"{major}{minor}"
 
     m = re.search(r"\+rocm(\d+)\.(\d+)", torch.__version__, re.I)
     if m:
-        return f"{m.group(1)}{int(m.group(2))}"
+        major = int(m.group(1))
+        minor = int(m.group(2))
+        if major >= 7 and major <= 9:
+            return f"{major}{minor}"
 
     hip = getattr(torch.version, "hip", None)
     if hip:
         m = re.match(r"(\d+)\.(\d+)", str(hip))
         if m:
-            return f"{m.group(1)}{int(m.group(2))}"
+            major = int(m.group(1))
+            minor = int(m.group(2))
+            if major >= 7 and major <= 9:
+                return f"{major}{minor}"
 
     raise RuntimeError(
-        f"could not parse ROCm version from torch {torch.__version__!r} "
+        f"could not parse ROCm 7.x version from torch {torch.__version__!r} "
         f"(rocm={rocm!r}, hip={hip!r})"
     )
+
+
+def _bitsandbytes_rocm_lib(bnb_suffix: str) -> Path | None:
+    try:
+        import bitsandbytes
+    except Exception:
+        return None
+    so = Path(bitsandbytes.__file__).resolve().parent / f"libbitsandbytes_rocm{bnb_suffix}.so"
+    return so if so.is_file() else None
 
 
 def main() -> int:
@@ -57,19 +76,29 @@ def main() -> int:
         probed = bnb_rocm_version_from_torch()
         import torch
         src = f"torch {torch.__version__}"
-        if is_linux:
-            if probed != DEFAULT_BNB_LINUX:
+        bnb = probed
+        so = _bitsandbytes_rocm_lib(bnb)
+        if so is None and is_linux and probed != DEFAULT_BNB_LINUX:
+            fallback = _bitsandbytes_rocm_lib(DEFAULT_BNB_LINUX)
+            if fallback is not None:
                 print(
-                    f"ERROR: torch reports ROCm SDK {probed} but Linux requires "
-                    f"{DEFAULT_BNB_LINUX} (libbitsandbytes_rocm714.so). "
-                    f"Re-run ./install_fizgig_rocm.sh (ROCm 7.14 pin).",
+                    f"WARN: libbitsandbytes_rocm{bnb}.so missing; "
+                    f"using BNB_ROCM_VERSION={DEFAULT_BNB_LINUX} ({fallback.name})",
                     file=sys.stderr,
                 )
-                return 1
-            bnb = DEFAULT_BNB_LINUX
+                bnb = DEFAULT_BNB_LINUX
+                so = fallback
+        if so is None:
+            print(
+                f"WARN: no matching libbitsandbytes_rocm*.so for ROCm {probed}; "
+                f"using BNB_ROCM_VERSION={default_bnb}",
+                file=sys.stderr,
+            )
+            bnb = default_bnb
+        elif is_linux and probed == DEFAULT_BNB_LINUX:
             src = f"{src} (Linux ROCm 7.14 / bnb {bnb})"
         else:
-            bnb = probed
+            src = f"{src} (bnb {bnb} / {so.name})"
     except Exception as exc:
         print(f"WARN: {exc}; using default BNB_ROCM_VERSION={default_bnb}")
         bnb = default_bnb

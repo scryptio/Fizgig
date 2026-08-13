@@ -306,7 +306,7 @@ cd Fizgig
 - `torchvision==0.27.0+rocm7.15.0a20260728`
 - `rocm-sdk-devel==7.15.0a20260728`
 
-Override with `TORCH_PIN` / `TORCHVISION_PIN` / `ROCM_SDK_DEVEL_PIN` if needed. **bitsandbytes** is a pinned community Windows ROCm wheel from [0xDELUXA/bitsandbytes_win_rocm](https://github.com/0xDELUXA/bitsandbytes_win_rocm) — built by neither AMD nor Fizgig. Shared deps come from `requirements.txt` with CUDA `torch`/`bitsandbytes` lines filtered out (`filter_requirements_rocm.py`). Launch with `run_fizgig_rocm.bat`.
+Override with `TORCH_PIN` / `TORCHVISION_PIN` / `ROCM_SDK_DEVEL_PIN` if needed. **bitsandbytes** is a pinned community Windows ROCm wheel from [0xDELUXA/bitsandbytes_win_rocm](https://github.com/0xDELUXA/bitsandbytes_win_rocm) — built by neither AMD nor Fizgig. Shared deps come from `requirements.txt` with CUDA `torch`/`bitsandbytes` and NVIDIA-only `nvidia-ml-py` filtered out (`filter_requirements_rocm.py`). Launch with `run_fizgig_rocm.bat`.
 
 **Linux (AMD ROCm — highly experimental)** — expect crashes, GPU resets, and incomplete model support on many setups. Best-effort only; Windows ROCm or NVIDIA Linux are the supported training paths. Prerequisites: amdgpu driver loaded (`/dev/kfd`), user in `render`/`video` groups. See [Install ROCm](https://rocm.docs.amd.com/en/latest/install/rocm.html) and [PyTorch for ROCm](https://rocm.docs.amd.com/projects/ai-ecosystem/en/latest/frameworks/pytorch/install.html). Then:
 
@@ -316,7 +316,15 @@ chmod +x install_fizgig_rocm.sh
 ./run_fizgig_rocm.sh
 ```
 
-The script detects your gfx target (`detect_gpu_linux.py`), installs **ROCm 7.14** PyTorch wheels pinned to **`2.13.0+rocm7.14.0`** by default (override with `TORCH_PIN=…`), then shared deps from `requirements.txt` (filtered) and `bitsandbytes>=0.50.0` for ROCm.
+The script detects your gfx target (`detect_gpu_linux.py`). **Stable** (default) installs **ROCm 7.14** PyTorch from `repo.amd.com`, pinned to **`2.12.0+rocm7.14.0`** (covers cp310–cp314; override with `TORCH_PIN=…`). **Nightly** follows [TheRock multi-arch RELEASES.md](https://github.com/ROCm/TheRock/blob/main/RELEASES.md): one index URL plus a `[device-gfx*]` extra for your GPU (e.g. `gfx1201` → `device-gfx1201`):
+
+```bash
+ROCM_CHANNEL=nightly ./install_fizgig_rocm.sh
+```
+
+Nightly pulls pinned **ROCm 7.14** (not latest 7.16+) for `libbitsandbytes_rocm714.so`: `rocm[libraries,devel,device-${ARCH}]==…` + `torch[device-${ARCH}]==…` + `torchvision[device-${ARCH}]` from the nightly index, defaulting to the latest **2.12** + **7.14.0a*** build. Override with `TORCH_PIN=…`, `ROCM_META_PIN=…`, or `TORCH_NIGHTLY_MINOR=…`.
+
+Then shared deps from `requirements.txt` (filtered) and `bitsandbytes>=0.50.0` for ROCm.
 
 **Linux / macOS (NVIDIA CUDA path)** — `install_fizgig.py` is CUDA-only (captioning / image prep on macOS; training needs a CUDA or ROCm GPU). On AMD-only Linux hosts it prints a hand-off to the ROCm installer and exits:
 

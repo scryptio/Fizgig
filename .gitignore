@@ -90,3 +90,6 @@ python312/
 # Internal-only: debugging test harnesses + template setup notes (local, never public)
 tests/
 docs/RUNPOD_TEMPLATE.md
+
+# Local-only deploy/sync helpers (never commit)
+sync-to-remote.sh

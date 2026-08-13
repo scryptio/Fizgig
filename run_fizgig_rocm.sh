@@ -47,6 +47,7 @@ export PATH
 
 for _lib in venv/lib/python*/site-packages/_rocm_sdk_core/lib \
             venv/lib/python*/site-packages/_rocm_sdk/lib \
+            venv/lib/python*/site-packages/_rocm_sdk_libraries/lib \
             /opt/rocm/lib /opt/rocm/lib64; do
     [[ -d "$_lib" ]] && LD_LIBRARY_PATH="${_lib}${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
 done

@@ -133,20 +133,20 @@ if !USE_LEGACY_URL!==1 (
         set "LEGACY_INDEX=https://rocm.nightlies.amd.com/v2-staging/gfx942-dcgpu/"
         echo Installing ROCm PyTorch for MI300/MI325 ^(gfx942^)...
         echo Source: !LEGACY_INDEX!
-        python -m uv pip install --link-mode copy --index-strategy unsafe-best-match --index-url "!LEGACY_INDEX!" "rocm[devel,libraries]"
+        python -m uv pip install --index-strategy unsafe-best-match --index-url "!LEGACY_INDEX!" "rocm[devel,libraries]"
         if errorlevel 1 goto :install_failed
         rocm-sdk init
-        python -m uv pip install --link-mode copy --index-strategy unsafe-best-match --index-url "!LEGACY_INDEX!" torch torchvision
+        python -m uv pip install --index-strategy unsafe-best-match --index-url "!LEGACY_INDEX!" torch torchvision
         if errorlevel 1 goto :install_failed
     )
     if /I "!arch!"=="gfx950" (
         set "LEGACY_INDEX=https://rocm.nightlies.amd.com/v2-staging/gfx950-dcgpu/"
         echo Installing ROCm PyTorch for MI350/MI355 ^(gfx950^)...
         echo Source: !LEGACY_INDEX!
-        python -m uv pip install --link-mode copy --index-strategy unsafe-best-match --index-url "!LEGACY_INDEX!" "rocm[devel,libraries]"
+        python -m uv pip install --index-strategy unsafe-best-match --index-url "!LEGACY_INDEX!" "rocm[devel,libraries]"
         if errorlevel 1 goto :install_failed
         rocm-sdk init
-        python -m uv pip install --link-mode copy --index-strategy unsafe-best-match --index-url "!LEGACY_INDEX!" torch torchvision
+        python -m uv pip install --index-strategy unsafe-best-match --index-url "!LEGACY_INDEX!" torch torchvision
         if errorlevel 1 goto :install_failed
     )
     goto :install_shared
@@ -157,7 +157,7 @@ echo Source: !ROCM_INDEX!
 echo   torch[device-!arch!]==!TORCH_PIN!
 echo   torchvision[device-!arch!]==!TORCHVISION_PIN!
 echo   rocm-sdk-devel==!ROCM_SDK_DEVEL_PIN!
-python -m uv pip install --link-mode copy --index-strategy unsafe-best-match --index-url "!ROCM_INDEX!" ^
+python -m uv pip install --index-strategy unsafe-best-match --index-url "!ROCM_INDEX!" ^
     "torch[device-!arch!]==!TORCH_PIN!" ^
     "torchvision[device-!arch!]==!TORCHVISION_PIN!" ^
     "rocm-sdk-devel==!ROCM_SDK_DEVEL_PIN!"
@@ -168,14 +168,14 @@ echo.
 echo Installing Fizgig dependencies from requirements.txt ^(CUDA torch/bnb lines stripped^)...
 python filter_requirements_rocm.py requirements.txt "%TEMP%\fizgig_rocm_shared_reqs.txt"
 if errorlevel 1 goto :install_failed
-python -m uv pip install --link-mode copy --index-strategy unsafe-best-match -r "%TEMP%\fizgig_rocm_shared_reqs.txt"
+python -m uv pip install --index-strategy unsafe-best-match -r "%TEMP%\fizgig_rocm_shared_reqs.txt"
 if errorlevel 1 goto :install_failed
 del "%TEMP%\fizgig_rocm_shared_reqs.txt" %Q%
 
 echo.
 echo Installing bitsandbytes ^(community Windows ROCm wheel - neither AMD nor Fizgig^)...
 echo Source: !BNB_WHEEL!
-python -m uv pip install --link-mode copy "!BNB_WHEEL!"
+python -m uv pip install "!BNB_WHEEL!"
 if errorlevel 1 goto :install_failed
 
 echo.
