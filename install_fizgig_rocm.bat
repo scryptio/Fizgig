@@ -1,7 +1,7 @@
 @echo off
 REM Fizgig ROCm Windows installer.
 REM Uses detect_gpu.py (GPL-3.0, from comfyui-rocm - see THIRD_PARTY_NOTICES.md)
-REM and portable-Python / ROCm-wheel patterns adapted from comfyui-rocm install.bat:
+REM and ROCm-wheel install patterns adapted from comfyui-rocm install.bat:
 REM   https://github.com/patientx/comfyui-rocm
 setlocal enabledelayedexpansion
 title Fizgig ROCm Installer
@@ -24,6 +24,7 @@ echo   Klein 9B and Krea 2 LoRA Studio
 echo ============================================================
 echo.
 echo Requires Python 3.12 ^(the ROCm bitsandbytes wheel is cp312-only^).
+echo Fizgig's GUI needs Tkinter, which ships with a full python.org / pymanager install.
 echo.
 echo PyTorch / ROCm wheels come from AMD nightlies - not built by Fizgig:
 echo   Index:  !ROCM_INDEX!
@@ -37,17 +38,7 @@ echo.
 
 call :resolve_python312
 if not defined PY312 (
-    echo.
-    echo No Python 3.12 found via py launcher or PATH.
-    echo Downloading portable Python 3.12.10 ^(same approach as comfyui-rocm^)...
-    echo.
-    call :download_python312
-)
-if not defined PY312 (
-    echo.
-    echo ERROR: Could not locate or install Python 3.12.
-    echo Install Python 3.12 from https://www.python.org/downloads/
-    echo or ensure `py -3.12` works, then re-run this script.
+    call :print_python312_help
     pause
     exit /b 1
 )
@@ -56,6 +47,17 @@ echo Using Python 3.12: !PY312!
 echo Source: !PY312_SOURCE!
 "!PY312!" --version
 echo.
+
+"!PY312!" -c "import tkinter" %Q%
+if errorlevel 1 (
+    echo.
+    echo ERROR: Python 3.12 is installed but Tkinter is missing ^(Fizgig's GUI needs it^).
+    echo Reinstall from python.org and tick "tcl/tk and IDLE", then re-run this script.
+    echo.
+    call :print_python312_help
+    pause
+    exit /b 1
+)
 
 if exist "venv" (
     echo Virtual environment already exists at venv\
@@ -70,14 +72,10 @@ if not exist "venv" (
     echo Creating virtual environment with Python 3.12...
     "!PY312!" -m venv venv
     if errorlevel 1 (
-        echo venv module failed - trying virtualenv...
-        "!PY312!" -m pip install virtualenv %Q%
-        "!PY312!" -m virtualenv venv
-        if errorlevel 1 (
-            echo ERROR: Failed to create venv.
-            pause
-            exit /b 1
-        )
+        echo ERROR: Failed to create venv.
+        echo Python 3.12 from python.org / pymanager includes the venv module.
+        pause
+        exit /b 1
     )
 )
 
@@ -214,15 +212,11 @@ exit /b 0
 
 REM ---------------------------------------------------------------------------
 REM Resolve Python 3.12 - never trust bare `python` when 3.14+ is the default.
-REM Order: py -3.12  >  python3.12  >  where python3.12  >  existing python312\
+REM Order: py -3.12  >  python3.12 on PATH  >  python if it is actually 3.12
 REM ---------------------------------------------------------------------------
 :resolve_python312
-if exist "%~dp0python312\python.exe" (
-    call :verify_python312 "%~dp0python312\python.exe" "portable download (python312\)"
-    if defined PY312 exit /b 0
-)
 
-REM Python launcher - handles multi-version installs (py list).
+REM Python launcher / Install Manager (py list, py -3.12, py install 3.12).
 where py >nul 2>&1
 if not errorlevel 1 (
     py -3.12 -V %Q%
@@ -266,77 +260,21 @@ set "PY312_SOURCE=%_SRC%"
 exit /b 0
 
 
-REM ---------------------------------------------------------------------------
-REM Download portable Python 3.12.10 (embed + dev libs), same pattern as comfyui-rocm.
-REM Stored in python312\ - reused on later installs.
-REM ---------------------------------------------------------------------------
-:download_python312
-set "PYDIR=%~dp0python312"
-set "PYVER=3.12.10"
-
-if exist "%PYDIR%\python.exe" (
-    call :verify_python312 "%PYDIR%\python.exe" "portable download (python312\)"
-    if defined PY312 exit /b 0
-)
-
-if not exist "%PYDIR%" mkdir "%PYDIR%"
-
-echo [1/5] Downloading Python %PYVER% embeddable...
-curl -L --ssl-no-revoke "https://www.python.org/ftp/python/%PYVER%/python-%PYVER%-embed-amd64.zip" -o "%TEMP%\fizgig_python_embed.zip" --no-progress-meter %Q%
-if errorlevel 1 (
-    echo ERROR: Failed to download Python embeddable.
-    exit /b 1
-)
-
-echo [2/5] Downloading Python %PYVER% development files...
-curl -L --ssl-no-revoke "https://www.python.org/ftp/python/%PYVER%/python-%PYVER%-amd64.zip" -o "%TEMP%\fizgig_python_full.zip" --no-progress-meter %Q%
-if errorlevel 1 (
-    echo ERROR: Failed to download Python full zip.
-    del "%TEMP%\fizgig_python_embed.zip" %Q%
-    exit /b 1
-)
-
-echo [3/5] Extracting Python runtime...
-tar -xf "%TEMP%\fizgig_python_embed.zip" -C "%PYDIR%" %Q%
-if errorlevel 1 (
-    echo ERROR: Failed to extract embeddable Python.
-    exit /b 1
-)
-del "%TEMP%\fizgig_python_embed.zip" %Q%
-
-echo [4/5] Copying headers and libraries...
-set "PYFULL=%TEMP%\fizgig_pythonfull"
-if exist "%PYFULL%" rd /s /q "%PYFULL%" %Q%
-mkdir "%PYFULL%"
-tar -xf "%TEMP%\fizgig_python_full.zip" -C "%PYFULL%" %Q%
-del "%TEMP%\fizgig_python_full.zip" %Q%
-
-if exist "%PYFULL%\include" xcopy "%PYFULL%\include" "%PYDIR%\include\" /E /I /Q %Q%
-if exist "%PYFULL%\libs" xcopy "%PYFULL%\libs" "%PYDIR%\libs\" /E /I /Q %Q%
-if exist "%PYFULL%\Lib" xcopy "%PYFULL%\Lib" "%PYDIR%\Lib\" /E /I /Q %Q%
-rd /s /q "%PYFULL%" %Q%
-
-(
-echo python312.zip
-echo .
-echo ..
-echo import site
-) > "%PYDIR%\python312._pth"
-
-echo [5/5] Installing pip into portable Python...
-curl -L --ssl-no-revoke "https://bootstrap.pypa.io/get-pip.py" -o "%TEMP%\fizgig_get-pip.py" --no-progress-meter %Q%
-if errorlevel 1 (
-    echo ERROR: Failed to download get-pip.py.
-    exit /b 1
-)
-"%PYDIR%\python.exe" "%TEMP%\fizgig_get-pip.py" --no-warn-script-location %Q%
-del "%TEMP%\fizgig_get-pip.py" %Q%
-if errorlevel 1 (
-    echo ERROR: Failed to install pip into portable Python.
-    exit /b 1
-)
-
-"%PYDIR%\python.exe" -m pip install --upgrade pip setuptools wheel --no-warn-script-location %Q%
-
-call :verify_python312 "%PYDIR%\python.exe" "portable download (python312\)"
+:print_python312_help
+echo.
+echo ERROR: Python 3.12 not found ^(needed for the ROCm bitsandbytes wheel, cp312-only^).
+echo `py -3.12` / `python3.12` must work, then re-run this script.
+echo.
+echo Windows downloads: https://www.python.org/downloads/windows/
+echo.
+echo Recommended ^(2026^) - Python Install Manager:
+echo   Microsoft Store: https://apps.microsoft.com/detail/9NQ7512CXL7T
+echo   Release page:    https://www.python.org/downloads/latest/pymanager
+echo   Then in a new terminal:
+echo     py install 3.12
+echo.
+echo Alternative - Python 3.12.10 installer:
+echo   https://www.python.org/ftp/python/3.12.10/python-3.12.10-amd64.exe
+echo   Tick "Add python.exe to PATH" and "tcl/tk and IDLE".
+echo.
 exit /b 0

@@ -320,7 +320,12 @@ presets and venv exactly where they are.
 
 **Windows (NVIDIA, one-click)** — double-click `install_fizgig.bat`. It creates a venv, installs CUDA 12.8 PyTorch and all dependencies, pre-downloads the InsightFace models, and verifies CUDA is visible to PyTorch. Launch with `run_fizgig.bat`; update later with `update_fizgig.bat`.
 
-**Windows (AMD ROCm)** — double-click `install_fizgig_rocm.bat` (NVIDIA users never run this). It picks **Python 3.12** via `py -3.12` / `python3.12` (not whatever `python` defaults to — e.g. 3.14), or downloads portable 3.12.10 if none is found (same approach as comfyui-rocm). GPU detection follows, then pinned multi-arch wheels from **AMD ROCm nightlies** (`https://rocm.nightlies.amd.com/whl-multi-arch/` — not built by Fizgig):
+**Windows (AMD ROCm)** — needs a full **Python 3.12** install first (the ROCm bitsandbytes wheel is cp312-only; Fizgig's GUI needs Tkinter). Do not use the embeddable zip. Install from [Windows downloads](https://www.python.org/downloads/windows/):
+
+- **Recommended (2026)** — [Python Install Manager](https://www.python.org/downloads/latest/pymanager) from the [Microsoft Store](https://apps.microsoft.com/detail/9NQ7512CXL7T), then `py install 3.12`.
+- **Alternative** — [python-3.12.10-amd64.exe](https://www.python.org/ftp/python/3.12.10/python-3.12.10-amd64.exe); tick **Add python.exe to PATH** and **tcl/tk and IDLE**.
+
+Then double-click `install_fizgig_rocm.bat` (NVIDIA users never run this). It picks 3.12 via `py -3.12` / `python3.12` (not whatever `python` defaults to — e.g. 3.14). GPU detection follows, then pinned multi-arch wheels from **AMD ROCm nightlies** (`https://rocm.nightlies.amd.com/whl-multi-arch/` — not built by Fizgig):
 
 - `torch==2.12.0+rocm7.15.0a20260728`
 - `torchvision==0.27.0+rocm7.15.0a20260728`

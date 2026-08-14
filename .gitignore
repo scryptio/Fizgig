@@ -83,7 +83,7 @@ rocm_env.bat
 rocm_env.sh
 gpu_detect_debug.log
 
-# Portable Python downloaded by install_fizgig_rocm.bat when py -3.12 is unavailable
+# Leftover portable-Python cache from older ROCm installer attempts
 python312/
 
 

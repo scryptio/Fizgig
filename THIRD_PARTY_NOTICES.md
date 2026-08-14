@@ -102,8 +102,8 @@ installer uses code from that project as follows:
   (AMD GPU → gfx architecture detection on Windows). **Unmodified.** This file
   is **GPL-3.0 only**; it is not relicensed under Apache-2.0.
 - `install_fizgig_rocm.bat` — Fizgig-authored installer that **calls**
-  `detect_gpu.py` and follows the same portable-Python / ROCm-wheel install
-  patterns as comfyui-rocm's `install.bat` (adapted for Fizgig's venv and
+  `detect_gpu.py` and follows the same ROCm-wheel install patterns as
+  comfyui-rocm's `install.bat` (adapted for Fizgig's venv and
   requirements). The batch file itself is Apache-2.0; the bundled
   `detect_gpu.py` remains GPL-3.0.
 
