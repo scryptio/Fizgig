@@ -45,6 +45,21 @@ def _bitsandbytes_rocm_libs_available() -> list[Path]:
     return sorted(lib_dir.glob(f"libbitsandbytes_rocm*{_bnb_lib_ext()}"))
 
 
+def _windows_rocm_path_prefix(core: Path) -> str | None:
+    """Directories where hipInfo.exe lives (bitsandbytes cuda_specs runs ``hipinfo``)."""
+    parts: list[str] = []
+    bin_dir = core / "bin"
+    if bin_dir.is_dir():
+        parts.append(str(bin_dir.resolve()))
+    devel_bin = core.parent / "_rocm_sdk_devel" / "bin"
+    if devel_bin.is_dir():
+        parts.append(str(devel_bin.resolve()))
+    venv_scripts = (SCRIPT_DIR / "venv" / "Scripts").resolve()
+    if venv_scripts.is_dir():
+        parts.append(str(venv_scripts))
+    return ";".join(parts) if parts else None
+
+
 def _linux_rocm_core_path() -> Path:
     for p in sorted((SCRIPT_DIR / "venv" / "lib").glob("python*/site-packages/_rocm_sdk_core")):
         if p.is_dir():
@@ -146,8 +161,11 @@ def main() -> int:
             f'set "BNB_ROCM_VERSION={bnb}"',
             f'set "ROCM_PATH={core}"',
             f'set "HIP_PATH={core}"',
-            "",
         ]
+        path_prefix = _windows_rocm_path_prefix(core)
+        if path_prefix:
+            bat_lines.append(f'set "PATH={path_prefix};%PATH%"')
+        bat_lines.append("")
         OUT_BAT.write_text("\r\n".join(bat_lines), encoding="utf-8")
         print(f"Wrote {OUT_BAT.name}: BNB_ROCM_VERSION={bnb}  ({src})")
 
