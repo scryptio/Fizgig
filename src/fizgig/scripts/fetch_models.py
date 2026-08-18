@@ -84,6 +84,15 @@ FAMILIES = {
         Weight("minimax_vae", "Comfy-Org/MiniMax-H3",
                "vae/minimax_h3_video_vae_fp16.safetensors", 4.9,
                "Video VAE — caching + preview decode"),
+        # Not behind --include-optional: 605 MB against this family's 47 GB is nothing, and a
+        # user who adds video clips later would otherwise have to come back for one small file.
+        Weight("minimax_audio_vae", "Comfy-Org/MiniMax-H3",
+               "vae/minimax_h3_audio_vae_fp32.safetensors", 0.61,
+               "Audio VAE — training on the sound in video clips"),
+        # Same reasoning: 780 MB buys 6-step previews for every H3 run.
+        Weight("minimax_turbo_lora", "larryvrh/MiniMax-H3-Turbo-Lora",
+               "minimax_h3_turbo_v4_step600.safetensors", 0.78,
+               "Turbo LoRA — fast 6-step in-training previews"),
         # ref2va is a DIFFERENT fine-tune, needed only for reference distillation — 21 GB most
         # users don't want on a first setup, so it rides behind --include-optional like the
         # Krea 2 Turbo DiT does.

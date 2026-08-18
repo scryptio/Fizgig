@@ -31,6 +31,52 @@ def fp8_scaled_mm_supported(device: Optional[Union[str, torch.device]] = None) -
     return (major, minor) >= (8, 9)
 
 
+def plannable_free_vram(device: Optional[Union[str, torch.device]] = None) -> float:
+    """Free VRAM in GB for PLANNING decisions — honouring the small-card simulator.
+
+    Set FIZGIG_SIM_VRAM_GB=16 and every planner behaves as though the machine had a 16 GB
+    card: reported free becomes (simulated total − whatever Windows/desktop currently eat),
+    the same view that card's real owner gets. A separate VRAM-hog process cannot do this
+    job — WDDM virtualizes memory per process, so mem_get_info in Fizgig's processes never
+    sees another process's ballast (the issue-#71 overcommit behaviour, met from the other
+    side). Pair with apply_sim_vram_cap() so exceeding the budget genuinely OOMs too.
+    """
+    import os
+    idx = None
+    if device is not None:
+        idx = torch.device(device).index
+    free_b, total_b = torch.cuda.mem_get_info(idx if idx is not None else 0)
+    free = free_b / 1e9
+    sim = os.environ.get("FIZGIG_SIM_VRAM_GB", "").strip()
+    if sim:
+        try:
+            reported_total = float(sim) * 0.995e9 / 1e9   # a "16 GB" card reports ~15.9
+            deficit = (total_b - free_b) / 1e9            # the Windows/desktop tax
+            free = min(free, max(0.0, reported_total - deficit))
+        except ValueError:
+            pass
+    return free
+
+
+def apply_sim_vram_cap(device: Optional[Union[str, torch.device]] = None):
+    """The enforcement half of the simulator: cap this process's torch allocator at the
+    simulated card size, so an allocation a real small card could not make OOMs here too
+    instead of quietly spilling into the 5090's headroom. No-op without the env var."""
+    import os
+    sim = os.environ.get("FIZGIG_SIM_VRAM_GB", "").strip()
+    if not sim or not torch.cuda.is_available():
+        return
+    try:
+        idx = torch.device(device).index if device is not None else 0
+        total = torch.cuda.mem_get_info(idx or 0)[1] / 1e9
+        frac = min(1.0, (float(sim) * 0.995) / total)
+        torch.cuda.set_per_process_memory_fraction(frac, idx or 0)
+        logger.warning(f"[sim] FIZGIG_SIM_VRAM_GB={sim}: allocator capped at "
+                       f"{frac * total:.1f} GB — this process behaves like a {sim} GB card.")
+    except Exception as exc:
+        logger.warning(f"[sim] could not cap the allocator: {exc}")
+
+
 def clean_memory_on_device(device: Optional[Union[str, torch.device]]):
     """Free cached memory on the specified device."""
     if device is None:

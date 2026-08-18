@@ -404,16 +404,11 @@ ARCHITECTURES = {
         "sample_is_distilled": True,
         "sample_cfg_fixed": True,
         "sample_steps_default": 20,   # the reference pipeline default
-        # 1024x1024 STILLS (Peter, 11 Aug). Once the four dtype/integration divergences from
-        # ComfyUI were fixed (VAE decode dtype, audio integration order, the int8 per-row scale,
-        # AdaLN precision) previews stopped being soft, and a still at full size became the
-        # better trade than a clip at a small one: 1 latent frame is 1/17th the video rows of a
-        # 56-frame clip, so 1024 costs less than 640 did before and renders in seconds instead
-        # of minutes. Our still decode is its own path (a 5-token group, keeping frame 3) and
-        # measures ~28 dB against the VAE's own reconstruction, well clear of the reference's
-        # single-frame route. Clips are still a dropdown away when motion is what you need.
-        "sample_width_default": 1024,
-        "sample_height_default": 1024,
+        # 768x768 (Peter, 17 Aug — down from the 11 Aug 1024): H3's native canvas is a 768
+        # short edge, and with clips-with-sound in the preview mix the smaller frame keeps
+        # those affordable too. 1024 is still one dropdown away.
+        "sample_width_default": 768,
+        "sample_height_default": 768,
         "lora_name_suffix": "mmh3",
     },
 }
@@ -495,44 +490,32 @@ def minimax_lownoise_to_shift(pct):
     return (1.0 - p) / p
 
 
-def minimax_lownoise_to_lognorm_shift(pct):
-    """Share of steps below sigma 0.5 (percent) -> the shift for a LOGIT-NORMAL base.
+def minimax_highnoise_lr(pct):
+    """'Medium to High LR adjustment' (percent) -> a plain multiplier. None if unusable.
 
-    The box means the same thing whichever shape is chosen; only the arithmetic behind it
-    changes. For a uniform base the inverse is closed-form. For a logit-normal base,
-    sigma < 0.5 happens when the base draw u < 1/(s+1), and u = sigmoid(z) with z ~ N(0,1), so
-
-        P = Phi(logit(1 / (s + 1)))
-
-    which is monotonically decreasing in s but has no tidy inverse — hence bisection. Bracketed
-    generously (1e-6 .. 1e6) so extreme box values still resolve rather than silently clamping.
+    Applies to steps drawn ABOVE sigma 0.5 — the same threshold the low-noise box is defined
+    against, so the two controls always agree about where the boundary is. 100 means unchanged.
+    0 is allowed and means those steps train nothing; the ceiling is 100 because raising the LR
+    for the noisy end is a different experiment from damping it, and one dial should do one thing.
     """
-    import math as _m
-    p = None
     try:
         p = float(str(pct).strip().rstrip("%")) / 100.0
     except (TypeError, ValueError):
         return None
-    if not (0.0 < p < 1.0):
-        return None
+    return None if not (0.0 <= p <= 1.0) else p
 
-    def _share(s):
-        u = 1.0 / (s + 1.0)                                   # the base draw that gives sigma 0.5
-        z = _m.log(u / (1.0 - u))                             # logit
-        return 0.5 * (1.0 + _m.erf(z / _m.sqrt(2.0)))         # Phi(z)
 
-    lo, hi = 1e-6, 1e6
-    if p >= _share(lo):
-        return lo
-    if p <= _share(hi):
-        return hi
-    for _ in range(200):                                      # ~1e-60 on the bracket; cheap
-        mid = _m.sqrt(lo * hi)                                # geometric: s spans many decades
-        if _share(mid) > p:
-            lo = mid
-        else:
-            hi = mid
-    return _m.sqrt(lo * hi)
+# The logit-normal ("mid-concentrated") variant of the above is GONE, deliberately.
+#
+# It bunched training around the middle and thinned BOTH tails, and the tail it was quietly
+# deleting is the high-noise end where pose and composition are decided — at 60% low noise it left
+# 0.7% of a run above sigma 0.9. A 20-step render spends most of its steps there, so the LoRA was
+# being asked to hold structure it had barely trained on: fine under a 4-step Turbo workflow,
+# soft or distorted without one.
+#
+# Tested directly (Peter, 14 Aug): the Likeness preset with mid-concentrated OFF works at strength
+# 1.0 without Turbo, and likeness did not suffer — so it was not buying what it was supposed to buy
+# either. The 60% share was never the problem.
 
 
 def minimax_shift_to_lownoise(shift):
@@ -569,6 +552,62 @@ def minimax_shift_to_lownoise(shift):
 # can be typed instead — "3-12, 14-15, 22, 31-33". The label separator is "·" and not "-" or a
 # plain space, because both of those appear inside a block spec; splitting on them would turn
 # "3-12, 14" into "3-12," and train the wrong set without ever complaining.
+# MiniMax H3 — "Training Structure" on the Training tab. One decision, two numbers behind it.
+#
+#   pct  = share of steps trained below sigma 0.5 (the clean end, where detail and identity live).
+#          Converted to the trainer's --shift by minimax_lownoise_to_shift.
+#   lr   = what the steps ABOVE that threshold do to the learning rate, as a percentage.
+#
+# Both presets recommend 100 — the noisy steps train at full rate — because that is the only
+# setting anything has been measured at. The dial exists because dropping the clean-end share
+# makes high-noise steps the MAJORITY (92% at the model's own schedule against 40% here), and the
+# worry was that they would swamp the few clean-end steps carrying identity.
+#
+# Measured across FIVE datasets (Peter, 14 Aug), at BOTH densities and at 0% and 100%: nothing
+# corrupts in any of the four combinations, and 100% has visibly better face SHAPE every time.
+# That fits — shape is settled early, at high noise, while skin and texture come late — so damping
+# costs geometry rather than buying stability, including at 8% clean-end where the noisy end is
+# 92% of the run and the swamping worry should have been strongest. It was not. Nothing is damped
+# by default.
+#
+# The box stays because it is the SAFE way to bias a run toward surface detail. Mid-concentrated
+# tried to do that by changing which noise levels were SAMPLED, which took the adapter
+# off-distribution and distorted at 20 steps. This changes only how much is learned from them —
+# the schedule the model sees is untouched, which is why 0% renders cleanly at either density. A
+# skin-texture LoRA is the obvious use.
+#
+# The 8% is not a guess. ai-toolkit's H3 entry overrides its global 'sigmoid' timestep type with
+# 'shift' (ui/src/app/jobs/new/options.tsx) against a scheduler at the model's RELEASED video flow
+# shift of 12 (minimax_h3.py + packing.py). A shifted-uniform draw at shift 12 puts 1/13 = 7.7% of
+# steps below sigma 0.5. It is the schedule the model's own flow shift implies — not a published
+# statement of what MiniMax ran in pre-training, which is why the label says the former.
+# There is deliberately no "style" setting between these two. Style lives at the CLEAN end, not
+# the noisy one — Fizgig's own Klein work established that, extracting at three timestep ranges
+# and finding style concentrated in the late/clean band. Brushwork, palette and grain are surface
+# properties, so a style LoRA wants the same density a likeness one does; what distinguishes it is
+# often rank and LR, not the noise schedule.
+# An earlier revision of this shipped a "Balanced / style — 25%" option built by treating style as
+# composition and pushing AWAY from the clean end. That was backwards, and a mislabelled setting is
+# worse than a missing one.
+MINIMAX_STRUCTURE_OPTIONS = {
+    "Likeness and Style — 60% clean-end": (60, 100),
+    "Model default, movement — 8% clean-end": (8, 100),
+    "Custom": None,
+}
+MINIMAX_STRUCTURE_DESC = {
+    "Likeness and Style — 60% clean-end":
+        "Most of the run on nearly-clean images. Skin, hair and identity are learned there — and "
+        "so is style, which is a surface property rather than a compositional one. The tuned "
+        "default for stills.",
+    "Model default, movement — 8% clean-end":
+        "The schedule H3's own flow shift implies, and what the reference trainer uses. Weighted "
+        "to movement and composition rather than fine detail.",
+    "Custom":
+        "Type your own share. Below ~50% the high-noise steps become the majority, which is what "
+        "the LR adjustment beside this is for.",
+}
+MINIMAX_STRUCTURE_DEFAULT = "Likeness and Style — 60% clean-end"
+
 MINIMAX_BLOCK_OPTIONS = [
     "all · every block (50 of 50)",
     "10-49 · skip the first 10",
@@ -785,14 +824,13 @@ MINIMAX_BUILT_IN_PRESETS = {
     "✨ MiniMax H3 Defaults (LoRA 16, 0.25 MP)": {
         "NETWORK_DIM": 16, "NETWORK_ALPHA": 16,
         "NETWORK_TYPE": "LoRA (standard)", "LOKR_FACTOR": 8,
-        # 2e-4 is a CEILING, not a dose — it is what Adapter-relative LR works its way up toward,
-        # and a flat run should be judged from its samples rather than trusted to this number.
-        "LEARNING_RATE": 2e-4,
-        # Ships ON at the slow build (Peter, 11 Aug). A LoRA starts at zero, so the first steps
-        # are enormous relative to its own size — the ramp holds that ratio steady instead of
-        # asking for a number that is wrong at one end of the run or the other. Off is still a
-        # dropdown away for a flat run.
-        "MINIMAX_ADAPTER_RAMP": "0.003 (slow build)",
+        # Flat 1e-4 (Peter, 17 Aug). With the ramp off this IS the rate — and rank 16 wants
+        # half of what the rank-8 Fast preset runs at (which keeps its flat 2e-4).
+        "LEARNING_RATE": 1e-4,
+        # Ships OFF (Peter, 17 Aug — reversing 11 Aug): the slow build spent the early epochs
+        # crawling and the flat 2e-4 runs have been the ones delivering. The ramp stays a
+        # dropdown away for anyone who wants the held-ratio start.
+        "MINIMAX_ADAPTER_RAMP": "Off",
         # Carried so "load Defaults" genuinely resets it. Multi Concept overrides this to Off
         # when it is on, and the command builder locks it there regardless.
         "MINIMAX_CAPTION_DROPOUT": "0.05 (default)",
@@ -812,7 +850,7 @@ MINIMAX_BUILT_IN_PRESETS = {
         # The canvas number is about what the model RENDERS; it turned out to say much less than
         # expected about what it can be TRAINED on.
         "DATASET_MEGAPIXELS": "0.25",
-        "MINIMAX_LOWNOISE_PCT": "60", "MINIMAX_LOGNORM": True,
+        "MINIMAX_LOWNOISE_PCT": "60", "MINIMAX_HIGHNOISE_LR_PCT": "100",
         # The experiment knobs all ship OFF, so the preset is the plain baseline every A/B is
         # measured against. Each of these was built to be TRIED, not to be on by default:
         #   blocks "all"      — no block-range restriction
@@ -1033,6 +1071,13 @@ DEFAULT_PREFS = {
     "minimax_ref_dit": "",
     "minimax_text_encoder": "",
     "minimax_vae": "",
+    # Audio VAE — optional, and only video clips ever use it. With it, a clip's sound becomes a
+    # real training target; without it, clips train video only, which is what every dataset did
+    # before clips existed. Never loaded for a stills folder.
+    "minimax_audio_vae": "",
+    # Turbo LoRA — optional, previews only: 6-step in-training samples with the community Turbo
+    # applied at ~75% on top of the training adapter, exactly how fast ComfyUI inference runs it.
+    "minimax_turbo_lora": "",
     # Output directories — relative to repo root, portable across clones/moves.
     # Resolved to absolute in load_prefs(); in-memory pref values are absolute.
     # All three live as top-level folders inside the repo:
@@ -1532,6 +1577,7 @@ class LoRATrainerGUI:
         # so a folder change on the Start tab must refresh it. Guarded: fires before the
         # Image Prep tab exists during startup, and _update_prep_note no-ops then.
         self.image_folder_var.trace_add("write", self._update_prep_note)
+        self.image_folder_var.trace_add("write", self._refresh_audio_only_ui)
         # Auto-save the dataset TOML on every relevant change (no Save button needed)
         def _auto_save_ds(*_a):
             if hasattr(self, "auto_save_dataset_config_silent"):
@@ -1580,7 +1626,9 @@ class LoRATrainerGUI:
             # reads them. (OPTIMIZER_TYPE below is deliberately NOT changed to match the preset:
             # it is shared with Klein and Krea 2, and the MiniMax preset supplies adamw on switch.)
             "MINIMAX_LOWNOISE_PCT": "60",
-            "MINIMAX_LOGNORM": True,       # False = flat spread; True = mid-concentrated
+            # What the steps ABOVE sigma 0.5 do to the LR, as a percentage. 100 = unchanged, which
+            # is every run before this existed.
+            "MINIMAX_HIGHNOISE_LR_PCT": "100",
             "MINIMAX_BLOCKS": "all",
             "MINIMAX_BASE_QUANT": MINIMAX_BASE_QUANT_OPTIONS[0],
             # OFF by default (Peter's call from real runs). The reference trains AdaLN on the
@@ -1657,6 +1705,9 @@ class LoRATrainerGUI:
             "SAMPLE_FLOW_SHIFT": "",
             "SAMPLE_NEGATIVE": "blurry, low detail, noisy, washed out, oversaturated, distorted anatomy, extra limbs, duplicate objects, text, watermark, logo, frame, cropped subject, flat lighting, muddy colors",
             "SAMPLE_CFG_SCALE": 1.0,
+            # MiniMax Turbo previews (used only when the Turbo LoRA is set in Preferences)
+            "MINIMAX_TURBO_STEPS": 6,
+            "MINIMAX_TURBO_STRENGTH": 75,
             # Florence captioning settings
             "CAPTION_TRIGGER_WORD": "",
             "CAPTION_MODEL": "MiaoshouAI/Florence-2-base-PromptGen",
@@ -3299,8 +3350,9 @@ class LoRATrainerGUI:
                  font=(FONT_FAMILY, 22, "bold"),
                  fg=COLORS["text_primary"], bg=COLORS["bg_deep"]).pack(anchor=tk.W)
         tk.Label(container,
-                 text="A focused, local trainer and workbench for Flux 2 Klein 9B and Krea 2 LoRAs — "
-                      "train, profile, repair, explore, and extract, all in one place.",
+                 text="A focused, local trainer and workbench for Flux 2 Klein 9B, Krea 2 and "
+                      "MiniMax H3 LoRAs — train, profile, repair, explore, and extract, all in "
+                      "one place.",
                  font=(FONT_FAMILY, 11),
                  fg=COLORS["text_secondary"], bg=COLORS["bg_deep"],
                  wraplength=800, justify=tk.LEFT).pack(anchor=tk.W, pady=(4, 24))
@@ -3346,7 +3398,7 @@ class LoRATrainerGUI:
 
         steps = [
             ("1", "Start",      "Choose your training image folder below.",                     False),
-            ("2", "Image Prep", "Resize, convert to PNG, or face-crop.",                        True),   # optional
+            ("2", "Image Prep", "Resize, convert to PNG, or face-crop. (Video Prep for MiniMax)", True),  # optional
             ("3", "Captions",   "Write trigger-word captions or generate them with AI.",        False),
             ("4", "Samples",    "Configure in-training preview prompts.",                       False),
             ("5", "Training",   "Pick a preset, tune settings, click Start Training.",          False),
@@ -3460,6 +3512,63 @@ class LoRATrainerGUI:
 
         # Initial check (deferred so tools_card exists)
         self.master.after(100, _check_model_paths)
+
+        def _check_minimax_extras():
+            # An H3 user (DiT set) missing the NEW files — the Audio VAE and the Turbo LoRA
+            # both arrived after most people set up their paths, so nothing else would ever
+            # tell them these exist (Peter). One popup, dismissable forever.
+            if self.prefs.get("minimax_extras_prompt_dismissed"):
+                return
+            if not str(self.prefs.get("minimax_dit", "") or "").strip():
+                return
+            missing = [label for key, label in (
+                ("minimax_audio_vae",
+                 "Audio VAE (~605 MB) — train on the sound in video clips, and on voices"),
+                ("minimax_turbo_lora",
+                 "Turbo LoRA (~780 MB) — fast 6-step in-training previews"))
+                if not str(self.prefs.get(key, "") or "").strip()]
+            if not missing:
+                return
+            win = tk.Toplevel(self.master)
+            win.title("MiniMax H3 — new model files")
+            win.configure(bg=COLORS["bg_deep"], padx=20, pady=16)
+            win.transient(self.master)
+            win.resizable(False, False)
+            tk.Label(win, text="Your MiniMax H3 setup is missing the new files",
+                     font=(FONT_FAMILY, 12, "bold"), bg=COLORS["bg_deep"],
+                     fg=COLORS["text_primary"]).pack(anchor=tk.W)
+            tk.Label(win, text="Fizgig can now train on video, sound and voices, and render "
+                               "fast Turbo previews. Your H3 model paths are set, but these "
+                               "are not:\n\n"
+                               + "\n".join(f"  •  {m}" for m in missing)
+                               + "\n\nPreferences has a download link on each row — or press "
+                                 "Download models for me and point it at your models folder.",
+                     font=(FONT_FAMILY, 10), justify=tk.LEFT, wraplength=520,
+                     bg=COLORS["bg_deep"], fg=COLORS["text_explain"]).pack(
+                anchor=tk.W, pady=(8, 12))
+            row = tk.Frame(win, bg=COLORS["bg_deep"])
+            row.pack(anchor=tk.E)
+
+            def _to_prefs():
+                win.destroy()
+                self.notebook.select(self.prefs_tab)
+
+            def _never():
+                self.prefs["minimax_extras_prompt_dismissed"] = True
+                save_prefs(self.prefs)
+                win.destroy()
+
+            ttk.Button(row, text="Open Preferences", command=_to_prefs).pack(side=tk.LEFT)
+            ttk.Button(row, text="Later", command=win.destroy).pack(side=tk.LEFT, padx=(8, 0))
+            ttk.Button(row, text="Don't ask again", command=_never).pack(side=tk.LEFT,
+                                                                         padx=(8, 0))
+        self._check_minimax_extras = _check_minimax_extras     # bound for tests / re-checks
+        self.master.after(700, _check_minimax_extras)
+        # The audio-aware Training-tab rows (grey-outs, the voice-structure hint, the
+        # per-category retirement row) refresh on folder-change traces — but the RESTORED
+        # folder's trace fires during startup, before those widgets exist, and nothing
+        # re-fires after the tab is built. One deferred pass covers the restored state.
+        self.master.after(150, self._refresh_audio_only_ui)
 
         # Tools card — highlights the post-training workbench tabs
         tools_card = tk.Frame(container, bg=COLORS["bg_surface"],
@@ -3713,8 +3822,8 @@ class LoRATrainerGUI:
                 model_card,
                 text=("⏱ Previews track LIKENESS, not quality. Judge quality in ComfyUI — Pause "
                       "frees the GPU, so you can check an epoch there and Resume.\n"
-                      "Defaults are 1024×1024 stills; Sample length gives clips. 📖 Full "
-                      "write-ups in the README."),
+                      "Defaults are 768×768 56-frame clips with sound; Sample length has "
+                      "stills and other lengths. 📖 Full write-ups in the README."),
                 font=(FONT_FAMILY, 9), fg=COLORS["warning"], bg=COLORS["bg_surface"],
                 wraplength=760, justify=tk.LEFT,
             )
@@ -3865,6 +3974,8 @@ class LoRATrainerGUI:
                                     "entry": self._lokr_factor_rowf,
                                     "browse": None, "parent": training_content}
 
+        self._build_minimax_structure_row(training_content)
+
         # Model Area to Train dropdown (blocks + timestep auto-fill)
         self._modelarea_label = ttk.Label(training_content, text="Model Area to Train:")
         self._modelarea_label.grid(row=10, column=0, sticky=tk.W, padx=5, pady=2)
@@ -3964,9 +4075,14 @@ class LoRATrainerGUI:
         ttk.Label(training_content, text="Target Megapixels:").grid(row=16, column=0, sticky=tk.W, padx=5, pady=(8, 2))
         mp_frame = ttk.Frame(training_content)
         mp_frame.grid(row=16, column=1, sticky=tk.W, padx=5, pady=(8, 2))
-        ttk.Combobox(mp_frame, textvariable=self.dataset_megapixels_var,
-                     values=["0.25", "0.5", "0.75", "1.0", "1.5", "2.0", "2.4", "3.0", "4.2"],
-                     width=8).pack(side=tk.LEFT, padx=(0, 10))
+        self._mp_combo = ttk.Combobox(
+            mp_frame, textvariable=self.dataset_megapixels_var,
+            values=["0.25", "0.5", "0.75", "1.0", "1.5", "2.0", "2.4", "3.0", "4.2"], width=8)
+        self._mp_combo.pack(side=tk.LEFT, padx=(0, 10))
+        # Shown (and the combo greyed) when the training folder is voice recordings only —
+        # there are no pixels for this number to size. Managed by _refresh_audio_only_ui.
+        self._mp_audio_note = ttk.Label(mp_frame, text="— audio-only dataset: nothing to size",
+                                        foreground="#F59E0B", font=(FONT_FAMILY, 9))
         ttk.Label(mp_frame,
                   text="MP  (0.25 ≈ 512², 1.0 ≈ 1024², 2.4 ≈ 1536², 4.2 ≈ 2048²)   "
                        "example: 512² = 512×512 pixels, or any other width × height with a similar pixel area",
@@ -4725,46 +4841,9 @@ class LoRATrainerGUI:
         self._minimax_blocks_hint.grid(row=32, column=0, columnspan=2, sticky=tk.W, padx=5, pady=(0, 4))
         self._refresh_minimax_blocks_count()
 
-        # --- Low-noise training share (MiniMax H3 only) -----------------------------------
-        # One number, uncapped: what fraction of steps train below sigma 0.5. Converted to the
-        # trainer's shift by minimax_lownoise_to_shift. Hidden for other families by
-        # _apply_training_arch_visibility.
-        self._minimax_shift_label = ttk.Label(scheduler_content, text="Low-noise training:")
-        self._minimax_shift_label.grid(row=33, column=0, sticky=tk.W, padx=5, pady=(8, 2))
-        self._minimax_shift_frame = ttk.Frame(scheduler_content)
-        self._minimax_shift_frame.grid(row=33, column=1, columnspan=2, sticky=tk.W, padx=5, pady=(8, 2))
-        self.entries["MINIMAX_LOWNOISE_PCT"] = ttk.Entry(self._minimax_shift_frame, width=8)
-        self.entries["MINIMAX_LOWNOISE_PCT"].insert(
-            0, str(self.settings.get("MINIMAX_LOWNOISE_PCT", "60")))
-        self.entries["MINIMAX_LOWNOISE_PCT"].pack(side=tk.LEFT)
-        ttk.Label(self._minimax_shift_frame, text="% of steps").pack(side=tk.LEFT, padx=(4, 0))
-        # Live readout: the number you type is the thing you care about, but the schedule it
-        # produces is worth seeing — especially at the extremes, where a couple of percent of
-        # change swings the shift enormously.
-        self._minimax_shift_match = tk.Label(self._minimax_shift_frame, text="",
-                                             font=(FONT_FAMILY, 9), bg=COLORS["bg_surface"])
-        self._minimax_shift_match.pack(side=tk.LEFT, padx=(10, 0))
-        self.minimax_lognorm_var = tk.BooleanVar(
-            value=bool(self.settings.get("MINIMAX_LOGNORM", True)))
-        ttk.Checkbutton(self._minimax_shift_frame, text="mid-concentrated",
-                        variable=self.minimax_lognorm_var,
-                        command=lambda: self._refresh_minimax_shift_match()).pack(side=tk.LEFT,
-                                                                                 padx=(10, 0))
-        self.entries["MINIMAX_LOWNOISE_PCT"].bind(
-            "<KeyRelease>", lambda _e: self._refresh_minimax_shift_match())
-        self._minimax_shift_hint = ttk.Label(
-            scheduler_content,
-            text="How much of the run trains on nearly-clean images — where fine detail and "
-                 "likeness are learned. 60% with mid-concentrated ticked is the tuned default. "
-                 "Full write-up in the README.",
-            foreground="#95A5A6", font=(FONT_FAMILY, 8, "italic"), justify=tk.LEFT, wraplength=720)
-        self._minimax_shift_hint.grid(row=34, column=0, columnspan=2, sticky=tk.W, padx=5, pady=(0, 4))
-
-        # Block A's initial populate — it used to sit at the tail of Training Parameters,
-        # which is now BEFORE the widget exists; the readout would have stayed blank until
-        # the user typed in the box.
-        self._refresh_minimax_shift_match()
-
+        # Training Structure lives in Training Parameters now — see _build_minimax_structure_row,
+        # called from that section. It used to sit here in Other Options, collapsed, which is
+        # where the single most consequential MiniMax setting was least likely to be found.
 
         # === Timestep & Noise Schedule Section (Collapsed by default) ===
         timestep_section = CollapsibleFrame(outer,"Timestep & Noise Schedule", default_expanded=False)
@@ -5191,8 +5270,7 @@ class LoRATrainerGUI:
 
         if "MINIMAX_DISTILL" in preset and hasattr(self, "minimax_distill_var"):
             self.minimax_distill_var.set(bool(preset["MINIMAX_DISTILL"]))
-        if "MINIMAX_LOGNORM" in preset and hasattr(self, "minimax_lognorm_var"):
-            self.minimax_lognorm_var.set(bool(preset["MINIMAX_LOGNORM"]))
+
         # Multi Concept: a BooleanVar plus a LIST of folders, so neither is reachable by the
         # generic self.entries loop above. Restore the folders BEFORE the toggle so the handler
         # that rewrites the TOML and locks caption dropout sees the finished state.
@@ -5384,7 +5462,8 @@ class LoRATrainerGUI:
     _QUEUE_SAMPLE_KEYS = ("SAMPLE_ENABLED", "SAMPLE_WIDTH", "SAMPLE_HEIGHT", "SAMPLE_STEPS",
                           "SAMPLE_SEED", "SAMPLE_EVERY_N_EPOCHS", "SAMPLE_EVERY_N_STEPS",
                           "SAMPLE_AT_FIRST", "SAMPLE_FLOW_SHIFT", "SAMPLE_NEGATIVE",
-                          "SAMPLE_CFG_SCALE", "SAMPLE_FRAMES")
+                          "SAMPLE_CFG_SCALE", "SAMPLE_FRAMES",
+                          "MINIMAX_TURBO_STEPS", "MINIMAX_TURBO_STRENGTH")
 
     def _queue_snapshot(self):
         """Capture the currently configured run as a queue item."""
@@ -5463,6 +5542,13 @@ class LoRATrainerGUI:
 
     def _queue_current_run(self):
         """Snapshot the current config to the end of the queue (Start pressed mid-run)."""
+        # Queueing skips validate_inputs entirely (Start returns above), so without this a bad
+        # name is written into the queue file, compared dirty by the clash check below, and only
+        # rejected an hour later when the queue tries to launch it — modal, unattended, held.
+        _name, _name_error = self._tidy_lora_name()
+        if _name_error:
+            messagebox.showwarning("Check the LoRA name", _name_error)
+            return
         item = self._queue_snapshot()
         if not item["image_folder"]:
             messagebox.showwarning(
@@ -5677,13 +5763,17 @@ class LoRATrainerGUI:
         try:
             from fizgig.dataset.image_dataset import IMAGE_EXTENSIONS
             _exts = {e.lower() for e in IMAGE_EXTENSIONS}
+            # Clips and voice recordings are training items too — count them or a MiniMax
+            # clip/audio folder reads "(0 images)" and looks like a queued mistake.
+            if "MiniMax" in str(item.get("architecture", "")):
+                _exts |= {".mp4"} | self.TRAINING_AUDIO_EXTENSIONS
             n_imgs = sum(1 for f in os.listdir(folder)
                          if os.path.splitext(f)[1].lower() in _exts) if os.path.isdir(folder) else 0
         except Exception:
             n_imgs = 0
         name = p.get("LORA_NAME") or os.path.basename(folder) or "(unnamed)"
         bits = [f"{item.get('architecture', '?')}",
-                f"{os.path.basename(folder) or '?'} ({n_imgs} images)"]
+                f"{os.path.basename(folder) or '?'} ({n_imgs} items)"]
         for label, key in (("LR", "LEARNING_RATE"), ("epochs", "MAX_TRAIN_EPOCHS"),
                            ("dim", "NETWORK_DIM"), ("type", "NETWORK_TYPE"),
                            ("area", "TARGET_LAYERS")):
@@ -5695,7 +5785,10 @@ class LoRATrainerGUI:
         if ARCHITECTURES.get(item.get("architecture", ""), {}).get("is_minimax"):
             _sh = str(p.get("MINIMAX_LOWNOISE_PCT") or "").strip()
             if _sh:
-                bits.append(f"low-noise {_sh}%" + (" mid" if p.get("MINIMAX_LOGNORM") else ""))
+                bits.append(f"low-noise {_sh}%")
+            _hl = str(p.get("MINIMAX_HIGHNOISE_LR_PCT") or "100").strip()
+            if _hl and _hl != "100":
+                bits.append(f"high-noise LR {_hl}%")
             _bl = minimax_block_spec(p.get("MINIMAX_BLOCKS"))
             if _bl.lower() != "all":
                 bits.append(f"blocks {_bl}")
@@ -5928,6 +6021,7 @@ class LoRATrainerGUI:
         "SAMPLE_SEED", "SAMPLE_EVERY_N_EPOCHS", "SAMPLE_EVERY_N_STEPS",
         "SAMPLE_AT_FIRST", "SAMPLE_FLOW_SHIFT",
         "SAMPLE_NEGATIVE", "SAMPLE_CFG_SCALE",
+        "MINIMAX_TURBO_STEPS", "MINIMAX_TURBO_STRENGTH",
         "RESUME_TRAINING",
     }
 
@@ -5991,7 +6085,6 @@ class LoRATrainerGUI:
         # and silently becomes an ordinary run (tests/test_minimax_distill_gui.py).
         _grab("minimax_distill_var", "MINIMAX_DISTILL")
         _grab("minimax_multiconcept_var", "MINIMAX_MULTICONCEPT")
-        _grab("minimax_lognorm_var", "MINIMAX_LOGNORM")
         _grab("grad_checkpoint_var", "GRADIENT_CHECKPOINTING")
         _grab("fp8_text_encoder_var", "FP8_TEXT_ENCODER")
         _grab("adaptive_lr_var", "ADAPTIVE_LR")
@@ -6296,18 +6389,185 @@ class LoRATrainerGUI:
         ent = self.entries.get("MINIMAX_LOWNOISE_PCT")
         if lbl is None or ent is None or not lbl.winfo_exists():
             return
-        lognorm = bool(getattr(self, "minimax_lognorm_var", None)
-                       and self.minimax_lognorm_var.get())
-        shift = (minimax_lownoise_to_lognorm_shift(ent.get()) if lognorm
-                 else minimax_lownoise_to_shift(ent.get()))
+        shift = minimax_lownoise_to_shift(ent.get())
         if shift is None:
             lbl.config(text="✗ enter a number above 0 and below 100", fg="#E74C3C")
             return
-        # The median is the shift map at the base's median draw — 0.5 for a uniform draw and for
-        # a logit-normal one alike — so it is shift/(shift+1) either way.
+        # The median is the shift map at the uniform base's median draw, so shift/(shift+1).
         med = shift / (shift + 1.0)
-        lbl.config(text=f"→ {'logit-normal' if lognorm else 'uniform'} shift {shift:.3g}, "
-                        f"median noise {med:.2f}", fg="#27AE60")
+        lbl.config(text=f"→ shift {shift:.3g}, median noise {med:.2f}", fg="#27AE60")
+
+    def _build_minimax_structure_row(self, parent):
+        """Training Structure — the MiniMax timestep density, named.
+
+        Rows 20-23 of Training Parameters, under Network Type. The dropdown is a VIEW of
+        MINIMAX_LOWNOISE_PCT rather than a setting of its own, so every existing preset and saved
+        run keeps working with no migration: 60 shows Face likeness, anything unrecognised shows
+        Custom and reveals the box it came from.
+        """
+        self._minimax_structure_label = ttk.Label(parent, text="Training Structure:")
+        self._minimax_structure_label.grid(row=20, column=0, sticky=tk.W, padx=5, pady=(8, 2))
+        self.minimax_structure_var = tk.StringVar(value=MINIMAX_STRUCTURE_DEFAULT)
+        self._minimax_structure_combo = ttk.Combobox(
+            parent, textvariable=self.minimax_structure_var,
+            values=list(MINIMAX_STRUCTURE_OPTIONS), state="readonly", width=36)
+        self._minimax_structure_combo.grid(row=20, column=1, columnspan=2, sticky=tk.W,
+                                           padx=5, pady=(8, 2))
+        self._minimax_structure_combo.bind("<<ComboboxSelected>>",
+                                           lambda _e: self._on_minimax_structure_changed())
+
+        self._minimax_structure_desc = tk.Label(
+            parent, text="", font=(FONT_FAMILY, 9, "italic"), fg=COLORS["text_explain"],
+            bg=COLORS["bg_surface"], justify=tk.LEFT, wraplength=700)
+        self._minimax_structure_desc.grid(row=21, column=0, columnspan=3, sticky=tk.W,
+                                          padx=(12, 5), pady=(0, 4))
+
+        # Shown when the dataset carries voice recordings and the structure ISN'T Likeness —
+        # A/B tested (Aug 2026): voices train much faster and sound better at Likeness and
+        # Style than at Model default, for the same reason faces do: identity lives at the
+        # clean end, and the audio schedule is chained to the video one. Managed by
+        # _refresh_audio_only_ui.
+        self._minimax_structure_voice_note = tk.Label(
+            parent, text="🎙 Voice recordings in this dataset — Likeness and Style trains "
+                         "voices much faster than Model default (tested). Consider switching.",
+            font=(FONT_FAMILY, 9), fg="#F59E0B", bg=COLORS["bg_surface"],
+            justify=tk.LEFT, wraplength=700)
+
+        # Per-category retirement — MIXED datasets only (managed by _refresh_audio_only_ui).
+        # Visuals and voice need not converge together (a much smaller category can finish,
+        # or start to overbake, well before the larger one),
+        # so each can retire at its own epoch. "Anchor" keeps the finished category training at
+        # a REAL 10% LR (it multiplies the optimizer's lr — a loss multiplier would be an Adam
+        # no-op) as a drift guard, with its epoch ledger staying live as the drift alarm;
+        # "stop" skips its steps outright for faster epochs.
+        self._mixed_stop_label = ttk.Label(parent, text="Finish one category early:")
+        self._mixed_stop_frame = ttk.Frame(parent)
+        _msf = self._mixed_stop_frame
+        _RETIRE_MODES = ["anchor at 10% LR (recommended)", "stop completely (faster)"]
+        self.entries["MIXED_STOP_CATEGORY"] = ttk.Combobox(
+            _msf, values=["voice", "photos & clips"], width=14, state="readonly")
+        self.entries["MIXED_STOP_CATEGORY"].set(
+            str(self.settings.get("MIXED_STOP_CATEGORY", "")) or "voice")
+        self.entries["MIXED_STOP_CATEGORY"].pack(side=tk.LEFT)
+        ttk.Label(_msf, text=" after epoch ").pack(side=tk.LEFT)
+        self.entries["MIXED_STOP_EPOCH"] = ttk.Entry(_msf, width=5)
+        self.entries["MIXED_STOP_EPOCH"].insert(
+            0, str(self.settings.get("MIXED_STOP_EPOCH", "")))
+        self.entries["MIXED_STOP_EPOCH"].pack(side=tk.LEFT, padx=(0, 8))
+        self.entries["MIXED_STOP_MODE"] = ttk.Combobox(_msf, values=_RETIRE_MODES, width=26,
+                                                       state="readonly")
+        self.entries["MIXED_STOP_MODE"].set(
+            str(self.settings.get("MIXED_STOP_MODE", "")) or _RETIRE_MODES[0])
+        self.entries["MIXED_STOP_MODE"].pack(side=tk.LEFT)
+        self._mixed_stop_hint = tk.Label(
+            parent, text="If one category is a substantially different size from the other, "
+                         "it may be done (or start to overbake) well before the rest — finish "
+                         "it early instead of overtraining it. Blank = both train to the end. "
+                         "Anchor keeps the finished category at a true 10% learning rate — "
+                         "holding its quality against drift from the still-training category, "
+                         "with its epoch report staying live as the drift alarm. Stop skips "
+                         "its steps entirely: faster epochs, but that category goes unwatched.",
+            font=(FONT_FAMILY, 8, "italic"), fg="#95A5A6", bg=COLORS["bg_surface"],
+            justify=tk.LEFT, wraplength=720)
+
+        # The raw share, revealed only under Custom — the named options are the point.
+        self._minimax_shift_label = ttk.Label(parent, text="Clean-end share:")
+        self._minimax_shift_label.grid(row=22, column=0, sticky=tk.W, padx=5, pady=2)
+        self._minimax_shift_frame = ttk.Frame(parent)
+        self._minimax_shift_frame.grid(row=22, column=1, columnspan=2, sticky=tk.W, padx=5, pady=2)
+        self.entries["MINIMAX_LOWNOISE_PCT"] = ttk.Entry(self._minimax_shift_frame, width=8)
+        self.entries["MINIMAX_LOWNOISE_PCT"].insert(
+            0, str(self.settings.get("MINIMAX_LOWNOISE_PCT", "60")))
+        self.entries["MINIMAX_LOWNOISE_PCT"].pack(side=tk.LEFT)
+        ttk.Label(self._minimax_shift_frame, text="% of steps").pack(side=tk.LEFT, padx=(4, 0))
+        # Live readout: the typed number is what you care about, but the schedule it produces is
+        # worth seeing — a couple of percent swings the shift enormously at the ends.
+        self._minimax_shift_match = tk.Label(self._minimax_shift_frame, text="",
+                                             font=(FONT_FAMILY, 9), bg=COLORS["bg_surface"])
+        self._minimax_shift_match.pack(side=tk.LEFT, padx=(10, 0))
+        self.entries["MINIMAX_LOWNOISE_PCT"].bind(
+            "<KeyRelease>", lambda _e: self._refresh_minimax_shift_match())
+
+        # Always visible: a preset recommends a value, the user can override it without that
+        # counting as a different structure.
+        self._minimax_hnlr_label = ttk.Label(parent, text="Medium to High LR:")
+        self._minimax_hnlr_label.grid(row=23, column=0, sticky=tk.W, padx=5, pady=(2, 8))
+        self._minimax_hnlr_frame = ttk.Frame(parent)
+        self._minimax_hnlr_frame.grid(row=23, column=1, columnspan=2, sticky=tk.W,
+                                      padx=5, pady=(2, 8))
+        self.entries["MINIMAX_HIGHNOISE_LR_PCT"] = ttk.Entry(self._minimax_hnlr_frame, width=8)
+        self.entries["MINIMAX_HIGHNOISE_LR_PCT"].insert(
+            0, str(self.settings.get("MINIMAX_HIGHNOISE_LR_PCT", "100")))
+        self.entries["MINIMAX_HIGHNOISE_LR_PCT"].pack(side=tk.LEFT)
+        tk.Label(self._minimax_hnlr_frame,
+                 text="%  — best left at 100 unless you are experimenting.",
+                 font=(FONT_FAMILY, 9, "italic"), fg=COLORS["text_explain"],
+                 bg=COLORS["bg_surface"]).pack(side=tk.LEFT, padx=(4, 0))
+        # Says what it does and what was measured, so lowering it is a decision rather than a
+        # guess: across five datasets, at both densities, 0% and 100% render cleanly at 20 steps
+        # without the Turbo LoRA and 100% holds face SHAPE better every time.
+        self._minimax_hnlr_hint = tk.Label(
+            parent,
+            text="What the noisier steps — where pose, framing and face shape are decided — do to "
+                 "the learning rate. Lowering it biases the run toward surface detail at the cost "
+                 "of shape — useful for a skin-texture LoRA, not for a likeness one. Across five "
+                 "datasets 100 held face shape better, and nothing distorted at any setting.",
+            font=(FONT_FAMILY, 9, "italic"), fg=COLORS["text_explain"], bg=COLORS["bg_surface"],
+            justify=tk.LEFT, wraplength=700)
+        self._minimax_hnlr_hint.grid(row=24, column=0, columnspan=3, sticky=tk.W,
+                                     padx=(12, 5), pady=(0, 8))
+
+        self._sync_minimax_structure_from_pct()
+        self._refresh_minimax_shift_match()
+
+    def _on_minimax_structure_changed(self):
+        """A named option writes the numbers behind it; Custom just reveals them."""
+        vals = MINIMAX_STRUCTURE_OPTIONS.get(self.minimax_structure_var.get())
+        if vals is not None:
+            pct, hnlr = vals
+            for key, value in (("MINIMAX_LOWNOISE_PCT", pct), ("MINIMAX_HIGHNOISE_LR_PCT", hnlr)):
+                ent = self.entries.get(key)
+                if ent is not None:
+                    ent.delete(0, tk.END)
+                    ent.insert(0, str(value))
+        self._refresh_minimax_structure_ui()
+        self._refresh_minimax_shift_match()
+        self._refresh_audio_only_ui()      # the voice hint clears the moment Likeness is picked
+
+    def _sync_minimax_structure_from_pct(self):
+        """Pick the dropdown entry the current percentage corresponds to, else Custom.
+
+        Derived rather than stored, which is what lets every preset written before this control
+        existed keep working untouched.
+        """
+        try:
+            pct = float(str(self.entries["MINIMAX_LOWNOISE_PCT"].get()).strip().rstrip("%"))
+        except (KeyError, TypeError, ValueError, tk.TclError):
+            pct = None
+        name = "Custom"
+        if pct is not None:
+            for label, vals in MINIMAX_STRUCTURE_OPTIONS.items():
+                if vals is not None and abs(vals[0] - pct) < 1e-9:
+                    name = label
+                    break
+        self.minimax_structure_var.set(name)
+        self._refresh_minimax_structure_ui()
+
+    def _refresh_minimax_structure_ui(self):
+        """Description text, and the raw share shown only under Custom."""
+        name = self.minimax_structure_var.get()
+        desc = getattr(self, "_minimax_structure_desc", None)
+        if desc is not None and desc.winfo_exists():
+            desc.config(text=MINIMAX_STRUCTURE_DESC.get(name, ""))
+        custom = MINIMAX_STRUCTURE_OPTIONS.get(name) is None
+        for w in (getattr(self, "_minimax_shift_label", None),
+                  getattr(self, "_minimax_shift_frame", None)):
+            if w is None or not w.winfo_exists():
+                continue
+            if custom and self._is_minimax_arch():
+                w.grid()
+            else:
+                w.grid_remove()
 
     def _refresh_minimax_blocks_count(self):
         """Say how many blocks the Blocks to Train box currently means, or why it can't be read.
@@ -6516,7 +6776,9 @@ class LoRATrainerGUI:
 
         # Detail Focus is the inverse: MiniMax ONLY. Klein and Krea 2 already derive their shift
         # from the sample's token count, so there is nothing to dial there.
-        for w in (self._minimax_shift_label, self._minimax_shift_frame, self._minimax_shift_hint,
+        for w in (self._minimax_structure_label, self._minimax_structure_combo,
+                  self._minimax_structure_desc,
+                  self._minimax_hnlr_label, self._minimax_hnlr_frame, self._minimax_hnlr_hint,
                   self._minimax_blocks_label, self._minimax_blocks_frame, self._minimax_blocks_hint,
                   self._minimax_distill_frame, self._minimax_distill_hint,
                   self._minimax_quant_label, self._minimax_quant_frame,
@@ -6529,6 +6791,9 @@ class LoRATrainerGUI:
                   self._minimax_mc_frame,
                   ):
             self._set_widget_visible(w, is_minimax)
+        # The clean-end box answers to BOTH the family and the dropdown: visible only for MiniMax,
+        # and only when the structure is Custom.
+        self._refresh_minimax_structure_ui()
         # The Multi Concept sub-rows are owned by its own toggle handler (they are hidden even
         # under MiniMax until the box is ticked), so route them through it rather than the loop.
         if is_minimax:
@@ -7985,6 +8250,15 @@ class LoRATrainerGUI:
             "Browse the training folder and pick individual images to caption or inspect.",
         )
 
+        # Voice recordings never appear in the grid — their captions are written in Gizmo's
+        # audio tab, where you can hear what you are describing. This banner is how the tab
+        # says so instead of silently showing fewer items than the folder holds. Text set (and
+        # the label shown/hidden) per-refresh in refresh_caption_images.
+        self._caption_audio_banner = tk.Label(
+            preview_card, text="", font=(FONT_FAMILY, 10),
+            fg=COLORS["accent"], bg=COLORS["bg_surface"],
+            wraplength=760, justify=tk.LEFT)
+
         self.caption_grid_frame = tk.Frame(preview_card, bg=COLORS["bg_surface"])
         self.caption_grid_frame.pack(fill=tk.BOTH, expand=True)
         for _c in range(4):
@@ -8037,6 +8311,167 @@ class LoRATrainerGUI:
             self.image_folder_var.set(folder)
             self.refresh_caption_images()
 
+    # Video clips are training items only for MiniMax H3, and only there does the dataset glob
+    # pick them up — so only there do they need captions.
+    TRAINING_VIDEO_EXTENSIONS = {'.mp4'}
+
+    @staticmethod
+    def _read_middle_clip_frame(path):
+        """One frame from the middle of a clip WITHOUT decoding the whole file. cv2 seeks the
+        container to the midpoint and decodes from the nearest keyframe — milliseconds,
+        against read_frames' full decode of every frame at native resolution (seconds per
+        clip, and it was running on the GUI thread at every Captions tab refresh — the tab
+        froze for the sum of it, Peter). None on any failure; the caller falls back."""
+        try:
+            import cv2
+            from PIL import Image
+            cap = cv2.VideoCapture(path)
+            if not cap.isOpened():
+                return None
+            try:
+                n = int(cap.get(cv2.CAP_PROP_FRAME_COUNT) or 0)
+                if n > 1:
+                    cap.set(cv2.CAP_PROP_POS_FRAMES, n // 2)
+                ok, frame = cap.read()
+                if not ok and n > 1:           # an odd container refused the seek — frame 0
+                    cap.set(cv2.CAP_PROP_POS_FRAMES, 0)
+                    ok, frame = cap.read()
+                if not ok or frame is None:
+                    return None
+                return Image.fromarray(frame[:, :, ::-1])      # BGR -> RGB
+            finally:
+                cap.release()
+        except Exception:
+            return None
+
+    def _open_training_frame(self, path):
+        """A PIL image for any training item. A video clip gives up its middle frame.
+
+        Clips are training items like every other, so they need a caption, a thumbnail and a face
+        score like every other — and the middle frame is the fairest single representative of
+        one. There is deliberately NO still written beside a clip on disk to serve this: the
+        latent cache keys on the filename stem with the extension stripped, so a sidecar
+        walk_03.png would land on walk_03.mp4's own cache file and one would silently overwrite
+        the other.
+
+        Clip frames are cached by (path, mtime) at a bounded size, so a Captions tab revisit
+        costs nothing. The returned image is always a COPY — callers thumbnail() it in place,
+        which would shrink the cached original for everyone after them. The clip's true
+        resolution rides along as `fizgig_source_size`, because the cached frame is capped and
+        a resolution label lying about the file would be worse than the wait was.
+        """
+        from PIL import Image
+        if os.path.splitext(path)[1].lower() not in self.TRAINING_VIDEO_EXTENSIONS:
+            return Image.open(path)
+        cache = getattr(self, "_clip_frame_cache", None)
+        if cache is None:
+            cache = self._clip_frame_cache = {}
+        try:
+            key = (path, os.path.getmtime(path))
+        except OSError:
+            key = (path, 0)
+        hit = cache.get(key)
+        if hit is None:
+            img = self._read_middle_clip_frame(path)
+            if img is None:                    # cv2 refused the file — the slow, sure way
+                from fizgig.minimax.clip import read_frames
+                frames = read_frames(path)
+                img = Image.fromarray(frames[len(frames) // 2])
+            true_size = img.size
+            img.thumbnail((1280, 1280), Image.LANCZOS)
+            for k in [k for k in cache if k[0] == path]:      # a re-exported clip re-reads
+                del cache[k]
+            while len(cache) >= 64:            # bounded: ~2-3 MB a frame, oldest out first
+                del cache[next(iter(cache))]
+            cache[key] = hit = (img, true_size)
+        frame, true_size = hit
+        out = frame.copy()
+        out.fizgig_source_size = true_size
+        return out
+
+    TRAINING_AUDIO_EXTENSIONS = {'.wav', '.mp3', '.flac', '.m4a'}
+
+    def _count_training_audio_files(self):
+        """Voice recordings in the training folder — MiniMax only, 0 elsewhere."""
+        folder = self.image_folder_var.get()
+        if not folder or not os.path.isdir(folder) or not self._is_minimax_arch():
+            return 0
+        return sum(1 for f in os.listdir(folder)
+                   if os.path.splitext(f)[1].lower() in self.TRAINING_AUDIO_EXTENSIONS)
+
+    def _refresh_audio_only_ui(self, *_a):
+        """Grey the image-shaped training controls when the dataset is voice recordings only.
+
+        Only what is STRUCTURALLY meaningless goes grey: Target Megapixels (no pixels to
+        size) and reference distillation (the teacher pairs photographs — with none, there is
+        nothing to learn identity from). Schedule and LR controls stay live: the audio stream
+        trains on the noise schedule like everything else. Disabled, not hidden — the user
+        should see the controls exist and read why they are off.
+        """
+        audio_only = self._training_folder_audio_only()
+        state = "disabled" if audio_only else "normal"
+        try:
+            if hasattr(self, "_mp_combo"):
+                self._mp_combo.configure(state=state)
+                if audio_only:
+                    self._mp_audio_note.pack(side=tk.LEFT, padx=(8, 0))
+                else:
+                    self._mp_audio_note.pack_forget()
+            if hasattr(self, "_minimax_distill_frame"):
+                for w in self._minimax_distill_frame.winfo_children():
+                    try:
+                        w.configure(state=state)
+                    except tk.TclError:
+                        pass
+                if audio_only and self.minimax_distill_var.get():
+                    self.minimax_distill_var.set(False)
+            # The voice-structure hint: ANY audio in the dataset (mixed counts too — its voice
+            # steps benefit the same), family is MiniMax, and the structure is not already
+            # Likeness. A/B tested: voices train much faster there than at Model default.
+            _has_audio = self._is_minimax_arch() and self._count_training_audio_files() > 0
+            if hasattr(self, "_minimax_structure_voice_note"):
+                _wants_note = (_has_audio
+                               and not str(self.minimax_structure_var.get()).startswith(
+                                   "Likeness"))
+                if _wants_note:
+                    self._minimax_structure_voice_note.grid(
+                        row=25, column=0, columnspan=3, sticky=tk.W, padx=(12, 5), pady=(0, 4))
+                else:
+                    self._minimax_structure_voice_note.grid_remove()
+            # Per-category retirement rows: only when the dataset is genuinely MIXED — with
+            # one category there is nothing to finish separately.
+            if hasattr(self, "_mixed_stop_label"):
+                _mixed = _has_audio and not audio_only
+                if _mixed:
+                    self._mixed_stop_label.grid(row=26, column=0, sticky=tk.W, padx=5,
+                                                pady=(8, 2))
+                    self._mixed_stop_frame.grid(row=26, column=1, columnspan=2, sticky=tk.W,
+                                                padx=5, pady=(8, 2))
+                    self._mixed_stop_hint.grid(row=27, column=0, columnspan=3, sticky=tk.W,
+                                               padx=(12, 5), pady=(0, 4))
+                else:
+                    self._mixed_stop_label.grid_remove()
+                    self._mixed_stop_frame.grid_remove()
+                    self._mixed_stop_hint.grid_remove()
+        except tk.TclError:
+            pass
+
+    def _training_folder_audio_only(self):
+        """True when the training folder holds voice recordings and nothing visual — the state
+        in which image-shaped controls (sizing, bucketing, face teachers) mean nothing."""
+        folder = self.image_folder_var.get().strip() if hasattr(self, "image_folder_var") else ""
+        if not folder or not os.path.isdir(folder) or not self._is_minimax_arch():
+            return False
+        if not self._count_training_audio_files():
+            return False
+        try:
+            from fizgig.dataset.image_dataset import IMAGE_EXTENSIONS
+            visual = {e.lower() for e in IMAGE_EXTENSIONS} | {".mp4"}
+            return not any(os.path.splitext(f)[1].lower() in visual
+                           for f in os.listdir(folder))
+        except OSError:
+            return False
+
     def get_caption_image_files(self):
         """Get list of image files in caption folder"""
         folder = self.image_folder_var.get()
@@ -8044,6 +8479,8 @@ class LoRATrainerGUI:
             return []
 
         image_extensions = {'.jpg', '.jpeg', '.png', '.gif', '.bmp', '.webp', '.tiff', '.tif'}
+        if self._is_minimax_arch():
+            image_extensions = image_extensions | self.TRAINING_VIDEO_EXTENSIONS
         images = []
 
         for filename in os.listdir(folder):
@@ -8065,6 +8502,24 @@ class LoRATrainerGUI:
 
         images = self.get_caption_image_files()
         total_images = len(images)
+
+        # Audio never enters the grid; count it so the tab explains itself rather than showing
+        # fewer items than the folder holds. Wordings per Peter: all-audio vs mixed.
+        _n_audio = self._count_training_audio_files()
+        if _n_audio and not total_images:
+            self._caption_audio_banner.config(
+                text="🎙 Audio-only training set — captions are written in Gizmo's audio tab.")
+            self._caption_audio_banner.pack(anchor=tk.W, pady=(0, 8),
+                                            before=self.caption_grid_frame)
+        elif _n_audio:
+            self._caption_audio_banner.config(
+                text=f"🎙 {_n_audio} audio file(s) in this training set — their captions are "
+                     f"handled in Gizmo; the grid below shows only images and clips.")
+            self._caption_audio_banner.pack(anchor=tk.W, pady=(0, 8),
+                                            before=self.caption_grid_frame)
+        else:
+            self._caption_audio_banner.pack_forget()
+
         total_pages = max(1, (total_images + self.images_per_page - 1) // self.images_per_page)
 
         # Clamp current page
@@ -8107,8 +8562,8 @@ class LoRATrainerGUI:
         # Create thumbnail (original resolution captured before thumbnail() shrinks it)
         img_res = None
         try:
-            with Image.open(img_path) as img:
-                img_res = img.size
+            with self._open_training_frame(img_path) as img:
+                img_res = getattr(img, "fizgig_source_size", img.size)
                 img.thumbnail((150, 150), Image.LANCZOS)
                 photo = ImageTk.PhotoImage(img)
                 self.caption_thumbnails[img_path] = photo  # Keep reference
@@ -8226,8 +8681,8 @@ class LoRATrainerGUI:
                          + (f"   ({files.index(os.path.basename(path)) + 1} / {len(files)})"
                             if os.path.basename(path) in files else ""))
             try:
-                with Image.open(path) as img:
-                    _w, _h = img.size
+                with self._open_training_frame(path) as img:
+                    _w, _h = getattr(img, "fizgig_source_size", img.size)
                     img.thumbnail((300, 300), Image.LANCZOS)
                     photo = ImageTk.PhotoImage(img)
                     img_label.configure(image=photo)
@@ -8846,10 +9301,9 @@ class LoRATrainerGUI:
                 return None
 
         try:
-            from PIL import Image
             import torch
 
-            image = Image.open(img_path).convert("RGB")
+            image = self._open_training_frame(img_path).convert("RGB")
             task = self.caption_task_var.get()
             max_tokens = int(self.caption_max_tokens_var.get())
 
@@ -8931,7 +9385,8 @@ class LoRATrainerGUI:
                 max_tokens = int(self.caption_max_tokens_var.get())
             except (ValueError, tk.TclError):
                 max_tokens = 120
-            return generate_caption(self.qwen_captioner, img_path,
+            # The frame, not the path: a MiniMax clip has no still on disk to hand over.
+            return generate_caption(self.qwen_captioner, self._open_training_frame(img_path),
                                     max_new_tokens=max_tokens,
                                     instruction=self._resolve_caption_instruction())
         except Exception as e:
@@ -9289,8 +9744,11 @@ class LoRATrainerGUI:
             messagebox.showerror("Error", "Please enter a trigger word in the Trigger Word box first.")
             return
 
-        # Supported image extensions
+        # Supported image extensions — plus video clips under MiniMax H3, where they are
+        # training items and need a .txt exactly like a still does.
         image_extensions = {'.jpg', '.jpeg', '.png', '.gif', '.bmp', '.webp', '.tiff', '.tif'}
+        if self._is_minimax_arch():
+            image_extensions = image_extensions | self.TRAINING_VIDEO_EXTENSIONS
 
         # Clear log
         self.caption_log.configure(state="normal")
@@ -9353,6 +9811,33 @@ class LoRATrainerGUI:
         )
         _bkids = self._samples_banner.winfo_children()
         self._samples_banner_sub = _bkids[1] if len(_bkids) > 1 else None
+
+        # === Base Model chooser (Peter) — the tab's options are family-shaped (Sample length
+        # with sound, Turbo pace are MiniMax-only), so choose the family HERE rather than
+        # round-tripping to the Training tab. Same StringVar as the Training-tab combobox, so
+        # the two can never disagree; the bind is required because architecture changes ride
+        # <<ComboboxSelected>>, not a var trace. Sits OUTSIDE sample_settings_frame on purpose:
+        # it must survive the master-enable toggle and the enable/disable widget walk.
+        if len(ARCHITECTURE_LIST) > 1:
+            arch_card = self._start_section_card(
+                outer, "Base Model",
+                "Pick what you're training — the sample options below match it. Same setting "
+                "as the Training tab.",
+            )
+            arch_row = tk.Frame(arch_card, bg=COLORS["bg_surface"])
+            arch_row.pack(anchor=tk.W)
+            tk.Label(
+                arch_row, text="Model:",
+                font=(FONT_FAMILY, 10), fg=COLORS["text_secondary"], bg=COLORS["bg_surface"],
+            ).pack(side=tk.LEFT, padx=(0, 8))
+            samples_arch_combo = ttk.Combobox(
+                arch_row, textvariable=self.architecture_var, state="readonly",
+                width=28, values=ARCHITECTURE_LIST,
+            )
+            samples_arch_combo.pack(side=tk.LEFT)
+            samples_arch_combo.bind("<<ComboboxSelected>>", self._on_architecture_selected)
+            ToolTip(samples_arch_combo, "Model family to train (Klein 9B, Krea 2 or MiniMax H3)")
+            self._samples_arch_combo = samples_arch_combo
 
         # Grid holder — video warning / master checkbox / settings block all row-managed
         # so update_samples_ui_for_architecture() can still .grid() / .grid_remove() them.
@@ -9490,17 +9975,20 @@ class LoRATrainerGUI:
         # Shown/hidden by update_samples_ui_for_architecture.
         self.sample_frames_label = ttk.Label(prompt_card, text="Sample length:")
         self.sample_frames_label.grid(row=8, column=0, sticky=tk.W, padx=(0, 10), pady=4)
-        # Default: STILL (Peter, 11 Aug). Previews are a heartbeat between per-epoch
-        # checkpoints, not the verdict, and a still renders in seconds where a clip takes
-        # minutes — at 1024 it is 1024 video rows against 17408 for a 56-frame clip. The
-        # softness that once argued for clips was four dtype/integration divergences from
-        # ComfyUI, since fixed. Pick a clip length when motion is what you need to see.
+        # Default: 56-FRAME CLIP WITH SOUND (Peter, 17 Aug — reversing the 11 Aug stills
+        # call). What changed: the Turbo makes a 6-step clip render affordable, the sampler's
+        # audio is finally trustworthy, and a clip IS the regime H3 was trained in — a
+        # picture-and-sound preview is now the honest default heartbeat. Without the audio
+        # VAE set it degrades to a silent clip with a console note; Still stays in the
+        # dropdown for anyone who wants seconds-per-preview.
         self.sample_frames_var = tk.StringVar(
-            value=self.last_used.get("sample_frames", "Still (1 frame)"))
+            value=self.last_used.get("sample_frames", "56 frames with sound (~2.3s)"))
         self.sample_frames_combo = ttk.Combobox(
             prompt_card, textvariable=self.sample_frames_var, state="readonly", width=34,
             values=["Still (1 frame)", "22 frames (~1s)", "56 frames (~2.3s)",
-                    "124 frames (~5s — trained minimum)", "141 frames (~6s)"])
+                    "124 frames (~5s — trained minimum)", "141 frames (~6s)",
+                    "56 frames with sound (~2.3s)",
+                    "124 frames with sound (~5s)"])
         self.sample_frames_combo.grid(row=8, column=1, columnspan=2, sticky=tk.W, pady=4)
         self.sample_frames_var.trace_add("write", lambda *a: self._save_last_used_paths())
         self._sample_frames_hint = tk.Label(prompt_card,
@@ -9512,6 +10000,33 @@ class LoRATrainerGUI:
         self._sample_frames_hint.grid(row=9, column=1, columnspan=2, sticky=tk.W, pady=(0, 4))
         # hidden until a MiniMax family is selected
         for _w in (self.sample_frames_label, self.sample_frames_combo, self._sample_frames_hint):
+            _w.grid_remove()
+
+        # --- Turbo preview pace (MiniMax only) ---------------------------------------------
+        # Live only when the Turbo LoRA is set in Preferences; 6 steps at 75% is the tested
+        # recommendation (Peter). Shown/hidden with the sample-length row above.
+        self.turbo_pace_label = ttk.Label(prompt_card, text="Turbo preview:")
+        self.turbo_pace_label.grid(row=10, column=0, sticky=tk.W, padx=(0, 10), pady=4)
+        self._turbo_pace_row = tk.Frame(prompt_card, bg=COLORS["bg_surface"])
+        self._turbo_pace_row.grid(row=10, column=1, columnspan=2, sticky=tk.W, pady=4)
+        self.turbo_steps_entry = ttk.Entry(self._turbo_pace_row, width=5)
+        self.turbo_steps_entry.insert(0, str(self.settings.get("MINIMAX_TURBO_STEPS", 6)))
+        self.turbo_steps_entry.pack(side=tk.LEFT)
+        ttk.Label(self._turbo_pace_row, text="steps at").pack(side=tk.LEFT, padx=6)
+        self.turbo_strength_entry = ttk.Entry(self._turbo_pace_row, width=5)
+        self.turbo_strength_entry.insert(0, str(self.settings.get("MINIMAX_TURBO_STRENGTH", 75)))
+        self.turbo_strength_entry.pack(side=tk.LEFT)
+        ttk.Label(self._turbo_pace_row, text="% strength").pack(side=tk.LEFT, padx=(6, 0))
+        self._turbo_pace_hint = tk.Label(prompt_card,
+                 text="Used when the Turbo LoRA is set in Preferences: previews render in "
+                      "these few steps with the Turbo at this strength on top of your "
+                      "training LoRA — previews only, never the saved LoRA. 6 steps at 75% "
+                      "is the tested recommendation; without the Turbo, the Steps box above "
+                      "applies as before.",
+                 font=(FONT_FAMILY, 9, "italic"), fg=COLORS["text_explain"],
+                 bg=COLORS["bg_surface"], wraplength=560, justify=tk.LEFT)
+        self._turbo_pace_hint.grid(row=11, column=1, columnspan=2, sticky=tk.W, pady=(0, 4))
+        for _w in (self.turbo_pace_label, self._turbo_pace_row, self._turbo_pace_hint):
             _w.grid_remove()
 
         # Card 2: Generation Frequency
@@ -9691,6 +10206,8 @@ class LoRATrainerGUI:
         self.entries["SAMPLE_NEGATIVE"] = self.sample_negative_entry
         self.entries["SAMPLE_CFG_SCALE"] = self.sample_cfg_scale_entry
         self.entries["SAMPLE_FRAMES"] = self.sample_frames_combo
+        self.entries["MINIMAX_TURBO_STEPS"] = self.turbo_steps_entry
+        self.entries["MINIMAX_TURBO_STRENGTH"] = self.turbo_strength_entry
 
         # Initial UI state based on current architecture
         self.update_samples_ui_for_architecture()
@@ -9870,6 +10387,11 @@ class LoRATrainerGUI:
             self._save_last_used_paths()
         except Exception:
             pass
+        # Audio-only greying depends on BOTH the folder and the family — re-check on a switch.
+        try:
+            self._refresh_audio_only_ui()
+        except Exception:
+            pass
 
     def update_samples_ui_for_architecture(self):
         """Update samples tab UI based on selected architecture"""
@@ -9965,7 +10487,10 @@ class LoRATrainerGUI:
             _mm = bool(config.get("is_minimax"))
             for _w in (getattr(self, "sample_frames_label", None),
                        getattr(self, "sample_frames_combo", None),
-                       getattr(self, "_sample_frames_hint", None)):
+                       getattr(self, "_sample_frames_hint", None),
+                       getattr(self, "turbo_pace_label", None),
+                       getattr(self, "_turbo_pace_row", None),
+                       getattr(self, "_turbo_pace_hint", None)):
                 if _w is None:
                     continue
                 (_w.grid if _mm else _w.grid_remove)()
@@ -10331,10 +10856,15 @@ class LoRATrainerGUI:
         .gallery-item.new { animation: highlight 2s ease-out; }
         @keyframes highlight { 0%, 30% { box-shadow: 0 0 30px #27AE60; } 100% { box-shadow: none; } }
         .image-container { position: relative; }
-        .gallery-item img { width: 100%; height: 280px; object-fit: cover; display: block; background-color: #1B2A38; }
+        /* contain, not cover: a widescreen preview letterboxes instead of losing its sides —
+           the grid is for JUDGING samples, and a cropped frame lies about the composition */
+        .gallery-item img { width: 100%; height: 280px; object-fit: contain; display: block; background-color: #1B2A38; }
         .badge { position: absolute; top: 10px; left: 10px; padding: 6px 12px; border-radius: 4px; font-weight: bold; font-size: 14px; box-shadow: 0 2px 8px rgba(0,0,0,0.3); }
         .epoch-badge { background-color: #27AE60; color: white; }
         .clip-badge { background-color: #8E44AD; color: white; right: 8px; left: auto; }
+        /* below the clip badge with clear air — the two overlapped at 34px (Peter) */
+        .sound-badge { background-color: #16A085; color: white; right: 8px; left: auto; top: 40px; }
+        #lightbox-vid { display: none; max-width: 90vw; max-height: 72vh; border-radius: 4px; }
         #lb-scrub-wrap { display: none; width: min(80vw, 640px); margin-top: 10px; text-align: center; }
         #lb-scrub-wrap.active { display: block; }
         #lb-scrub { width: 100%; }
@@ -10456,11 +10986,16 @@ class LoRATrainerGUI:
         <span class="close-btn" onclick="closeLightbox()">&times;</span>
         <span class="nav-btn prev-btn" onclick="navigateLightbox(-1)">&#10094;</span>
         <img id="lightbox-img" src="" alt="">
+        <video id="lightbox-vid" controls preload="metadata"></video>
         <span class="nav-btn next-btn" onclick="navigateLightbox(1)">&#10095;</span>
         <div id="lb-scrub-wrap">
             <input type="range" id="lb-scrub" min="0" max="0" value="0"
                    oninput="lbScrub(parseInt(this.value))">
             <div id="lb-scrub-label"></div>
+        </div>
+        <div id="lb-audio-wrap" style="display:none; margin-top:8px; text-align:center;">
+            <audio id="lb-audio" controls preload="none"
+                   style="width:min(80vw,640px);"></audio>
         </div>
         <div class="image-details">
             <div class="image-name" id="lightbox-name"></div>
@@ -10610,6 +11145,16 @@ class LoRATrainerGUI:
                         const cj = await fetch('clips.json?t=' + Date.now());
                         if (cj.ok) { const cm = await cj.json(); images.forEach(im => { if (cm[im.filename]) im.clip = cm[im.filename]; }); }
                     } catch (e) {}
+                    // Sample sound (previews with audio): filename -> wav. Never autoplays.
+                    try {
+                        const sj = await fetch('sounds.json?t=' + Date.now());
+                        if (sj.ok) { const sm = await sj.json(); images.forEach(im => { if (sm[im.filename]) im.sound = sm[im.filename]; }); }
+                    } catch (e) {}
+                    // Playable clips (frames + sound muxed): filename -> mp4. Never autoplays.
+                    try {
+                        const vj = await fetch('videos.json?t=' + Date.now());
+                        if (vj.ok) { const vm = await vj.json(); images.forEach(im => { if (vm[im.filename]) im.video = vm[im.filename]; }); }
+                    } catch (e) {}
                     await loadLikeness();
                     renderGallery();
                     renderLikenessChart();
@@ -10665,7 +11210,9 @@ class LoRATrainerGUI:
                         <img src="${img.filename}" alt="${img.filename}" loading="lazy">
                         <span class="badge epoch-badge">Epoch ${img.epoch}</span>
                         ${likBadge(img)}
-                        ${img.clip ? `<span class="badge clip-badge">🎞 scrub</span>` : ''}
+                        ${img.video ? `<span class="badge clip-badge">🎬 video</span>` : ''}
+                        ${!img.video && img.clip ? `<span class="badge clip-badge">🎞 scrub</span>` : ''}
+                        ${!img.video && img.sound ? `<span class="badge sound-badge">🔊 sound</span>` : ''}
                     </div>
                     <div class="image-info">
                         <div class="lora-name">${img.loraName}</div>
@@ -11039,6 +11586,35 @@ class LoRATrainerGUI:
         function showLightbox(img) {
             const wrap = document.getElementById('lb-scrub-wrap');
             const slider = document.getElementById('lb-scrub');
+            const aw = document.getElementById('lb-audio-wrap');
+            const au = document.getElementById('lb-audio');
+            const vid = document.getElementById('lightbox-vid');
+            const imEl = document.getElementById('lightbox-img');
+            au.pause();
+            vid.pause();
+            // A sample with a muxed mp4 plays as a REAL clip — controls, never autoplay —
+            // replacing both the scrub slider and the separate audio player.
+            if (img.video) {
+                vid.src = img.video;
+                vid.style.display = 'block';
+                imEl.style.display = 'none';
+                aw.style.display = 'none';
+                au.removeAttribute('src');
+                wrap.classList.remove('active');
+                lbClip = null;
+                document.getElementById('lightbox-name').textContent = img.filename;
+                document.getElementById('lightbox-meta').textContent = `${img.loraName} | Epoch ${img.epoch} | Seed: ${img.seed} | ${img.time}`;
+                document.getElementById('lightbox').classList.add('active');
+                document.body.style.overflow = 'hidden';
+                return;
+            }
+            vid.removeAttribute('src');
+            vid.style.display = 'none';
+            imEl.style.display = '';
+            // The sample's generated sound, when it has one (wav without an mp4 — e.g. the
+            // mux failed). A play CONTROL, never autoplay — scrubbing stays silent.
+            if (img.sound) { au.src = img.sound; aw.style.display = 'block'; }
+            else { au.removeAttribute('src'); aw.style.display = 'none'; }
             lbClip = img.clip || null;
             if (lbClip) {
                 // Preload on OPEN, not up front — a 60-epoch gallery would otherwise pull
@@ -11060,6 +11636,8 @@ class LoRATrainerGUI:
         }
 
         function closeLightbox() {
+            document.getElementById('lb-audio').pause();
+            document.getElementById('lightbox-vid').pause();
             document.getElementById('lightbox').classList.remove('active');
             document.body.style.overflow = '';
         }
@@ -11149,6 +11727,18 @@ class LoRATrainerGUI:
                         clips[f[:-len(".clip")] + ".png"] = [f + "/" + x for x in frames]
             with open(os.path.join(samples_dir, "clips.json"), 'w', encoding='utf-8') as f:
                 json.dump(clips, f)
+            # Sample sound (previews with audio): <stem>.wav beside the contract PNG. Its own
+            # map so clips.json keeps its shape for older galleries.
+            sounds = {f[:-4] + ".png": f for f in os.listdir(samples_dir)
+                      if f.lower().endswith(".wav")}
+            with open(os.path.join(samples_dir, "sounds.json"), 'w', encoding='utf-8') as f:
+                json.dump(sounds, f)
+            # Playable clips (frames + sound muxed): <stem>.mp4 — the lightbox plays these
+            # instead of the scrub slider + separate audio player.
+            videos = {f[:-4] + ".png": f for f in os.listdir(samples_dir)
+                      if f.lower().endswith(".mp4")}
+            with open(os.path.join(samples_dir, "videos.json"), 'w', encoding='utf-8') as f:
+                json.dump(videos, f)
         except Exception:
             pass
 
@@ -11522,7 +12112,7 @@ class LoRATrainerGUI:
         .gallery-item {{ background-color: #2C3E50; border-radius: 8px; overflow: hidden; cursor: pointer; transition: transform 0.2s, box-shadow 0.2s; }}
         .gallery-item:hover {{ transform: translateY(-5px); box-shadow: 0 10px 30px rgba(0, 0, 0, 0.3); }}
         .image-container {{ position: relative; }}
-        .gallery-item img {{ width: 100%; height: 250px; object-fit: cover; display: block; }}
+        .gallery-item img {{ width: 100%; height: 250px; object-fit: contain; display: block; background-color: #1B2A38; }}
         .epoch-badge, .step-badge {{ position: absolute; top: 10px; left: 10px; padding: 6px 12px; border-radius: 4px; font-weight: bold; font-size: 14px; box-shadow: 0 2px 8px rgba(0,0,0,0.3); }}
         .epoch-badge {{ background-color: #27AE60; color: white; }}
         .step-badge {{ background-color: #E67E22; color: white; }}
@@ -11687,6 +12277,31 @@ class LoRATrainerGUI:
                  fg=COLORS["text_muted"], bg=COLORS["bg_surface"]).grid(
             row=1, column=1, sticky=tk.W, pady=(0, 4)
         )
+
+        # Working from video or audio — sits ABOVE the prep steps because clips and voice
+        # segments are cut first, and both then land in the same training folder as everything
+        # else. Shown to everyone rather than only under MiniMax: the person who needs it is
+        # the one who has not chosen a model yet, looking at an hour of footage or a voice
+        # memo, wondering where to start.
+        gizmo_card = self._start_section_card(
+            outer, "Working from video or audio?",
+            "Gizmo cuts training clips AND voice segments. Video: scrub to a moment, pick a "
+            "length, save — frame rate, frame count, sizing and sound all come out on spec. "
+            "Audio: open a recording (or a video, for just its sound), scrub the waveform, "
+            "caption the voice — with optional Whisper transcription — and export ready "
+            "training segments. Video and voice training are MiniMax H3 only; still images "
+            "need none of this.",
+        )
+        _gz_row = tk.Frame(gizmo_card, bg=COLORS["bg_surface"])
+        _gz_row.pack(anchor=tk.W)
+        tk.Button(_gz_row, text="🎬🎙  Open Gizmo", command=self._launch_gizmo,
+                  bg=COLORS["accent"], fg=COLORS["text_primary"],
+                  activebackground=COLORS["accent_hover"],
+                  activeforeground=COLORS["text_primary"], font=(FONT_FAMILY, 10, "bold"),
+                  relief=tk.FLAT, bd=0, padx=16, pady=8, cursor="hand2").pack(side=tk.LEFT)
+        tk.Label(_gz_row, text="opens in its own window — Fizgig keeps running",
+                 font=(FONT_FAMILY, 9), fg=COLORS["text_muted"],
+                 bg=COLORS["bg_surface"]).pack(side=tk.LEFT, padx=12)
 
         # Card 2: What to do — one radio per outcome, plain-language hint under each. The radio
         # VALUES stay the historical mode strings so persistence and the convert pipeline are
@@ -11933,6 +12548,14 @@ class LoRATrainerGUI:
         output folder entirely and taught users the wrong answer to 'does this touch my
         folder?'."""
         if not hasattr(self, '_prep_note_var'):
+            return
+        # A voice folder has nothing for this tab to do — resize, crop and face detection are
+        # image operations. Say so instead of promising to process "your 0 images".
+        if self._training_folder_audio_only():
+            self._prep_note_var.set(
+                "🎙 Audio-only training set — this tab prepares images, and voice recordings "
+                "need none of it. Segments are cut, captioned and sized in Gizmo's audio tab; "
+                "your files here are already ready to train.")
             return
         mode = self.prep_mode_var.get()
         replace = self.delete_originals_var.get()
@@ -12540,6 +13163,40 @@ class LoRATrainerGUI:
     # region Image Prep Helpers
 
     IMAGE_EXTENSIONS = {'.jpg', '.jpeg', '.png', '.gif', '.bmp', '.webp', '.tiff', '.tif'}
+
+    def _launch_gizmo(self):
+        """Open Gizmo, the clip and voice prep tool, as its own process.
+
+        On a pod this button is the ONLY route — there is no desktop icon and a .bat is useless
+        on Linux. It works because the container runs openbox and DISPLAY=:1 is set in the image,
+        both of which this process already inherited, so the child does too.
+
+        Not a "close Fizgig and open Gizmo" flow, deliberately: on a pod Fizgig is PID 1's
+        successor and closing it would kill the pod.
+        """
+        script = os.path.join(FIZGIG_DIR, "gizmo.pyw" if os.name == "nt" else "gizmo.py")
+        if not os.path.isfile(script):
+            messagebox.showerror("Gizmo not found",
+                                 f"{os.path.basename(script)} is missing from your Fizgig folder. "
+                                 "Update Fizgig to get it.")
+            return
+
+        proc = getattr(self, "_gizmo_proc", None)
+        if proc is not None and proc.poll() is None:
+            messagebox.showinfo("Gizmo is already open",
+                                "Gizmo is running — look for its window behind this one.")
+            return
+
+        exe = self._venv_python()
+        if os.name == "nt":
+            # pythonw, or the child inherits a console window Fizgig itself does not have.
+            cand = os.path.join(FIZGIG_DIR, "venv", "Scripts", "pythonw.exe")
+            if os.path.isfile(cand):
+                exe = cand
+        try:
+            self._gizmo_proc = subprocess.Popen([exe, script], cwd=FIZGIG_DIR)
+        except Exception as exc:
+            messagebox.showerror("Gizmo could not start", f"{type(exc).__name__}: {exc}")
 
     @staticmethod
     def _atomic_png_save(img, output_path):
@@ -15512,6 +16169,57 @@ class LoRATrainerGUI:
 
     # region Preferences Tab
 
+    # The paths a family cannot train without. The optional rows (reference DiT, audio VAE,
+    # Turbo LoRA) neither hold a section open nor count against its badge — a family whose only
+    # gaps are optional is configured.
+    _PREFS_FAMILY_KEYS = {
+        "klein": ("base_dit", "distilled_dit", "vae", "text_encoder"),
+        "krea2": ("krea2_raw_dit", "krea2_turbo_dit", "krea2_vae", "krea2_text_encoder"),
+        "minimax": ("minimax_dit", "minimax_text_encoder", "minimax_vae"),
+    }
+    # Badge names — "2 paths needed if training Klein 9B" reads as advice, where a bare
+    # "2 paths needed" reads as a problem: someone who never trains that family owes it nothing.
+    _PREFS_FAMILY_NAMES = {"klein": "Klein 9B", "krea2": "Krea 2", "minimax": "MiniMax H3"}
+
+    def _prefs_family_section(self, parent, family, title, description):
+        """A collapsible model-path section for one model family on the Preferences tab.
+
+        Starts collapsed only when the family's required paths are all filled: a new user sent
+        here by the Start tab's setup prompt lands on the sections they still need already open,
+        while a configured machine shows three closed headers instead of a wall of path rows.
+        The header badge keeps a collapsed section honest — you can see whether a family needs
+        attention without opening it. Returns (content_frame, first_free_grid_row).
+        """
+        keys = self._PREFS_FAMILY_KEYS[family]
+
+        def _missing():
+            return sum(1 for k in keys if not str(self.prefs_vars[k].get() or "").strip())
+
+        section = CollapsibleFrame(parent, title, default_expanded=_missing() > 0)
+        section.pack(fill=tk.X, padx=36, pady=(0, 16))
+        content = section.get_content_frame()
+        content.columnconfigure(1, weight=1)
+        tk.Label(content, text=description, font=(FONT_FAMILY, 10),
+                 fg=COLORS["text_explain"], bg=COLORS["bg_surface"],
+                 wraplength=760, justify=tk.LEFT
+                 ).grid(row=0, column=0, columnspan=3, sticky=tk.W, pady=(4, 10))
+
+        def _refresh_badge(*_a):
+            n = _missing()
+            try:
+                section.badge.config(
+                    text="✓ configured" if n == 0
+                    else (f"{n} path{'s' if n != 1 else ''} needed if training "
+                          f"{self._PREFS_FAMILY_NAMES[family]}"),
+                    fg=COLORS["text_secondary"] if n == 0 else COLORS["warning"])
+            except tk.TclError:
+                pass
+
+        _refresh_badge()
+        for k in keys:
+            self.prefs_vars[k].trace_add("write", _refresh_badge)
+        return content, 1
+
     def create_prefs_tab(self):
         """Create the Preferences tab (Start-tab styled)."""
         scrollable_frame, _ = self.create_scrollable_frame(self.prefs_tab)
@@ -15526,14 +16234,14 @@ class LoRATrainerGUI:
             "and persist to prefs.json.",
         )
 
-        # Card 1: Model Paths
-        models_card = self._start_section_card(
-            outer, "Model Paths (Klein 9B)",
+        # The three model-family sections are collapsible, and smart about it: a family with a
+        # required path still blank starts open, a configured one starts closed. Click the
+        # header to toggle; the badge says which state you're in without opening anything.
+        models_card, next_row = self._prefs_family_section(
+            outer, "klein", "Model Paths (Klein 9B)",
             "Absolute paths to the four model files. Each row has a Download link that opens the HuggingFace page "
             "in your browser.",
         )
-        models_card.columnconfigure(1, weight=1)
-        next_row = 0
         next_row = self._add_pref_row(
             models_card, next_row, "Base DiT:", "base_dit",
             "Klein 9B Base model (for training & precise profiling). "
@@ -15588,15 +16296,13 @@ class LoRATrainerGUI:
             "Fizgig asks for it and tells you which pages to accept the licence on.")
         next_row += 1
 
-        # Card 1b: Krea 2 model paths
-        krea_card = self._start_section_card(
-            outer, "Model Paths (Krea 2)",
+        # Krea 2 model paths
+        krea_card, kr = self._prefs_family_section(
+            outer, "krea2", "Model Paths (Krea 2)",
             "Krea 2 LoRA training + inference. Train on RAW; previews and inference use the pre-quant fp8 Turbo "
             "(8-step, CFG-free). The text encoder can be either Qwen3-VL-4B file — bf16, or the smaller "
             "fp8_scaled (~3.6 GB less VRAM; its vision tower is bf16 either way).",
         )
-        krea_card.columnconfigure(1, weight=1)
-        kr = 0
         kr = self._add_pref_row(
             krea_card, kr, "RAW DiT:", "krea2_raw_dit",
             "Krea 2 RAW (undistilled 12.9B base) — the training model (krea2_raw_bf16.safetensors)",
@@ -15655,6 +16361,97 @@ class LoRATrainerGUI:
             font=(FONT_FAMILY, 9), fg=COLORS["text_explain"], bg=COLORS["bg_surface"],
             wraplength=760, justify=tk.LEFT)
         _offline_tip.grid(row=kr + 2, column=0, columnspan=3, sticky=tk.W, pady=(12, 2))
+
+        # MiniMax H3 model paths — third family, beside the other two now that clip+audio
+        # training has outgrown its bottom-of-the-page beginnings.
+        mm_card, mr = self._prefs_family_section(
+            outer, "minimax", "Model Paths (MiniMax H3 — experimental)",
+            "Image-only LoRA training for MiniMax's ~33B H3 omni DiT. Train on the pruned int8 DiT "
+            "— the same file ComfyUI runs — quantized to NF4 at load, so the resident base is "
+            "~11 GB. The Qwen3-VL-32B text encoder and the video VAE are only needed for the "
+            "one-time caching pass; the compact nvfp4 TE is recommended. Trains on stills, or on "
+            "short video clips — and with the audio VAE set, on their sound too.",
+        )
+        mr = self._add_pref_row(
+            mm_card, mr, "DiT:", "minimax_dit",
+            "MiniMax H3 DiT — the training base. Use the PRUNED int8 file "
+            "(minimax_h3_fl2va_pruned_int8_convrot.safetensors, ~21 GB): it is the one ComfyUI "
+            "runs, so your LoRA trains against the weights it will be deployed on, and its "
+            "curve-table AdaLN is a target a LoRA can actually use. The ~66 GB bf16 file also "
+            "works. The pruned file KEEPS its int8 weights (~21 GB on the GPU, what the reference "
+            "trainer does); the bf16 file is quantized to NF4 at load (~11 GB, a little lossier).",
+            download_url="https://huggingface.co/Comfy-Org/MiniMax-H3/blob/main/diffusion_models/minimax_h3_fl2va_pruned_int8_convrot.safetensors",
+            download_note="~21GB — Comfy-Org/MiniMax-H3 → diffusion_models/minimax_h3_fl2va_pruned_int8_convrot.safetensors (fl2va is the trainable variant; the 66GB bf16 file works too)",
+        )
+        mr = self._add_pref_row(
+            mm_card, mr, "DiT (reference):", "minimax_ref_dit",
+            "OPTIONAL — only for reference distillation ('Learn identity from' on the Training "
+            "tab). This is the ref2va model, a DIFFERENT fine-tune from the fl2va one above and "
+            "not just another quantization of it: it is what ComfyUI's Reference-to-Video "
+            "workflow loads, and the only H3 build that accepts reference images. A LoRA "
+            "distilled this way is trained on it and runs on it. Leave blank for ordinary "
+            "training.",
+            download_url="https://huggingface.co/Comfy-Org/MiniMax-H3/blob/main/diffusion_models/minimax_h3_ref2va_pruned_int8_convrot.safetensors",
+            download_note="~21GB — Comfy-Org/MiniMax-H3 -> diffusion_models/"
+                          "minimax_h3_ref2va_pruned_int8_convrot.safetensors (the pruned int8 "
+                          "build, same shape as the fl2va one above; you may already have it if "
+                          "you use the r2v workflow)",
+        )
+        mr = self._add_pref_row(
+            mm_card, mr, "Qwen3-VL-32B TE:", "minimax_text_encoder",
+            "Qwen3-VL-32B text encoder — nvfp4 (the compact ComfyUI file) or bf16 both work; the "
+            "loader detects which you gave it. The nvfp4 file keeps its packed weights (~15.7 GB "
+            "on the GPU); bf16 is NF4-quantized at load (~14 GB). Used only while caching caption "
+            "embeddings, then offloaded before training. (The int8_convrot TE "
+            "variant is NOT supported — its rotated weights can't be dequantized here.)",
+            download_url="https://huggingface.co/Comfy-Org/MiniMax-H3/blob/main/text_encoders/qwen3vl_32b_minimax_h3_nvfp4_awq.safetensors",
+            download_label="Download nvfp4 (recommended)",
+            download_note="~15.7GB nvfp4-awq — the same TE ComfyUI uses, so you may already have it; "
+                          "identical conditioning to bf16 (validated), just a slower one-off load",
+            download_url2="https://huggingface.co/Comfy-Org/MiniMax-H3/blob/main/text_encoders/qwen3vl_32b_minimax_h3_bf16.safetensors",
+            download_label2="bf16",
+            download_note2="~51.5GB bf16 — the full-precision original; loads faster, 3.3x the disk",
+        )
+        mr = self._add_pref_row(
+            mm_card, mr, "Video VAE:", "minimax_vae",
+            "The H3 video VAE — encodes each training image to a 24-channel latent (used only "
+            "during caching).",
+            download_url="https://huggingface.co/Comfy-Org/MiniMax-H3/blob/main/vae/minimax_h3_video_vae_fp16.safetensors",
+            download_note="~4.9GB — Comfy-Org/MiniMax-H3 → vae/minimax_h3_video_vae_fp16.safetensors",
+        )
+        mr = self._add_pref_row(
+            mm_card, mr, "Audio VAE:", "minimax_audio_vae",
+            "OPTIONAL — set this to train on the sound in your video clips. H3 generates audio and "
+            "video together, so a clip with sound can teach it a voice, and nothing else can. "
+            "Used only during caching, and only by clips: a folder of stills never loads it, and "
+            "neither does a clip you muted (a _mute on the filename trains that clip's video and "
+            "ignores its sound). Leave blank and clips train silent, exactly as they did before.",
+            download_url="https://huggingface.co/Comfy-Org/MiniMax-H3/blob/main/vae/minimax_h3_audio_vae_fp32.safetensors",
+            download_note="~605MB — Comfy-Org/MiniMax-H3 → vae/minimax_h3_audio_vae_fp32.safetensors",
+        )
+        mr = self._add_pref_row(
+            mm_card, mr, "Turbo LoRA:", "minimax_turbo_lora",
+            "OPTIONAL — fast in-training previews. With this set, previews render in 6 steps "
+            "with the community Turbo LoRA applied at 75% on top of your training LoRA — the "
+            "same pairing fast ComfyUI inference uses — instead of the full 20-step pass. It "
+            "touches PREVIEWS ONLY: the Turbo is switched in for the sample render and out "
+            "again before the next training step, and your saved LoRA never contains it. "
+            "Steps and strength are adjustable on the Samples tab.",
+            download_url="https://huggingface.co/larryvrh/MiniMax-H3-Turbo-Lora/blob/main/minimax_h3_turbo_v4_step600.safetensors",
+            download_note="~780MB — larryvrh/MiniMax-H3-Turbo-Lora → "
+                          "minimax_h3_turbo_v4_step600.safetensors (you may already have it in "
+                          "ComfyUI's loras folder)",
+        )
+        self._add_fetch_models_row(
+            mm_card, mr, "minimax",
+            "Fetches the DiT, text encoder, both VAEs and the Turbo LoRA above, plus the Krea 2 Qwen3-VL captioning "
+            "text encoder (~47 GB all in), and fills in these paths for you — plus the small "
+            "helper models (Florence-2 captioner, face model for the Look "
+            "Filter and likeness scoring, EN→ZH translator — ~1.6 GB) so nothing stalls to "
+            "download later. No HuggingFace account needed — none of these are gated. The "
+            "reference DiT is left out unless you tick it above: another 21 GB, and it is only "
+            "used by identity mode.",
+            optional_label="Include the reference DiT (+21 GB)")
 
         # Card 1b: which GPU. Only when the machine actually has more than one - a chooser with a
         # single entry is noise, and the whole feature is a no-op there.
@@ -15776,76 +16573,6 @@ class LoRATrainerGUI:
 
         self._add_runpod_card(outer)
 
-        # Card (bottom): MiniMax H3 model paths — experimental third family, kept at the very
-        # bottom under everything else since it's barebones image-only LoRA training (no samples,
-        # no inference). The DiT is the training base; it's NF4-quantized at load either way.
-        mm_card = self._start_section_card(
-            outer, "Model Paths (MiniMax H3 — experimental)",
-            "Image-only LoRA training for MiniMax's ~33B H3 omni DiT. Train on the pruned int8 DiT "
-            "— the same file ComfyUI runs — quantized to NF4 at load, so the resident base is "
-            "~11 GB. The Qwen3-VL-32B text encoder and the video VAE are only needed for the "
-            "one-time caching pass; the compact nvfp4 TE is recommended. Stills only — no video, "
-            "no audio.",
-        )
-        mm_card.columnconfigure(1, weight=1)
-        mr = 0
-        mr = self._add_pref_row(
-            mm_card, mr, "DiT:", "minimax_dit",
-            "MiniMax H3 DiT — the training base. Use the PRUNED int8 file "
-            "(minimax_h3_fl2va_pruned_int8_convrot.safetensors, ~21 GB): it is the one ComfyUI "
-            "runs, so your LoRA trains against the weights it will be deployed on, and its "
-            "curve-table AdaLN is a target a LoRA can actually use. The ~66 GB bf16 file also "
-            "works. The pruned file KEEPS its int8 weights (~21 GB on the GPU, what the reference "
-            "trainer does); the bf16 file is quantized to NF4 at load (~11 GB, a little lossier).",
-            download_url="https://huggingface.co/Comfy-Org/MiniMax-H3/blob/main/diffusion_models/minimax_h3_fl2va_pruned_int8_convrot.safetensors",
-            download_note="~21GB — Comfy-Org/MiniMax-H3 → diffusion_models/minimax_h3_fl2va_pruned_int8_convrot.safetensors (fl2va is the trainable variant; the 66GB bf16 file works too)",
-        )
-        mr = self._add_pref_row(
-            mm_card, mr, "DiT (reference):", "minimax_ref_dit",
-            "OPTIONAL — only for reference distillation ('Learn identity from' on the Training "
-            "tab). This is the ref2va model, a DIFFERENT fine-tune from the fl2va one above and "
-            "not just another quantization of it: it is what ComfyUI's Reference-to-Video "
-            "workflow loads, and the only H3 build that accepts reference images. A LoRA "
-            "distilled this way is trained on it and runs on it. Leave blank for ordinary "
-            "training.",
-            download_url="https://huggingface.co/Comfy-Org/MiniMax-H3/blob/main/diffusion_models/minimax_h3_ref2va_pruned_int8_convrot.safetensors",
-            download_note="~21GB — Comfy-Org/MiniMax-H3 -> diffusion_models/"
-                          "minimax_h3_ref2va_pruned_int8_convrot.safetensors (the pruned int8 "
-                          "build, same shape as the fl2va one above; you may already have it if "
-                          "you use the r2v workflow)",
-        )
-        mr = self._add_pref_row(
-            mm_card, mr, "Qwen3-VL-32B TE:", "minimax_text_encoder",
-            "Qwen3-VL-32B text encoder — nvfp4 (the compact ComfyUI file) or bf16 both work; the "
-            "loader detects which you gave it. The nvfp4 file keeps its packed weights (~15.7 GB "
-            "on the GPU); bf16 is NF4-quantized at load (~14 GB). Used only while caching caption "
-            "embeddings, then offloaded before training. (The int8_convrot TE "
-            "variant is NOT supported — its rotated weights can't be dequantized here.)",
-            download_url="https://huggingface.co/Comfy-Org/MiniMax-H3/blob/main/text_encoders/qwen3vl_32b_minimax_h3_nvfp4_awq.safetensors",
-            download_label="Download nvfp4 (recommended)",
-            download_note="~15.7GB nvfp4-awq — the same TE ComfyUI uses, so you may already have it; "
-                          "identical conditioning to bf16 (validated), just a slower one-off load",
-            download_url2="https://huggingface.co/Comfy-Org/MiniMax-H3/blob/main/text_encoders/qwen3vl_32b_minimax_h3_bf16.safetensors",
-            download_label2="bf16",
-            download_note2="~51.5GB bf16 — the full-precision original; loads faster, 3.3x the disk",
-        )
-        mr = self._add_pref_row(
-            mm_card, mr, "Video VAE:", "minimax_vae",
-            "The H3 video VAE — encodes each training image to a 24-channel latent (used only "
-            "during caching).",
-            download_url="https://huggingface.co/Comfy-Org/MiniMax-H3/blob/main/vae/minimax_h3_video_vae_fp16.safetensors",
-            download_note="~4.9GB — Comfy-Org/MiniMax-H3 → vae/minimax_h3_video_vae_fp16.safetensors",
-        )
-        self._add_fetch_models_row(
-            mm_card, mr, "minimax",
-            "Fetches the DiT, text encoder and VAE above, plus the Krea 2 Qwen3-VL captioning "
-            "text encoder (~47 GB all in), and fills in these paths for you — plus the small "
-            "helper models (Florence-2 captioner, face model for the Look "
-            "Filter and likeness scoring, EN→ZH translator — ~1.6 GB) so nothing stalls to "
-            "download later. No HuggingFace account needed — none of these are gated. The "
-            "reference DiT is left out unless you tick it above: another 21 GB, and it is only "
-            "used by identity mode.",
-            optional_label="Include the reference DiT (+21 GB)")
 
         # Card 4: Actions
         actions_card = self._start_section_card(outer, "Actions", None)
@@ -21948,6 +22675,20 @@ class LoRATrainerGUI:
         # frees far more than swap); otherwise suggest more block swap. (Preview OOMs are caught in
         # the trainer, auto-disable previews, and don't print this literal — so this only fires on a
         # genuine training-step OOM.)
+        # The preview resolution ladder settled somewhere (trainer prints this per
+        # downgrade): write it back into the Samples tab so the NEXT run starts at the size
+        # that fit, instead of re-walking the ladder from the configured resolution. It
+        # persists exactly like a hand edit of Width/Height.
+        if "[preview] resolution settled:" in line:
+            import re as _re_res
+            _m = _re_res.search(r"resolution settled: (\d+)x(\d+)", line)
+            if _m and hasattr(self, "sample_width_var"):
+                self.sample_width_var.set(_m.group(1))
+                self.sample_height_var.set(_m.group(2))
+                self.update_console(f"[samples] preview resolution saved as the new "
+                                    f"default: {_m.group(1)}x{_m.group(2)} — future runs "
+                                    f"start there.\n")
+
         if "CUDA out of memory" in line or "OutOfMemoryError" in line:
             if not getattr(self, "_oom_warning_shown", False):
                 self._oom_warning_shown = True
@@ -22006,6 +22747,34 @@ class LoRATrainerGUI:
             self.settings[setting_name] = path
             self.entries[setting_name].delete(0, tk.END)
             self.entries[setting_name].insert(0, self.settings[setting_name])
+
+    def _tidy_lora_name(self):
+        """Clean the LoRA Name field in place. Returns (name, error or None).
+
+        The name becomes a filename, but not until the FIRST CHECKPOINT SAVE — an epoch in. A
+        stray character (a newline off a paste is the common one) trained for sixteen minutes
+        and then died inside safetensors with a bare OS error that named neither the setting nor
+        the character; and since the LoRA is written before the state dir, there was nothing left
+        to resume from (#70).
+
+        What has one obvious intent is fixed silently — surrounding whitespace, control
+        characters, trailing dots Windows discards anyway — and WRITTEN BACK to the widget, so
+        the field, the preset that gets persisted, the queue entry and --output_name cannot
+        disagree about what this run is called. Everything else is refused by name.
+        """
+        entry = self.entries.get("LORA_NAME")
+        raw = entry.get() if entry is not None else ""
+        name = "".join(c for c in raw if c >= " ").strip().rstrip(".").strip()
+        if entry is not None and name != raw:
+            entry.delete(0, tk.END)
+            entry.insert(0, name)
+        if not name:
+            return name, "LoRA name cannot be empty"
+        bad = next((c for c in name if c in '<>:"|?*/\\'), None)
+        if bad is not None:
+            return name, (f"LoRA name cannot contain '{bad}' — file names can't include that "
+                          f"character. Use letters, numbers, spaces, - _ or .")
+        return name, None
 
     def validate_inputs(self):
         """Validate all inputs before starting training"""
@@ -22248,6 +23017,12 @@ class LoRATrainerGUI:
             save_epochs = int(self.entries["SAVE_EVERY_N_EPOCHS"].get())
             if save_epochs <= 0:
                 errors.append("Save every N epochs must be a positive integer")
+            # Per-category retirement epoch: blank = never, else a positive whole number.
+            _rk = self.entries.get("MIXED_STOP_EPOCH")
+            _rv = str(_rk.get() if _rk else "").strip()
+            if _rv and (not _rv.isdigit() or int(_rv) <= 0):
+                errors.append(f"'Finish one category early: after epoch' must be blank or "
+                              f"a positive whole number, not {_rv!r}")
         except ValueError:
             errors.append("Save every N epochs must be a valid integer")
 
@@ -22260,10 +23035,9 @@ class LoRATrainerGUI:
         except ValueError:
             errors.append("Blocks swap must be a valid integer")
 
-        # Check LoRA name is not empty
-        lora_name = self.entries["LORA_NAME"].get()
-        if not lora_name or not lora_name.strip():
-            errors.append("LoRA name cannot be empty")
+        _name, _name_error = self._tidy_lora_name()
+        if _name_error:
+            errors.append(_name_error)
 
         # Check output directory
         output_dir = self.entries["LORA_OUTPUT_DIR"].get()
@@ -22551,7 +23325,16 @@ class LoRATrainerGUI:
             # trainer's shift. Keeping the percentage is what makes a saved preset mean the same
             # thing later, rather than a shift number nobody can interpret.
             "MINIMAX_LOWNOISE_PCT": str(self.entries["MINIMAX_LOWNOISE_PCT"].get() or "").strip(),
-            "MINIMAX_LOGNORM": bool(self.minimax_lognorm_var.get()),
+            "MINIMAX_HIGHNOISE_LR_PCT": str(
+                self.entries["MINIMAX_HIGHNOISE_LR_PCT"].get() or "").strip(),
+            # The hand-curated dict trap (5f20ba2): a control missing HERE silently never
+            # reaches the trainer, however correct the widgets and the command builder are.
+            "MIXED_STOP_CATEGORY": str(
+                self.entries["MIXED_STOP_CATEGORY"].get() or "").strip(),
+            "MIXED_STOP_EPOCH": str(
+                self.entries["MIXED_STOP_EPOCH"].get() or "").strip(),
+            "MIXED_STOP_MODE": str(
+                self.entries["MIXED_STOP_MODE"].get() or "").strip(),
             "MINIMAX_BLOCKS": minimax_block_spec(self.entries["MINIMAX_BLOCKS"].get()),
             "MINIMAX_TRAIN_ADALN": bool(self.entries["MINIMAX_TRAIN_ADALN"].get()),
             "MINIMAX_DISTILL": bool(self.minimax_distill_var.get()),
@@ -23083,9 +23866,16 @@ class LoRATrainerGUI:
             # the CURRENT bucket, not just the filename — change Target Megapixels and it
             # re-encodes anyway. Deliberately NOT passed to text caching, where the skip is
             # filename-only and would silently reuse the embedding of an edited caption.
-            return self._build_krea2_cache_command(
+            cmd = self._build_krea2_cache_command(
                 "minimax_cache_latents.py", "--vae", self._krea2_pref("minimax_vae")) + \
                 ["--skip_existing"]
+            # Passed whenever it's set — the script itself decides whether to load it, and only
+            # does when the dataset actually contains clips. A stills folder never pays the
+            # 605 MB, so there's nothing to gate on here.
+            _avae = self._krea2_pref("minimax_audio_vae")
+            if _avae:
+                cmd += ["--audio_vae", _avae]
+            return cmd
         arch = self.settings["ARCHITECTURE"]
         python_path = self._venv_python()
         cache_script_path = self._resolve_script(config, "cache_latents_script")
@@ -23589,14 +24379,27 @@ class LoRATrainerGUI:
         # The trainer stamps the same thing into the LoRA as ss_timestep_density.
         # Low-noise share -> shift. Always sent, including the default, so the launched command
         # records which density ran instead of leaving it implicit.
-        if self.settings.get("MINIMAX_LOGNORM"):
-            _shift = minimax_lownoise_to_lognorm_shift(self.settings.get("MINIMAX_LOWNOISE_PCT"))
-            if _shift is not None:
-                cmd += ["--shift", f"lognorm:{_shift:g}"]
-        else:
-            _shift = minimax_lownoise_to_shift(self.settings.get("MINIMAX_LOWNOISE_PCT"))
-            if _shift is not None:
-                cmd += ["--shift", f"{_shift:g}"]
+        # Always the plain uniform-base shift. A saved preset or queue row carrying the retired
+        # MINIMAX_LOGNORM is deliberately ignored rather than migrated — mid-concentrated is the
+        # thing being removed, so honouring it here would keep shipping the fault.
+        _shift = minimax_lownoise_to_shift(self.settings.get("MINIMAX_LOWNOISE_PCT"))
+        if _shift is not None:
+            cmd += ["--shift", f"{_shift:g}"]
+        _hl = minimax_highnoise_lr(self.settings.get("MINIMAX_HIGHNOISE_LR_PCT"))
+        if _hl is not None and abs(_hl - 1.0) > 1e-9:
+            cmd += ["--highnoise_lr_scale", f"{_hl:g}"]
+        # Per-category retirement (mixed visual+voice datasets). One category, one epoch —
+        # sent only when the epoch is set: the flag's presence means the run used it.
+        try:
+            _n = int(str(self.settings.get("MIXED_STOP_EPOCH", "") or "").strip() or 0)
+        except ValueError:
+            _n = 0
+        if _n > 0:
+            _flag = ("visual" if "photo" in
+                     str(self.settings.get("MIXED_STOP_CATEGORY", "")).lower() else "audio")
+            _mode = ("stop" if "stop" in
+                     str(self.settings.get("MIXED_STOP_MODE", "")).lower() else "anchor")
+            cmd += [f"--{_flag}_stop_epoch", str(_n), f"--{_flag}_stop_mode", _mode]
         # Blocks to Train — only sent when it's a real range; "all" is the trainer's own default,
         # and not sending it keeps the flag's presence meaning "this run was a block experiment".
         _blocks = minimax_block_spec(self.settings.get("MINIMAX_BLOCKS", "all"))
@@ -23657,12 +24460,43 @@ class LoRATrainerGUI:
                 ]
                 # Sample length: "124 frames (~5s — trained minimum)" -> 124. Always sent so
                 # the launched command records whether a run previewed stills or clips.
-                _sf = str(getattr(self, "sample_frames_var", None)
-                          and self.sample_frames_var.get() or "").split(" ")[0]
+                _sf_raw = str(getattr(self, "sample_frames_var", None)
+                              and self.sample_frames_var.get() or "")
+                _sf = _sf_raw.split(" ")[0]
                 cmd += ["--sample_frames", _sf if _sf.isdigit() else "1"]
-                _st = self.sample_steps_var.get().strip()
-                if _st.isdigit() and int(_st) > 0:
-                    cmd += ["--sample_steps", _st]
+                # "with sound" variants: the samples also carry their generated audio,
+                # decoded through the audio VAE — same file the caching pass uses.
+                if "with sound" in _sf_raw.lower():
+                    _avae = self._krea2_pref("minimax_audio_vae")
+                    if _avae:
+                        cmd += ["--sample_audio", "--audio_vae", _avae]
+                    else:
+                        self.update_console("[samples] 'with sound' needs the Audio VAE path "
+                                            "— set it in Preferences. Samples render "
+                                            "silent.\n")
+                # The Turbo LoRA (Preferences) takes over the preview pace when set: its own
+                # steps + strength from the Samples tab (6 @ 75% recommended), nothing else
+                # changed. Without it, the ordinary Steps box applies as before.
+                _turbo = self._krea2_pref("minimax_turbo_lora")
+                if _turbo and os.path.isfile(_turbo):
+                    # read the WIDGETS, like the other sample fields — settings can lag them
+                    _ts = str(getattr(self, "turbo_steps_entry", None)
+                              and self.turbo_steps_entry.get() or "").strip()
+                    _ts = _ts if _ts.isdigit() and int(_ts) > 0 else "6"
+                    try:
+                        _tstr = float(str(getattr(self, "turbo_strength_entry", None)
+                                          and self.turbo_strength_entry.get()
+                                          or "").strip() or 75) / 100.0
+                    except ValueError:
+                        _tstr = 0.75
+                    _tstr = min(2.0, max(0.0, _tstr))
+                    cmd += ["--turbo_lora_path", _turbo,
+                            "--turbo_lora_strength", f"{_tstr:.3f}",
+                            "--sample_steps", _ts]
+                else:
+                    _st = self.sample_steps_var.get().strip()
+                    if _st.isdigit() and int(_st) > 0:
+                        cmd += ["--sample_steps", _st]
                 try:
                     _cfg = float(self.sample_cfg_scale_var.get().strip())
                 except (ValueError, AttributeError):

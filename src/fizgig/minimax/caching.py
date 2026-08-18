@@ -15,6 +15,7 @@ import logging
 import os
 from typing import List
 
+import numpy as np
 import torch
 from safetensors.torch import save_file
 
@@ -25,13 +26,54 @@ logger = logging.getLogger(__name__)
 
 
 # --- cache writers -----------------------------------------------------------
-def save_latent_cache_minimax(item_info: ItemInfo, latent: torch.Tensor) -> None:
-    """Save an H3 VAE latent (3-D: C, H, W) to the item's latent cache file."""
-    assert latent.dim() == 3, f"latent must be 3-D (C,H,W), got {tuple(latent.shape)}"
-    _, H, W = latent.shape
-    sd = {f"latent_{H}x{W}": latent.detach().cpu().contiguous()}
+def save_latent_cache_minimax(item_info: ItemInfo, latent: torch.Tensor,
+                              audio_latent: torch.Tensor = None,
+                              audio_only: bool = False) -> None:
+    """Save an H3 VAE latent to the item's cache file, optionally with the clip's audio.
+
+    Two shapes, two keys, and the still one is unchanged on purpose:
+
+      * a still  -> 3-D (C, H, W)     keyed `latent_{H}x{W}`
+      * a clip   -> 4-D (C, T, H, W)  keyed `latent_{T}x{H}x{W}`
+
+    A still written today is byte-identical to one written before clips existed, so every cache
+    already on disk stays valid and nobody re-caches a working dataset. Both keys start `latent_`,
+    which is all the shared collate looks at (image_dataset.py: `startswith("latent_")` ->
+    `latents`), and the trainer only adds a frame axis when one is missing — so a 4-D cache
+    arrives at the DiT as (1, 24, T, H, W) with no further work.
+
+    audio_latent is stored ALREADY PACKED into DiT rows — (2*T_audio, 32), channel-major — rather
+    than in the VAE's own (32, 2, T) layout. Packing at write time means the ordering is decided
+    once, next to the encoder that produced it, instead of being re-derived on every load where
+    getting it backwards would train against scrambled targets and raise nothing.
+
+    Absent audio is absent, not zeros: an item with no `audio_latent` key contributes no audio
+    loss, which is what a muted clip and every still are meant to do. A silence TARGET would
+    teach the model that this footage sounds like nothing.
+
+    audio_only marks a VOICE item — its video latent is a zeros placeholder and the trainer
+    zeroes the video loss for it. Stored as a cache key (not metadata) because keys are what
+    the collate forwards into the batch; the flag rides beside the tensors it governs.
+    """
+    assert latent.dim() in (3, 4), \
+        f"latent must be 3-D (C,H,W) or 4-D (C,T,H,W), got {tuple(latent.shape)}"
+    if latent.dim() == 3:
+        _, H, W = latent.shape
+        key = f"latent_{H}x{W}"
+    else:
+        _, T, H, W = latent.shape
+        key = f"latent_{T}x{H}x{W}"
+    sd = {key: latent.detach().cpu().contiguous()}
+    if audio_latent is not None:
+        assert audio_latent.dim() == 2 and audio_latent.shape[1] == 32, (
+            f"audio_latent must be packed rows (2*T, 32), got {tuple(audio_latent.shape)} — "
+            f"use audio_vae.pack_audio() on the encoder's (B, 32, 2, T) output")
+        sd["audio_latent"] = audio_latent.detach().cpu().contiguous()
+    if audio_only:
+        assert audio_latent is not None, "an audio-only item with no audio rows trains nothing"
+        sd["audio_only"] = torch.tensor(True)
     for key, value in sd.items():
-        if torch.isnan(value).any():
+        if value.is_floating_point() and torch.isnan(value).any():
             logger.warning(f"NaN in {key} for {item_info.item_key} - replaced with 0")
             value[torch.isnan(value)] = 0
     metadata = {
@@ -130,11 +172,164 @@ def load_text_encoder_output_cache_minimax(path: str):
         return f.get_tensor("hidden_states"), f.get_tensor("attention_mask").to(torch.bool)
 
 
+# --- clips -------------------------------------------------------------------
+def _is_clip(item: ItemInfo) -> bool:
+    """A clip is an item whose source file is a video AND whose content is many frames.
+
+    Both halves matter: `content` being a list already means "multi-target" elsewhere in the
+    dataset, so the extension is what says this list is time rather than alternatives.
+    """
+    from fizgig.minimax.clip import is_video
+    return is_video(str(item.item_key)) and isinstance(item.content, list) and len(item.content) > 1
+
+
+def _encode_clip(vae, item: ItemInfo, audio_vae, device, dtype) -> None:
+    """One clip -> one cache file holding its video latent and, if it has sound, its audio rows."""
+    from fizgig.minimax.audio import HOP_LENGTH
+    from fizgig.minimax.clip import read_audio
+    from fizgig.minimax.model import audio_latents_for_frames
+
+    frames = torch.from_numpy(np.stack(item.content))            # (T, H, W, C) uint8
+    n_frames = frames.shape[0]
+    x = frames.permute(3, 0, 1, 2).unsqueeze(0).float() / 127.5 - 1.0   # (1, C, T, H, W)
+    with torch.no_grad():
+        # encode_clip, not encode: the clip goes in as 17-frame groups, which is both what makes
+        # the latent frame count match the DiT's clock and what keeps peak VRAM off the clip's
+        # length. See MiniMaxH3VideoVAEEncoder.encode_clip.
+        latent = vae.encode_clip(x.to(device, dtype=dtype))[0]   # (24, T', H/16, W/16)
+
+    audio_rows = None
+    if audio_vae is not None:
+        wav = read_audio(str(item.item_key))                     # None when muted or silent
+        if wav is not None:
+            from fizgig.minimax.audio_vae import pack_audio
+
+            # Fit the WAVEFORM to the frame count before encoding, rather than repairing rows
+            # afterwards. A real container's audio rarely lines up with its video to the sample:
+            # AAC granularity leaves a 22-frame clip about 20 ms short, which is one latent
+            # short of the 37 the DiT will pack — and a row count the model does not expect is
+            # a shifted target, not an error anyone would see.
+            #
+            # HOP-EXACT, never seconds-based: the target is the latent count the DiT demands
+            # times the VAE's 800-sample hop — the voice path's trim_to_grid doctrine. The old
+            # target, ceil(frames/24 x 32000) samples, disagrees with round(frames/24 x 40)
+            # latents whenever the latent count rounds DOWN: a 56-frame clip got 74,667
+            # samples, which encodes to 94 latents against the 93 required, and the belt-and-
+            # braces check below refused every 5-, 56- and 107-frame clip with sound (Peter's
+            # run died on the first 56). 22/39/73/90/124 agreed by rounding luck, which is why
+            # it survived earlier clip training.
+            want_samples = audio_latents_for_frames(n_frames) * HOP_LENGTH
+            have = wav.shape[1]
+            if have < want_samples:
+                wav = np.pad(wav, ((0, 0), (0, want_samples - have)))
+            elif have > want_samples:
+                wav = wav[:, :want_samples]
+
+            a_dev = next(audio_vae.parameters()).device
+            a_dt = next(audio_vae.parameters()).dtype
+            with torch.no_grad():
+                z = audio_vae.encode(torch.from_numpy(wav).unsqueeze(0).to(a_dev, dtype=a_dt))
+            audio_rows = pack_audio(z).float().cpu()
+
+            # Belt and braces: the DiT sizes its audio block from the PIXEL frame count, so this
+            # has to agree with the helper the model itself uses. Refuse rather than cache a
+            # target the trainer will silently mis-read.
+            want = audio_latents_for_frames(n_frames)
+            got = audio_rows.shape[0] // 2
+            if got != want:
+                raise ValueError(
+                    f"{item.item_key}: audio encoded to {got} latents but {n_frames} pixel "
+                    f"frames need {want}. The clip's audio and video lengths disagree by more "
+                    f"than padding can bridge — re-export it with Gizmo.")
+
+    logger.info("latent cache: %s -> %s%s", item.item_key, tuple(latent.shape),
+                f" + audio {tuple(audio_rows.shape)}" if audio_rows is not None else " (no audio)")
+    save_latent_cache_minimax(item, latent.cpu(), audio_latent=audio_rows)
+
+
+# --- audio-only voice items --------------------------------------------------
+def _is_audio(item: ItemInfo) -> bool:
+    """Extension only — a voice item's content is a placeholder image the aggregator has
+    already collapsed to a bare ndarray, so content shape can't distinguish it from a still."""
+    from fizgig.minimax.audio import is_audio
+    return is_audio(str(item.item_key))
+
+
+def _encode_audio_item(item: ItemInfo, audio_vae) -> None:
+    """One voice recording -> one cache file: a zeros video placeholder and the real audio rows.
+
+    The zeros latent is not laziness — it is the dataset-mean in normalized latent space, and
+    the trainer zeroes the video loss for these items, so its only jobs are sizing the packed
+    sequence (latent_t drives the audio row count) and giving the audio rows something to
+    attend across. The audio is the training item.
+    """
+    from fizgig.minimax.audio import grid_frames_for_samples, read_audio_file, trim_to_grid
+    from fizgig.minimax.audio_vae import pack_audio
+    from fizgig.minimax.model import audio_latents_for_frames, latent_frames_for_pixels
+
+    path = str(item.item_key)
+    wav = read_audio_file(path)                                   # (2, L) or AudioRejected
+    frames = grid_frames_for_samples(wav.shape[1], os.path.basename(path))
+    wav = trim_to_grid(wav, frames)                               # hop-exact sample count
+
+    a_dev = next(audio_vae.parameters()).device
+    a_dt = next(audio_vae.parameters()).dtype
+    with torch.no_grad():
+        z = audio_vae.encode(torch.from_numpy(wav).unsqueeze(0).to(a_dev, dtype=a_dt))
+    audio_rows = pack_audio(z).float().cpu()
+
+    want = audio_latents_for_frames(frames)
+    got = audio_rows.shape[0] // 2
+    if got != want:
+        raise ValueError(
+            f"{os.path.basename(path)}: audio encoded to {got} latents but the model wants "
+            f"{want} — the hop-exact trim should make this impossible; please report it.")
+
+    latent_t = latent_frames_for_pixels(frames)
+    placeholder = torch.zeros(24, latent_t, item.bucket_size[1] // 16, item.bucket_size[0] // 16)
+    logger.info("latent cache: %s -> audio %s + placeholder %s (video loss will be zeroed)",
+                item.item_key, tuple(audio_rows.shape), tuple(placeholder.shape))
+    save_latent_cache_minimax(item, placeholder, audio_latent=audio_rows, audio_only=True)
+
+
 # --- batch encoders (called by the cache scripts) ----------------------------
-def encode_and_save_latents(vae, batch: List[ItemInfo]) -> None:
-    """Encode an image batch through the H3 video VAE and save each 24-ch latent."""
+def encode_and_save_latents(vae, batch: List[ItemInfo], audio_vae=None) -> None:
+    """Encode a batch through the H3 video VAE and save each 24-ch latent.
+
+    A CLIP takes a different route: its content is the whole list of frames, encoded together so
+    the VAE's causal 4x temporal stride produces real latent frames, and its audio (when it has
+    any and was not muted) is encoded here too and stored in the same file. Clips are encoded one
+    at a time — a batch mixing lengths cannot stack, and MiniMax trains at batch size 1 anyway.
+
+    audio_vae=None means clips still train, silently: video learns, the audio rows stay silence.
+    That is the intended behaviour when the user has not downloaded the audio VAE.
+    """
+    audio_items = [it for it in batch if _is_audio(it)]
+    if audio_items:
+        if len(batch) != len(audio_items):
+            raise ValueError("a batch mixes voice recordings with other items — set Batch "
+                             "Size to 1")
+        if audio_vae is None:
+            raise ValueError(
+                "this dataset contains voice recordings but no audio VAE is configured — set "
+                "the Audio VAE path in Preferences (Model Paths, MiniMax H3), or remove the "
+                "audio files.")
+        for item in audio_items:
+            _encode_audio_item(item, audio_vae)
+        return
+
     device = next(vae.parameters()).device
     dtype = next(vae.parameters()).dtype
+
+    clips = [it for it in batch if _is_clip(it)]
+    if clips:
+        if len(batch) != len(clips):
+            raise ValueError("a batch mixes clips and stills — MiniMax caches clips one at a "
+                             "time; set Batch Size to 1")
+        for item in clips:
+            _encode_clip(vae, item, audio_vae, device, dtype)
+        return
+
     contents = []
     for item in batch:
         content = item.content

@@ -8,6 +8,12 @@ import logging
 import os
 import sys
 
+# NOTE: do NOT set max_split_size_mb here. It briefly was (chasing the 16 GB fragmentation
+# OOM), and it deterministically broke batch-16 encoding even on an EMPTY 32 GB card — raw
+# cudaMalloc failure, reproduced in isolation. The real fix was the row-chunked nvfp4 dequant
+# in embedder.py, which alone holds the tight-mode peak at 13.7 GiB under a 16 GB budget
+# (measured with the VRAM simulator, batch 1 AND batch 16 both verified).
+
 import torch
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", ".."))
@@ -74,6 +80,18 @@ def _cache_reference_conditioning(args, datasets, all_files, all_paths, encoder)
     k = max(0, int(args.reference_count or 0))
     for ds_i, ds in enumerate(datasets):
         paths = list(getattr(getattr(ds, "datasource", None), "image_paths", []) or [])
+        # STILLS only, both roles. As a reference, a clip or voice file would reach
+        # Image.open() and kill the pass; as a student, a teref slot written for a clip or a
+        # voice item sends it down the distillation branch at train time, whose still-sized
+        # audio block cannot match a longer item's packed sequence. Neither has a face for the
+        # teacher to describe anyway.
+        from fizgig.minimax.audio import is_audio as _is_audio_file
+        from fizgig.minimax.clip import is_video as _is_video_file
+        _dropped = [p for p in paths if _is_video_file(p) or _is_audio_file(p)]
+        if _dropped:
+            paths = [p for p in paths if p not in set(_dropped)]
+            logger.info("[reference] %d clip/voice item(s) sit out of reference distillation — "
+                        "they train normally, the teacher only pairs photographs.", len(_dropped))
         n = len(paths)
         if n < 2:
             logger.warning("[reference] dataset %d has %d image(s) — need at least 2 to pair "
@@ -104,6 +122,8 @@ def _cache_reference_conditioning(args, datasets, all_files, all_paths, encoder)
         _img_cache, _lat_cache = {}, {}
 
         def reference_for(item):
+            if _is_video_file(str(item.item_key)) or _is_audio_file(str(item.item_key)):
+                return []                       # sits out by design — announced once above
             i = idx_of.get(item.item_key)
             if i is None:                       # key shapes differ -> match on the basename
                 i = idx_of.get(os.path.splitext(os.path.basename(str(item.item_key)))[0])
@@ -149,7 +169,7 @@ def _cache_reference_conditioning(args, datasets, all_files, all_paths, encoder)
                         index_offset=ds_i)
 
 
-def _report_headroom(device, batch_size):
+def _report_headroom(device, batch_size, with_vision=False):
     """Say what the encoder took and what is left, and shrink the batch when it is tight.
 
     Overcommitting VRAM does not raise on Windows — the driver pages the overflow into system
@@ -162,6 +182,13 @@ def _report_headroom(device, batch_size):
     almost independent of the batch — dropping the batch buys ~0.2 GB, not gigabytes. Which makes
     it a last-ditch lever rather than the fix, and worth pulling only inside that 1.9 GB band
     where a fifth of a gigabyte decides whether the card pages.
+
+    with_vision changes what the advice can honestly be. Those 12.78 GB assume cpu_embed, which
+    the vision build forces off (embedder.py: it scatters image embeddings from input_ids, so
+    inputs_embeds would drop the pixels) — the ~1.5 GB embedding table comes back onto the card,
+    and that is the entire margin 16 GB has. Telling someone in that state to close their browser
+    sends them looking for memory nothing else is holding (issue #71: 15.3 GB resident, 0.0 free,
+    nothing else on the GPU). Name the teacher instead.
     """
     if torch.device(device).type != "cuda" or not torch.cuda.is_available():
         return batch_size
@@ -170,6 +197,11 @@ def _report_headroom(device, batch_size):
     except Exception:
         return batch_size
     free_gb, resident_gb = free_b / (1024 ** 3), torch.cuda.memory_allocated(device) / (1024 ** 3)
+    try:
+        from fizgig.utils.device import plannable_free_vram
+        free_gb = min(free_gb, plannable_free_vram(device))   # FIZGIG_SIM_VRAM_GB honoured
+    except Exception:
+        pass
     logger.info(f"[vram] text encoder resident {resident_gb:.1f} GB, "
                 f"{free_gb:.1f} GB of {total_b / (1024 ** 3):.1f} GB free")
     if free_gb >= 2.5:                      # clears the measured batch-16 spike with room over
@@ -180,16 +212,24 @@ def _report_headroom(device, batch_size):
                     f"{batch_size}. Costs about a second per image, once.")
         batch_size = small
     if free_gb < 1.9:                       # below the smallest forward this encoder can do
+        _what_to_do = (
+            "Reference distillation is what took it: the teacher needs the encoder's vision "
+            "tower, and that build has to hold the ~1.5 GB embedding table on the GPU rather "
+            "than in system RAM. That is the whole margin a 16 GB card has. Turn the teacher "
+            "off and caching fits; keeping it needs a bigger card."
+            if with_vision else
+            "Close anything else using the GPU — ComfyUI, and browsers, which can hold a couple "
+            "of GB on hardware acceleration — then run this again.")
         logger.warning(
             "[vram] only %.1f GB free with the encoder loaded, and a single forward needs about "
             "1.7 GB. Windows pages instead of failing here, so caching can appear frozen for a "
-            "very long time rather than stopping with an error. Close anything else using the "
-            "GPU — ComfyUI, and browsers, which can hold a couple of GB on hardware "
-            "acceleration — then run this again.", free_gb)
+            "very long time rather than stopping with an error. %s", free_gb, _what_to_do)
     return batch_size
 
 
 def main():
+    from fizgig.utils.device import apply_sim_vram_cap
+    apply_sim_vram_cap()          # FIZGIG_SIM_VRAM_GB: behave like a smaller card
     args = setup_parser().parse_args()
     device = torch.device(args.device or ("cuda" if torch.cuda.is_available() else "cpu"))
 
@@ -207,9 +247,19 @@ def main():
     encoder = load_minimax_h3_te(args.text_encoder, device=device, compute_dtype=torch.bfloat16,
                                  quantize=not args.no_quantize, with_vision=bool(_refs))
 
-    args.batch_size = _report_headroom(device, args.batch_size or 16)
-    process_batches(args, datasets, all_files, all_paths,
-                    lambda batch: encode_and_save_text(encoder, batch, args.batch_size))
+    args.batch_size = _report_headroom(device, args.batch_size or 16, with_vision=bool(_refs))
+
+    def _encode(batch):
+        # Tight mode: defragment between forwards. The nvfp4 dequant wants ~0.5 GB fresh per
+        # forward, Windows has no expandable_segments to consolidate with, and on a 16 GB
+        # card nearly a GB can sit reserved-but-unallocated while the allocation fails
+        # (surfaced by the 16 GB simulator: 13.91 GiB allocated + 931 MiB fragmented at a
+        # 14.83 GiB budget). Same phase-boundary empty_cache doctrine the Repair Studio uses.
+        if args.batch_size <= 2 and torch.cuda.is_available():
+            torch.cuda.empty_cache()
+        encode_and_save_text(encoder, batch, args.batch_size)
+
+    process_batches(args, datasets, all_files, all_paths, _encode)
 
     # r2v conditioning for the teacher. Written AFTER the plain cache and to sibling files, so
     # a run without --reference_count is byte-identical to before.

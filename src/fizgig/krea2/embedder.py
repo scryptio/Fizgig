@@ -445,7 +445,7 @@ def _strip_caption_preamble(text: str) -> str:
     return out if out else text.strip()
 
 
-def generate_caption(conditioner: "Qwen3VLConditioner", image_path: str, *,
+def generate_caption(conditioner: "Qwen3VLConditioner", image_path, *,
                      max_new_tokens: int = 120, megapixels: float = 1.0,
                      detailed: bool = False, seed: int = None,
                      instruction: str = None) -> str:
@@ -464,7 +464,11 @@ def generate_caption(conditioner: "Qwen3VLConditioner", image_path: str, *,
     from PIL import Image
 
     proc = conditioner._get_image_processor()
-    im = conditioner._cap_image(Image.open(image_path), megapixels)
+    # image_path is a path OR an already-opened PIL image. The second form exists because a
+    # MiniMax H3 training item can be a video clip, and what gets captioned is a frame decoded
+    # from it — there is no file on disk to hand over.
+    src = Image.open(image_path) if isinstance(image_path, (str, os.PathLike)) else image_path
+    im = conditioner._cap_image(src, megapixels)
     # An explicit instruction wins (the Captions tab's task menu, or a user-edited one); otherwise
     # the historical detailed/standard pair, so existing callers are unaffected.
     if instruction is None:

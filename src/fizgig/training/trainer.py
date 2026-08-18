@@ -70,6 +70,7 @@ from fizgig.training.train_utils import (
     prune_state_dirs,
     save_state_on_epoch_end,
     save_and_remove_state_stepwise,
+    validate_output_name,
     save_state_on_train_end,
 )
 from fizgig.utils.device import clean_memory_on_device
@@ -1859,6 +1860,8 @@ class KleinTrainer:
             raise ValueError("dataset_config is required")
         if args.dit is None:
             raise ValueError("path to DiT model is required")
+        if args.output_name is not None:      # optional here; when given it must be a filename (#70)
+            validate_output_name(args.output_name)
         assert not args.fp8_scaled or args.fp8_base, "fp8_scaled requires fp8_base"
 
         if args.sage_attn:

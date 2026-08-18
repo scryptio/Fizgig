@@ -2,6 +2,17 @@
 
 Fizgig is written by [Peter Neill (shootthesound)](https://github.com/shootthesound).
 
+## rintic-13
+
+[rintic-13](https://github.com/rintic-13) designed and prototyped the **async H2D-only int8
+block streaming** that headlines v4.0.0
+([#73](https://github.com/shootthesound/Fizgig/issues/73)): the frozen base's swapped blocks
+stream host-to-GPU through a pinned ring buffer on a copy stream and never travel back —
+measured **6.4× faster** than round-trip swap at the same depth, which is what lets 16 GB and
+24 GB cards train MiniMax H3 on the accurate int8 base instead of 4-bit. Landed with
+`Co-authored-by` credit (ab90dda), and ongoing work extends the idea to the text encoder
+([#74](https://github.com/shootthesound/Fizgig/issues/74)).
+
 ## FNGarvin
 
 [FNGarvin](https://github.com/FNGarvin) has contributed a string of high-quality features and

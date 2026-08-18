@@ -223,11 +223,16 @@ def create_launcher_scripts():
     that ended in 'Press any key to continue', and (b) dirtied a tracked file so the next
     update_fizgig.bat's `git pull` refused to run. Never write it here.
     """
-    bat_path = SCRIPT_DIR / "run_fizgig.bat"
-    if bat_path.exists():
-        print(f"Launcher present: {bat_path} (ships with the repo — not modified)")
-    else:
-        print(f"WARNING: {bat_path} is missing — restore it with `git checkout -- run_fizgig.bat`")
+    # Gizmo's launcher is the same story and gets the same treatment: tracked, verified, never
+    # written. It needs no install of its own — Tkinter is stdlib, PIL and imageio-ffmpeg are
+    # already pinned — so it simply arrives with an ordinary update.
+    for name in ("run_fizgig.bat", "Launch Gizmo (Video clip prep tool).bat"):
+        bat_path = SCRIPT_DIR / name
+        if bat_path.exists():
+            print(f"Launcher present: {bat_path} (ships with the repo — not modified)")
+        else:
+            print(f"WARNING: {bat_path} is missing — restore it with "
+                  f'`git checkout -- "{name}"`')
 
     # Linux/Mac shell script (not shipped in the repo — generated here)
     sh_content = '''#!/bin/bash

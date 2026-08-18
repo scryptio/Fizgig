@@ -164,8 +164,68 @@ class MiniMaxH3VideoVAEEncoder(nn.Module):
         self.register_buffer("pixel_std", torch.tensor(IMAGENET_STD).view(1, 3, 1, 1, 1), persistent=False)
 
     @torch.no_grad()
+    @staticmethod
+    def plan_clip_bucket(free_gb, width, height, reserve_gb=1.5):
+        """Largest /32 bucket of this shape whose clip encode fits in `free_gb`.
+
+        Encoding a clip is far more expensive than encoding a still of the same size — the whole
+        17-frame group is live at once — and a mixed dataset lets someone pick 1 MP for their
+        photographs without knowing that no consumer card can cache a clip at it. Refusing the
+        run would be the wrong answer: the stills are fine, and the clips are still worth having
+        at a size that fits.
+
+        MEASURED on a 5090, fp32, encoding in 17-frame groups:
+
+            0.09 MP  5.6 GiB     0.26 MP  14.2 GiB     0.52 MP  28.0 GiB     0.66 MP  OOM
+
+        which is 0.9 + 52 x megapixels, within 0.3 GiB across that range, and flat in clip length
+        (124 frames costs 0.3 GiB more than 22). So the cap is a straight solve, with the same
+        1.5 GiB left for the allocator and the display that the training planner reserves.
+        """
+        budget = max(0.0, float(free_gb) - float(reserve_gb) - 0.9)
+        max_pixels = budget / 52.0 * 1e6
+        if width * height <= max_pixels or max_pixels < 32 * 32:
+            return int(width), int(height)
+        scale = (max_pixels / (width * height)) ** 0.5
+        w = max(32, int(width * scale) // 32 * 32)
+        h = max(32, int(height * scale) // 32 * 32)
+        return w, h
+
+    def encode_clip(self, x):
+        """A whole clip -> [B,24,T',H/16,W/16], encoded in the groups the model expects.
+
+        Encoding a clip in ONE call is wrong twice over, and the first way is silent.
+
+        H3's latent clock is (1,4,4,4,4) repeating — five latent frames covering seventeen pixel
+        frames, restarting with a keyframe. Feeding all 22 frames of a clip to `encode` gives six
+        latent frames; feeding 17 then 5 gives 5+2 = 7, which is what the DiT's position ids and
+        audio clock are built for. Both numbers are plausible tensor shapes, so the wrong one does
+        not raise — it just trains against a misaligned target. (Measured on the real weights.)
+
+        The second way is loud: `encode` has no temporal chunking, so peak activation follows the
+        whole clip at once. A 39-frame clip peaks at 30 GiB and a 56-frame one will not fit on a
+        32 GB card at all. In 17-frame groups the peak is fixed by the group, so length costs
+        nothing extra here and the ceiling moves to the training step where it belongs.
+        """
+        t = x.shape[2] if x.ndim == 5 else 1
+        if t <= 1:
+            return self.encode(x)
+        if t < 5 or (t - 5) % 17:
+            raise ValueError(f"{t} frames is not on H3's 17n+5 grid — the VAE could not have "
+                             f"produced a latent for it")
+        # n groups of 17, then the 5 that every grid length ends on: 22 = 17+5, 39 = 17+17+5.
+        sizes = [17] * ((t - 5) // 17) + [5]
+        out, i = [], 0
+        for size in sizes:
+            out.append(self.encode(x[:, :, i:i + size]))
+            i += size
+        return torch.cat(out, dim=2)
+
     def encode(self, x):
         """x: [B,3,H,W] or [B,3,T,H,W] in [-1,1] -> normalized latent [B,24,ceil(T/4),H/16,W/16].
+
+        A CLIP should go through `encode_clip` instead — see there for why calling this with all
+        of a clip's frames gives the wrong number of latent frames without raising.
 
         The stack is temporally causal with a 4x stride, so latent frame k depends only on pixel
         frames up to 4k (verified by perturbation) and a still gives T'=1 — the image path is

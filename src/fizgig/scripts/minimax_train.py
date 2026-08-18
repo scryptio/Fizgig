@@ -72,6 +72,23 @@ def setup_parser() -> argparse.ArgumentParser:
     p.add_argument("--caption_dropout", type=float, default=0.05,
                    help="Fraction of steps trained on the empty prompt (reference default 0.05; "
                         "needs the uncond embed cached by minimax_cache_text). 0 disables.")
+    p.add_argument("--audio_weight", type=float, default=1.0,
+                   help="Weight on the audio term for video clips that carry sound. Audio is "
+                        "only ~4%% of the packed sequence, so parity may be too quiet to teach "
+                        "anything — raise it if the per-epoch [audio] line shows sound winning "
+                        "a negligible share of the loss. Ignored by stills and muted clips.")
+    p.add_argument("--visual_stop_epoch", type=int, default=0,
+                   help="Mixed datasets: retire photos & clips after this epoch (0 = never). "
+                        "See --visual_stop_mode for what retirement means.")
+    p.add_argument("--visual_stop_mode", choices=["anchor", "stop"], default="anchor",
+                   help="anchor = the retired category keeps training at 10%% LR (holds its "
+                        "quality against drift on the shared adapters, and its epoch ledger "
+                        "stays live as the drift alarm); stop = skipped outright (faster "
+                        "epochs, blind).")
+    p.add_argument("--audio_stop_epoch", type=int, default=0,
+                   help="Mixed datasets: retire voice recordings after this epoch (0 = never).")
+    p.add_argument("--audio_stop_mode", choices=["anchor", "stop"], default="anchor",
+                   help="As --visual_stop_mode, for the voice recordings.")
     p.add_argument("--include_patterns", nargs="*", default=None,
                    help="Regex module filters (Model Area to Train). Default: all transformer blocks.")
     p.add_argument("--distill", action="store_true",
@@ -153,6 +170,12 @@ def setup_parser() -> argparse.ArgumentParser:
                         "unshifted logit-normal and 'resolution' = resolution-shifted "
                         "logit-normal, both A/B modes that overdrive adapters at 1e-4. "
                         "A float = the uniform-u shift map at that value.")
+    p.add_argument("--highnoise_lr_scale", type=float, default=1.0,
+                   help="Learning-rate multiplier for steps drawn ABOVE sigma 0.5 — the noisy "
+                        "half, where pose and composition are decided. 1.0 (default) leaves them "
+                        "alone. Lower it as --shift moves the run toward the noisy end, where "
+                        "those steps become the majority and would otherwise swamp the few "
+                        "clean-end steps that carry identity.")
     # Adaptive LR — bi-directional plateau tracker (starts at the geometric midpoint of min/max;
     # the Learning Rate box is ignored while it's on).
     p.add_argument("--adaptive_lr", action="store_true")
@@ -176,6 +199,19 @@ def setup_parser() -> argparse.ArgumentParser:
                    help="Pixel frames per sample on the 17n+5 grid (1=still; 124=trained minimum, ~5s). Off-grid snaps down.")
     p.add_argument("--sample_negative", default=None, help="Only used when --sample_cfg_scale > 1")
     p.add_argument("--sample_seed", type=int, default=42, help="0 = random each preview")
+    p.add_argument("--turbo_lora_path", default=None,
+                   help="H3 Turbo LoRA (minimax_h3_turbo_v4_step600.safetensors) — applied to "
+                        "PREVIEWS only, at --turbo_lora_strength, and removed before the next "
+                        "training step. Pair with --sample_steps 6.")
+    p.add_argument("--turbo_lora_strength", type=float, default=0.75,
+                   help="Preview strength for --turbo_lora_path (0.75 recommended)")
+    p.add_argument("--sample_audio", action="store_true",
+                   help="Clip previews carry their generated SOUND: the jointly-denoised "
+                        "audio rows are decoded to a .wav beside each sample. Needs "
+                        "--audio_vae. Stills are unaffected.")
+    p.add_argument("--audio_vae", default=None,
+                   help="H3 audio VAE (minimax_h3_audio_vae_fp32.safetensors) — its decoder "
+                        "half, for --sample_audio")
     p.add_argument("--text_encoder", default=None,
                    help="Qwen3-VL-32B TE — needed only to pre-encode preview prompts")
     p.add_argument("--vae", default=None, help="H3 video VAE (reserved for the full decoder)")
@@ -199,6 +235,8 @@ def _read_prompts(path):
 
 
 def main():
+    from fizgig.utils.device import apply_sim_vram_cap
+    apply_sim_vram_cap()          # FIZGIG_SIM_VRAM_GB: behave like a smaller card
     args = setup_parser().parse_args()
     train_minimax(
         dataset_config=args.dataset_config,
@@ -221,6 +259,11 @@ def main():
         optimizer_type=args.optimizer_type,
         optimizer_args=args.optimizer_args,
         caption_dropout=args.caption_dropout,
+        audio_weight=args.audio_weight,
+        visual_stop_epoch=args.visual_stop_epoch,
+        visual_stop_mode=args.visual_stop_mode,
+        audio_stop_epoch=args.audio_stop_epoch,
+        audio_stop_mode=args.audio_stop_mode,
         base_quant=args.base_quant,
         include_patterns=args.include_patterns,
         train_blocks=args.train_blocks,
@@ -237,6 +280,7 @@ def main():
         ema_decay=args.ema_decay,
         quantize=not args.no_quantize,
         shift=args.shift,
+        highnoise_lr_scale=args.highnoise_lr_scale,
         blocks_to_swap=args.blocks_to_swap,
         gradient_checkpointing=args.gradient_checkpointing,
         adaptive_lr=args.adaptive_lr,
@@ -260,6 +304,10 @@ def main():
         sample_frames=args.sample_frames,
         sample_negative=args.sample_negative,
         sample_seed=args.sample_seed,
+        turbo_lora_path=args.turbo_lora_path,
+        turbo_lora_strength=args.turbo_lora_strength,
+        sample_audio=args.sample_audio,
+        audio_vae_path=args.audio_vae,
     )
 
 

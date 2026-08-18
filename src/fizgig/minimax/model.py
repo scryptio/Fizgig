@@ -443,6 +443,14 @@ def _run_block(blocks, i, swap_from, h, t_emb, mod_row, cos, sin):
     can't skip. The self-park at the tail still runs in the plain forward pass (no early-stop
     there), keeping the forward's footprint at ~one swapped block too."""
     swapped = i >= swap_from
+    offloader = getattr(blocks[i], "_h2d_offloader", None) if swapped else None
+    if offloader is not None:
+        # H2D-only streaming (int8 ConvRot, #73): the block's bytes are prefetched into a GPU
+        # ring by a copy stream; this only WAITS for them. No parking dance — blocks never
+        # physically move, so the checkpoint early-stop has nothing to skip, and a recompute
+        # arriving after the ring rotated is healed inside wait_for_block.
+        offloader.wait_for_block(i)
+        return blocks[i](h, t_emb, mod_row, cos, sin)
     if swapped:
         blocks[i].to(h.device)
         if i + 1 < len(blocks):
@@ -496,6 +504,8 @@ class MiniMaxH3DiT(nn.Module):
                                       c.audio_latents_dim, c.final_norm_eps, apply_silu=_silu)
         self._gradient_checkpointing = False
         self._swap_from = len(self.blocks)          # blocks >= this index live on CPU between uses
+        self._h2d_requested = False                 # H2D-only streaming (#73) — int8 bases
+        self._h2d_offloader = None
         # Pack the reference's silence audio block (see the AUDIO_* constants above). Off is an
         # escape hatch for A/B only — the base was trained with these rows present.
         self.pack_audio_rows = True
@@ -522,13 +532,49 @@ class MiniMaxH3DiT(nn.Module):
         weights through the whole backward, saving nothing)."""
         self._gradient_checkpointing = enabled
 
-    def enable_block_swap(self, blocks_to_swap: int):
+    def enable_block_swap(self, blocks_to_swap: int, h2d_only=None, ring_size: int = 2):
         """Park the LAST n blocks on CPU; each is moved to GPU just-in-time for its forward
         (and again for its checkpoint recompute) then parked again. bnb NF4 weights stay packed
         (uint8, 0.5 B/param) through the moves, so a parked block costs ~¼ of its GPU footprint
-        in system RAM and one PCIe round-trip per pass."""
+        in system RAM and one PCIe round-trip per pass.
+
+        h2d_only=True (int8 ConvRot bases only, #73 @rintic-13) streams the frozen int8
+        tensors host→device through a ring buffer on a copy stream instead — no writeback, the
+        prefetch overlaps compute. h2d_only=None KEEPS the previously requested mode: the
+        preview-decode path parks the whole DiT and re-calls this bare, and it must come back
+        in the mode it left, with the stale offloader rebuilt (a whole-model .to() replaces
+        every tensor storage this machinery caches)."""
+        if h2d_only is None:
+            h2d_only = getattr(self, "_h2d_requested", False)
+        self._h2d_requested = bool(h2d_only)
+
+        # Any existing offloader is stale the moment blocks were moved wholesale — and even
+        # when they weren't, rebuilding is cheap next to leaking a set of backward hooks.
+        old = getattr(self, "_h2d_offloader", None)
+        if old is not None:
+            old.release()
+            self._h2d_offloader = None
+            for blk in self.blocks:
+                if hasattr(blk, "_h2d_offloader"):
+                    blk._h2d_offloader = None
+
         n = max(0, min(int(blocks_to_swap), len(self.blocks) - 2))   # keep >=2 resident
         self._swap_from = len(self.blocks) - n
+
+        if self._h2d_requested and n > 0:
+            from .h3_h2d_offload import H3Int8H2DOffloader
+            dev = next((m.qdata.device for b in self.blocks for m in b.modules()
+                        if m.__class__.__name__ == "ConvRotInt8Linear"
+                        and m.qdata.is_cuda), None) or torch.device("cuda")
+            self._h2d_offloader = H3Int8H2DOffloader(self.blocks, self._swap_from,
+                                                     device=dev, ring_size=ring_size)
+            self._h2d_offloader.move_static_weights_to_gpu()
+            self._h2d_offloader.prepare()
+            for blk in self.blocks:
+                blk._h2d_offloader = self._h2d_offloader
+            return n
+
+        self._h2d_offloader = None
         for i in range(self._swap_from, len(self.blocks)):
             self.blocks[i].to("cpu")
         return n
@@ -612,6 +658,18 @@ class MiniMaxH3DiT(nn.Module):
             sigma_a = remap_sigma(sigma_v)
             t_audio = 1.0 - sigma_a
             if audio_rows is not None:
+                # Checked, because the sequence and its POSITION GRID are built from two
+                # different numbers: the rows come from the cache, the grid from n_audio_latents
+                # above. They agree only while the cache and this file agree about a clip's
+                # length, and that is exactly the sort of contract that drifts across files. A
+                # silent desync would train the audio stream against shifted positions.
+                _want = n_audio_latents * AUDIO_CHANNELS
+                if audio_rows.shape[0] != _want:
+                    raise ValueError(
+                        f"audio_rows has {audio_rows.shape[0]} rows but this {latent_t}-latent-"
+                        f"frame clip ({pixel_frames_for_latent(latent_t)} pixel frames) packs "
+                        f"{_want} — {n_audio_latents} latents x {AUDIO_CHANNELS} channels. The "
+                        f"cached audio does not match the cached video.")
                 _arows = audio_rows.to(device=device, dtype=torch.float32)
             else:
                 eps = audio_noise
@@ -684,6 +742,13 @@ class MiniMaxH3DiT(nn.Module):
                     use_reentrant=False)
             else:
                 h = _run_block(self.blocks, i, self._swap_from, h, t_emb, mod_row, cos, sin)
+            # H2D streaming: the block's forward is done — free its ring slot and start the
+            # copy for the block ring_size ahead, overlapping the next blocks' compute. Sits
+            # OUTSIDE the checkpoint call: it must run once per forward pass, not again per
+            # recompute (backward prefetch is the offloader's hooks' job).
+            _off = getattr(self, "_h2d_offloader", None)
+            if _off is not None and i >= self._swap_from:
+                _off.submit_move_blocks_forward(i)
 
         v = self.final_layer(h[video_start:], t_emb, video_t_index)              # [n_video, video_patch_dim]
         out = unpatchify_video(v, latent_t, lat_h // self.patch_size[1], lat_w // self.patch_size[2],

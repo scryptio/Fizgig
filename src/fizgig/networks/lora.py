@@ -1316,6 +1316,9 @@ def detect_lora_format(weights_sd: Dict[str, torch.Tensor]) -> str:
             has_peft = True
         if k.startswith("transformer.") and (".lora_A." in k or ".lora_B." in k or ".lora_down" in k or ".lora_up" in k):
             has_peft = True  # AI-Toolkit / OneTrainer OMI format
+        if "." in k and not k.startswith(("lora_unet_", "lora_transformer_")) \
+                and (".lora_A." in k or ".lora_B." in k):
+            has_peft = True  # bare dotted paths, no prefix — MiniMax H3 ecosystem exports
     if has_kohya and not has_peft:
         return "kohya"
     if has_peft and not has_kohya:
@@ -1673,9 +1676,17 @@ def peft_to_kohya(weights_sd: Dict[str, torch.Tensor]) -> Dict[str, torch.Tensor
                 stripped = key[len(pfx):]
                 break
         if stripped is None:
-            # Not a LoRA weight in a format we convert — preserve as-is (rare)
-            converted[key] = tensor
-            continue
+            # No prefix at all, but a dotted module path with a LoRA suffix — the MiniMax H3
+            # ecosystem exports like this (blocks.0.attn.qkv_proj.lora_A.weight, e.g. the
+            # Turbo LoRA). Treat the whole key as the stripped path.
+            _bare_suffixes = (".lora_A.weight", ".lora_B.weight", ".lora_down.weight",
+                              ".lora_up.weight", ".alpha") + LYCORIS_SUFFIXES
+            if "." in key and key.endswith(_bare_suffixes):
+                stripped = key
+            else:
+                # Not a LoRA weight in a format we convert — preserve as-is (rare)
+                converted[key] = tensor
+                continue
 
         # LyCORIS suffix? Preserve it verbatim.
         lycoris_match = None

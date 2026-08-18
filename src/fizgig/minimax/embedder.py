@@ -88,15 +88,31 @@ def _nvfp4_dequant(packed, block_scale_fp8, global_scale):
     layer, i.e. ~73s -> ~25s across the whole encoder)."""
     out, in2 = packed.shape
     inp = in2 * 2
+    dev = packed.device
     # device follows `packed`: this began as a load-time CPU helper, but Nvfp4Linear now calls it
     # inside a GPU forward, and an un-placed scratch tensor silently lands on CPU.
-    codes = torch.empty(out, inp, dtype=torch.uint8, device=packed.device)
-    codes[:, 0::2] = packed >> 4                                  # HIGH nibble first (verified)
-    codes[:, 1::2] = packed & 0x0F
-    vals = _E2M1_SIGNED.to(codes.device)[codes.long()]            # one signed gather
     bs = _from_blocked(block_scale_fp8.to(torch.float32).reshape(-1, 32, 16), out, inp // 16)
-    w = vals.view(out, inp // 16, 16) * bs.unsqueeze(-1) * global_scale.to(torch.float32)
-    return w.view(out, inp).to(torch.bfloat16)
+    gs = global_scale.to(torch.float32)
+    table = _E2M1_SIGNED.to(dev)
+
+    # ROW-CHUNKED, because the whole-matrix formulation transiently held an int64 gather
+    # index (8 B/element — over a GB on the big layers), the fp32 values, and two fp32
+    # products all at once: ~1.7 GB per forward, which is exactly what pushed a 16 GB card's
+    # text-caching over the edge (surfaced by the VRAM simulator; real cards limped through
+    # it on WDDM paging — the issue-#71 freeze). Same ops per element in the same order, so
+    # still bit-identical — the transients are just bounded to a chunk. The scalar multiply
+    # is in-place for the same reason.
+    w_out = torch.empty(out, inp, dtype=torch.bfloat16, device=dev)
+    chunk = max(1, (32 << 20) // max(inp, 1))                     # ~32M elements per chunk
+    for r0 in range(0, out, chunk):
+        r1 = min(out, r0 + chunk)
+        codes = torch.empty(r1 - r0, inp, dtype=torch.uint8, device=dev)
+        codes[:, 0::2] = packed[r0:r1] >> 4                       # HIGH nibble first (verified)
+        codes[:, 1::2] = packed[r0:r1] & 0x0F
+        vals = table[codes.long()]                                # one signed gather
+        w = (vals.view(r1 - r0, inp // 16, 16) * bs[r0:r1].unsqueeze(-1)).mul_(gs)
+        w_out[r0:r1] = w.view(r1 - r0, inp).to(torch.bfloat16)
+    return w_out
 
 
 def _dequant_comfy_weight(f, file_mod, ckpt):

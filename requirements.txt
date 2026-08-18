@@ -32,7 +32,7 @@ toml==0.10.2
 voluptuous==0.15.2
 
 # Image processing
-pillow==11.3.0
+pillow==12.3.0
 numpy>=1.26.4,<3  # range, not a hard pin — over-constraining numpy breaks pip resolution on some setups (issue #4). torch 2.10 supports numpy 1.26+ and 2.x.
 opencv-python==4.10.0.84
 imageio-ffmpeg>=0.5  # bundled ffmpeg → LoRA Royale exports web-standard H.264 MP4 (Reddit/X/IG), no system ffmpeg needed

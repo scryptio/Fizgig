@@ -34,6 +34,15 @@ logger = logging.getLogger(__name__)
 
 VIDEO_SIGMA_SHIFT_TRAIN = 12.0     # H3's video shift — also the reference TRAINING density
 
+# Where "low noise" stops and the noisy half begins. The GUI defines its clean-end percentage
+# against this same 0.5, so the box and --highnoise_lr_scale always mean the same boundary; the
+# two must move together if either ever moves.
+MINIMAX_LOWNOISE_SIGMA = 0.5
+
+# What a RETIRED category trains at in anchor mode — the Krea per-image ladder's tested floor.
+# One constant, not a knob: "anchor" is legible, "0.085 vs 0.12" is not.
+ANCHOR_LR_SCALE = 0.1
+
 # Identity-first phase 1 trains at this fraction of the Learning Rate box (Peter, 11 Aug). Phase
 # 1 places the identity on a near-zero adapter, where a full-size Adam stride does the most
 # damage and the least good; phase 2 then gets the full rate from a sensible starting point.
@@ -78,6 +87,47 @@ def clip_fallback_frames(frames: int) -> int:
     if half < 22:                      # below the first real grid point above a keyframe pair
         return 1
     return half - (half - 5) % 17      # largest 17n+5 value <= half
+
+
+def restore_parked_dit(dit, device, n_swap: int):
+    """Bring a whole-DiT park (``dit.to("cpu")``) back WITHOUT materializing the full base on
+    the GPU.
+
+    ``dit.to(device)`` moves all 50 blocks up before ``enable_block_swap`` can re-park its
+    tail — invisible on a card that briefly fits the whole ~21 GB int8 base (32 GB), a
+    guaranteed OOM on the tier that never could (16 GB — found by the VRAM sim, where the
+    restore's failure was then mis-blamed on the clip render that had already succeeded).
+    Move only the resident head and the non-block modules; the swapped tail stays on CPU,
+    which is exactly where ``enable_block_swap`` expects to find it (the H2D offloader
+    re-pins from wherever the sources live, and classic parking re-parks CPU→CPU for free).
+    """
+    n = max(0, min(int(n_swap or 0), len(dit.blocks) - 2))
+    if n <= 0:
+        dit.to(device)
+        return
+    _old = getattr(dit, "_h2d_offloader", None)
+    if _old is not None:
+        # Free the stale GPU ring BEFORE refilling the card — enable_block_swap would release
+        # it too, but only after the head blocks are already up, and on a tight card that
+        # ordering is the difference between fitting and not.
+        _old.release()
+        dit._h2d_offloader = None
+        for _blk in dit.blocks:
+            if hasattr(_blk, "_h2d_offloader"):
+                _blk._h2d_offloader = None
+    keep = len(dit.blocks) - n
+    for i, blk in enumerate(dit.blocks):
+        blk.to(device if i < keep else "cpu")
+    for name, child in dit.named_children():
+        if name != "blocks":
+            child.to(device)
+    for _pn, _p in list(dit._parameters.items()):
+        if _p is not None:
+            _p.data = _p.data.to(device)
+    for _bn, _b in list(dit._buffers.items()):
+        if _b is not None:
+            dit._buffers[_bn] = _b.to(device)
+    dit.enable_block_swap(n)              # rebuilds the H2D ring / re-parks, mode preserved
 
 
 def parse_block_spec(spec, num_blocks: int = None):
@@ -212,6 +262,11 @@ _ACT_GB_NOCKPT = 5.5         # step overhead at 0.25 MP batch 1, no checkpointin
 # for a 1 MP run that actually peaks at 24.6 GB, costing ~4x the step time for nothing.
 _ACT_GB_CKPT = 0.5           # step overhead at 0.25 MP batch 1, checkpointed (measured 0.19)
 _SWAP_TRANSIENT_GB = 7.5     # extra backward-time peak whenever swap is active (measured 7.4 @ n=16)
+# H2D-only streaming (#73) keeps ring_size blocks resident at once (~0.8 GB at ring 2) —
+# inside this transient budget. Re-measure only if diag_h2d_speedup shows the peak moving.
+_H2D_PER_BLOCK_GB = 0.39     # one streamed int8 block's VRAM share (checkpoint header: 0.385)
+_H2D_TRANSIENT_GB = 2.0      # ring (2 x 0.39) + margin — validated on a simulated 16 GB card
+                             # at BOTH 0.25 MP and 1 MP buckets, swap 40 (~1.85 s/it at 1 MP)
 _RESERVE_GB = 1.5            # display / allocator / fragmentation headroom
 # Skipping checkpointing has to EARN it. Measured on H3, recompute costs ~0.1 s/step and saves
 # ~5 GB — so choosing "no checkpointing" on a thin margin trades five gigabytes of headroom for
@@ -302,20 +357,24 @@ def plan_base_quant(free_gb: float, pruned: bool, mp: float = 0.25, adapter_gb: 
 
     Choosing a swap count from VRAM alone, with the quantisation already fixed, produces the
     worst available outcome on mid-range cards: the int8 base is ~21 GB, so a 24 GB card cannot
-    hold it and the planner parks 38 of 50 blocks on CPU — every one of them crossing PCIe every
-    step, for roughly 4x the step time. The same file loaded 4-bit is ~11 GB and needs no swap at
-    all. Krea 2 hit this exact failure and fixed it the same way (see _auto_krea2_strategy):
-    quantisation and swap are one decision.
+    hold it and the old CLASSIC swap parked 38 of 50 blocks on CPU — every one of them
+    round-tripping PCIe every step, ~4x the step time. That trade DIED with the H2D-only
+    streamer (#73, @rintic-13): int8 blocks are frozen, so they stream host->device only, on a
+    copy stream that overlaps compute — measured on the real base at swap 40 (a simulated
+    16 GB card, six epochs): ~1.35 s/it steady, where classic parking ran several times that.
+    So int8 no longer has to fit to be picked.
 
     Order of preference:
-      1. int8, no swap  — the most accurate base (~0.17% error against the reference's own
-                          storage) with no PCIe cost. Always preferred when it fits.
-      2. 4-bit, no swap — trades base accuracy (~9.5% error) for keeping every block resident.
-      3. 4-bit + swap   — 11 GB resident always parks fewer blocks than 21 GB would.
-
-    The trade in step 2 is real and worth stating: a LoRA fitted on a 9.5%-perturbed base spends
-    capacity correcting error that will not exist at inference, and it compounds with depth. It
-    is chosen only when the alternative is most of the model crossing PCIe on every step.
+      1. int8, no swap   — the most accurate base (~0.17% error against the reference's own
+                           storage) with no PCIe cost at all.
+      2. int8 + H2D swap — same accurate base; parked blocks stream one-way with prefetch.
+                           This replaced "4-bit, no swap": a LoRA fitted on NF4's ~9.5%-
+                           perturbed base spends capacity correcting error that will not exist
+                           at inference, and the speed argument for accepting that is gone.
+      3. 4-bit (+classic swap if even 11 GB doesn't fit) — the floor for cards the int8
+                           residual footprint (~5.6 GB of non-streamed weights + activations)
+                           genuinely cannot fit, and for the bf16 checkpoint (no int8 weights
+                           to stream — H2D is ConvRot-specific).
 
     Only applies to a pruned int8 checkpoint — the bf16 file has no int8 weights to keep, so
     there is nothing to choose between.
@@ -328,15 +387,76 @@ def plan_base_quant(free_gb: float, pruned: bool, mp: float = 0.25, adapter_gb: 
                                transient_gb=_INT8_TRANSIENT_GB, adapter_gb=adapter_gb)
     if i_swap == 0:
         return "int8", i_swap, i_ckpt, "int8 fits with no block swap — the most accurate base"
+    # H2D-specific arithmetic — the classic anchors are WRONG for streaming and would refuse
+    # cards that measurably work. Classic swap's 7.5 GB backward transient is engine-held
+    # recompute segments of physically-moving blocks; H2D blocks never move — the transient is
+    # the ring (2 x 0.39 GB) plus margin. And an int8 block frees _H2D_PER_BLOCK_GB = 0.39
+    # (measured from the checkpoint header), not NF4's 0.34. Validated: a simulated 16 GB
+    # card (14.2 GB free) ran swap 40 for six epochs at ~1.35 s/it, peak within budget.
+    _base = _RESIDENT_INT8_GB + _INT8_TRANSIENT_GB + float(adapter_gb)
+    _scale = max(0.25, float(mp)) / 0.25
+    _need = _base + _ACT_GB_CKPT * _scale + _RESERVE_GB + _H2D_TRANSIENT_GB
+    _h2d_swap = int((_need - free_gb) / _H2D_PER_BLOCK_GB + 0.999)
+    if 0 < _h2d_swap <= 40:
+        return ("int8", _h2d_swap, True,
+                f"int8 with {_h2d_swap} blocks streamed H2D-only — the accurate base, and "
+                f"streaming (not parking) keeps the swap cheap")
 
     n_swap, n_ckpt = plan_vram(free_gb, mp=mp, resident_gb=_RESIDENT_PRUNED_GB,
                                adapter_gb=adapter_gb)
-    if n_swap == 0:
-        return ("nf4", n_swap, n_ckpt,
-                f"int8 would need {i_swap} of 50 blocks on CPU (~4x slower); 4-bit fits entirely "
-                f"in VRAM, at ~9% more error in the frozen base")
     return ("nf4", n_swap, n_ckpt,
-            f"neither fits outright — 4-bit parks {n_swap} blocks against int8's {i_swap}")
+            f"too tight even for streamed int8 — 4-bit parks {n_swap} blocks against "
+            f"int8's {i_swap}")
+
+
+def _max_effective_mp(group):
+    """The heaviest single ITEM in the dataset, as effective megapixels: T x H x W per file.
+
+    Header-only: safetensors key names carry the shape, so this is a directory scan and no
+    tensor is read. A still's `latent_HxW` contributes its own area; a clip's `latent_TxHxW`
+    contributes area x T. The per-file PRODUCT is the point — the old form took the largest
+    bucket and the longest T as two separate maxima, which planned a 1 MP stills + tiny-latent
+    voice dataset as ~37 MP and forced a several-times-slower max-swap run for nothing. (A
+    voice item's placeholder is (24, 37, 8, 8): 0.6 effective MP, smaller than one 1 MP still.)
+
+    Returns (max_mp, latent_t_of_that_item); (0.0, 1) when no cache exists yet.
+    """
+    from safetensors import safe_open
+    best_mp, best_t = 0.0, 1
+    seen = set()
+    for ds in getattr(group, "datasets", []):
+        cache_dir = getattr(ds, "cache_directory", None)
+        if not cache_dir or cache_dir in seen or not os.path.isdir(cache_dir):
+            continue
+        seen.add(cache_dir)
+        # Only caches whose stems are CURRENT images — the stale-cache guard's rule, applied
+        # to planning. Without it, a leftover cache from a previous Target Megapixels in the
+        # same dir inflates the plan (seen live: 992x992-era headers made a 0.25 MP run plan
+        # for 0.98 MP — conservative direction, but the plan should describe THIS run).
+        _stems = None
+        _img_dir = getattr(ds, "image_directory", None)
+        if _img_dir and os.path.isdir(_img_dir):
+            _stems = {os.path.splitext(f)[0] for f in os.listdir(_img_dir)}
+        for name in os.listdir(cache_dir):
+            if not name.endswith(".safetensors"):
+                continue
+            if _stems is not None:
+                _stem = "_".join(name.split("_")[:-2])       # {basename}_{WxH}_{arch}
+                if _stem and _stem not in _stems:
+                    continue
+            try:
+                with safe_open(os.path.join(cache_dir, name), framework="pt") as f:
+                    for k in f.keys():
+                        if k.startswith("latent_") and not k.startswith("latent_control_"):
+                            dims = [int(d) for d in k[len("latent_"):].split("x")]
+                            t = dims[0] if len(dims) == 3 else 1
+                            h, w = dims[-2], dims[-1]
+                            mp = t * (h * 16) * (w * 16) / 1e6
+                            if mp > best_mp:
+                                best_mp, best_t = mp, t
+            except Exception:
+                continue                      # unreadable cache: the caching pass will say so
+    return best_mp, best_t
 
 
 def plan_vram(free_gb: float, mp: float = 0.25, batch: int = 1, resident_gb: float = None,
@@ -454,13 +574,30 @@ def sample_sigmas(batch: int, device, shift=None, generator=None,
 
 def compute_loss(model, latent: torch.Tensor, text_embeds: torch.Tensor, *,
                  sigma: torch.Tensor = None, shift: float = None, generator=None,
-                 noise: torch.Tensor = None):
-    """One image-training step's loss.
+                 noise: torch.Tensor = None, audio_latent: torch.Tensor = None,
+                 audio_weight: float = 1.0, video_weight: float = 1.0,
+                 parts_out: dict = None):
+    """One training step's loss.
 
-    latent      : [1, 24, 1, H, W] clean VAE latent (x0).
+    latent      : [1, 24, T, H, W] clean VAE latent (x0). T=1 is a still.
     text_embeds : [1, L, text_dim] Qwen3-VL states.
     noise       : optional fixed noise (reproducible steps / tests); else sampled.
-    Returns (loss, sigma_used) — MSE of the DiT's video_out against (x0 - noise).
+    audio_latent: optional [A*2, 32] clean audio rows (channel-major, as cached). Given, the
+                  audio stream gets a REAL target instead of silence and its error joins the
+                  loss. Absent — a still, or a clip the user muted — nothing changes: the rows
+                  are still packed as noised silence so the frozen base runs in the layout it
+                  was trained in, they simply contribute no gradient.
+    audio_weight: multiplier on the audio term. Audio is only ~4% of the packed sequence at any
+                  clip length, so an unweighted term barely moves; this is the dial for that,
+                  and it starts at parity until a measurement says otherwise.
+    video_weight: multiplier on the video term — 0 for an audio-only voice item, whose video
+                  latent is a zeros placeholder. At 0 the video loss never enters the graph:
+                  MSE against the dataset-mean latent is a real, wrong gradient ("every frame
+                  looks like the average"), not a harmless no-op.
+
+    Returns (loss, sigma_used). parts_out, if given, receives the video and audio terms
+    separately — they are on different noise schedules and averaging them into one number hides
+    which stream is actually learning.
     """
     if latent.shape[0] != 1:
         raise ValueError("MiniMax H3 image training is batch size 1")
@@ -488,9 +625,256 @@ def compute_loss(model, latent: torch.Tensor, text_embeds: torch.Tensor, *,
 
     noised = (1.0 - s) * x0 + s * noise
     t = (1.0 - sigma).to(device)
-    pred = model(noised.to(latent.dtype), t, text_embeds)
-    target = (x0 - noise).to(pred.dtype)
-    return F.mse_loss(pred.float(), target.float()), float(sigma.reshape(-1)[0])
+
+    if audio_latent is None:
+        pred = model(noised.to(latent.dtype), t, text_embeds)
+        loss = F.mse_loss(pred.float(), (x0 - noise).to(pred.dtype).float())
+        if parts_out is not None:
+            parts_out.update(video=float(loss.detach()), audio=None)
+        if video_weight != 1.0:              # degenerate (an audio item missing its rows) but honest
+            loss = video_weight * loss
+        return loss, float(sigma.reshape(-1)[0])
+
+    # The audio stream denoises on its OWN schedule — shift 3 against video's 12 — and
+    # remap_sigma is the closed form that keeps the two at the same underlying point. Noising the
+    # audio rows at the VIDEO sigma would put the stream somewhere the base has never seen it,
+    # and the frozen model would spend the step disagreeing with the layout rather than learning.
+    from fizgig.minimax.model import remap_sigma
+    sigma_v = float(sigma.reshape(-1)[0])
+    sigma_a = float(remap_sigma(torch.tensor(sigma_v)))
+
+    a0 = audio_latent.to(device=device, dtype=torch.float32)
+    a_noise = torch.randn(a0.shape, device=device, generator=generator, dtype=torch.float32)
+    a_noised = (1.0 - sigma_a) * a0 + sigma_a * a_noise
+
+    pred, pred_a = model(noised.to(latent.dtype), t, text_embeds,
+                         audio_rows=a_noised, return_audio=True)
+    v_loss = F.mse_loss(pred.float(), (x0 - noise).to(pred.dtype).float())
+    if pred_a is None:                      # pack_audio_rows off — nothing to train against
+        if parts_out is not None:
+            parts_out.update(video=float(v_loss.detach()), audio=None)
+        return video_weight * v_loss, sigma_v
+    a_loss = F.mse_loss(pred_a.float(), (a0 - a_noise).float())
+    if parts_out is not None:
+        parts_out.update(video=float(v_loss.detach()), audio=float(a_loss.detach()),
+                         sigma_audio=sigma_a)
+    if video_weight == 0.0:
+        # Not `0 * v_loss`: the multiplied form still builds the video branch's backward graph
+        # and autograd walks it for nothing. The audio term alone IS this item's loss.
+        return audio_weight * a_loss, sigma_v
+    if video_weight != 1.0:
+        return video_weight * v_loss + audio_weight * a_loss, sigma_v
+    return v_loss + audio_weight * a_loss, sigma_v
+
+
+def _find_ffmpeg():
+    try:
+        import imageio_ffmpeg
+        return imageio_ffmpeg.get_ffmpeg_exe()
+    except Exception:
+        import shutil
+        return shutil.which("ffmpeg")
+
+
+def write_preview_mp4(path, frames, wav_path, fps=24):
+    """Mux decoded preview frames [3, F, H, W] in [0,1] with their wav into a playable mp4.
+
+    The gallery plays THIS for samples with sound — a real clip at the true frame rate with
+    its soundtrack, instead of a scrub slider plus a separate audio player. Raises on any
+    failure; the caller treats the mp4 as a nicety."""
+    import subprocess
+    ffmpeg = _find_ffmpeg()
+    if not ffmpeg:
+        raise RuntimeError("no ffmpeg available")
+    f, h, w = frames.shape[1], frames.shape[2], frames.shape[3]
+    raw = (frames.permute(1, 2, 3, 0).clamp(0, 1) * 255).byte().cpu().numpy().tobytes()
+    cmd = [ffmpeg, "-y", "-hide_banner", "-loglevel", "error",
+           "-f", "rawvideo", "-pix_fmt", "rgb24", "-s", f"{w}x{h}", "-r", str(fps), "-i", "-",
+           "-i", wav_path,
+           "-c:v", "libx264", "-crf", "18", "-preset", "veryfast", "-pix_fmt", "yuv420p",
+           "-c:a", "aac", "-b:a", "192k", "-shortest", "-movflags", "+faststart", path]
+    p = subprocess.run(cmd, input=raw, capture_output=True,
+                       creationflags=0x08000000 if os.name == "nt" else 0)
+    if p.returncode != 0 or not os.path.isfile(path):
+        raise RuntimeError((p.stderr or b"").decode("utf-8", "replace")[-300:]
+                           or "ffmpeg failed")
+
+
+_PREVIEW_RUNGS = (1536, 1280, 1024, 768, 640, 512)
+
+
+def _rung_below(v):
+    for r in _PREVIEW_RUNGS:
+        if r < v:
+            return r
+    return v
+
+
+def next_preview_res(w, h):
+    """One rung down the preview OOM ladder, walking the STANDARD resolutions: the taller
+    axis drops to the next standard size first, then the other — 1024x1024 -> 1024x768 ->
+    768x768 -> 768x640 -> 640x640 -> 640x512 -> 512x512 (Peter). Floors at 512; returns
+    the same pair when nothing is below (the caller re-raises then)."""
+    if h >= w and h > 512:
+        nh = _rung_below(h)
+        if nh < h:
+            return w, nh
+    if w > 512:
+        nw = _rung_below(w)
+        if nw < w:
+            return nw, h
+    if h > 512:
+        nh = _rung_below(h)
+        if nh < h:
+            return w, nh
+    return w, h
+
+
+def write_wav(path, wav, sample_rate=32000):
+    """[2, L] float waveform in [-1, 1] -> 16-bit interleaved stereo wav. Stdlib only."""
+    import wave as _wave
+    data = (wav.detach().float().clamp(-1, 1) * 32767.0).to(torch.int16)
+    with _wave.open(path, "wb") as f:
+        f.setnchannels(int(data.shape[0]))
+        f.setsampwidth(2)
+        f.setframerate(int(sample_rate))
+        f.writeframes(data.t().contiguous().numpy().tobytes())
+
+
+_EGRID_CACHE = [None]
+
+
+def _load_h3_egrid():
+    """The full model's silu(t_emb) rows on a 1025-point t grid, [1025, 2688].
+
+    Bundled from larryvrh's ComfyUI-MiniMax-H3-Turbo node (Apache-2.0) — it exists because
+    the PRUNED base collapsed the time embedder into an 8-wide curve table, so silu(t_emb)
+    cannot be computed from the loaded weights; the grid is the full model's answer,
+    precomputed."""
+    if _EGRID_CACHE[0] is None:
+        import fizgig
+        from safetensors.torch import load_file
+        p = os.path.join(os.path.dirname(fizgig.__file__), "assets",
+                         "h3_silu_temb_grid.safetensors")
+        _EGRID_CACHE[0] = load_file(p)["silu_t_emb_grid"]
+    return _EGRID_CACHE[0]
+
+
+def _turbo_adaln_forward(base, A, B, table, egrid):
+    """A replacement AdalnProj.forward that adds the Turbo's AdaLN update.
+
+    The update lives in the full model's silu(t_emb) space; the pruned base only has curve
+    rows, so each incoming t_emb row is matched to its nearest table row (the model built it
+    by lerping adjacent rows — half a grid step of error at worst, larryvrh's own approach)
+    and the corresponding full-width grid row stands in: x += B @ A @ silu(t_emb). Strength
+    is folded into B at collection time."""
+    def forward(t_emb):
+        import torch.nn.functional as _F
+        x = base.linear(_F.silu(t_emb) if base.apply_silu else t_emb)
+        idx = torch.cdist(t_emb.detach().float(),
+                          table.to(t_emb.device, torch.float32)).argmin(dim=1)
+        st = egrid.to(t_emb.device)[idx].to(x.dtype)
+        x = x + (B.to(x) @ (A.to(x) @ st.T)).T
+        x = x.view(x.shape[0] * base.modalities, base.expand * base.hidden)
+        return x.chunk(base.expand, dim=-1)
+    return forward
+
+
+def turbo_adaln_patch(dit, pairs, device, dtype, egrid=None):
+    """Install the AdaLN injection for the preview render. Returns modules patched.
+
+    Instance-attribute forwards, like the reference node: assignment shadows the class
+    method, deletion restores it — the module tree is never rebuilt, and a training AdaLN
+    adapter wrapped around .linear keeps firing because the replacement still calls
+    base.linear."""
+    if not pairs or not getattr(dit, "pruned_adaln", False):
+        return 0
+    egrid = _load_h3_egrid() if egrid is None else egrid
+    table = dit.adaln_t_table
+    if table.shape[0] != egrid.shape[0]:
+        logger.warning(f"[turbo] adaln grid rows {egrid.shape[0]} != table rows "
+                       f"{table.shape[0]} — adaln injection skipped")
+        return 0
+    eg = egrid.to(device)
+    n = 0
+    for mod, A, B in pairs:
+        if A.shape[1] != eg.shape[1]:
+            continue
+        mod.forward = _turbo_adaln_forward(mod, A.to(device, dtype), B.to(device, dtype),
+                                           table, eg)
+        n += 1
+    return n
+
+
+def turbo_adaln_unpatch(pairs):
+    """Remove the injection (idempotent) — the class forward comes back, and the GPU copies
+    of A/B/grid die with the closures."""
+    for mod, _a, _b in pairs:
+        try:
+            del mod.forward
+        except AttributeError:
+            pass
+
+
+def load_preview_turbo(dit, path, strength):
+    """The Turbo LoRA, wired for previews: applied ONCE to the live DiT with every module
+    DISABLED, weights parked on CPU. The preview phase flips `enabled` on and moves the
+    weights to the GPU; afterwards both revert. A disabled LoRAInfModule's forward is a pure
+    passthrough that never touches its weights, so the training step pays one Python branch
+    per wrapped Linear and nothing else — no weight surgery on the training model, ever.
+
+    Returns (network, adaln_pairs). The file's backbone modules are prefiltered to Linears
+    that exist on THIS base with matching shapes. Its AdaLN modules (2688-wide, full-model
+    space) cannot be hosted by the pruned curve-table base as weight modules — but they are
+    NOT discarded: they carry the per-timestep modulation for the video AND audio streams,
+    and dropping them is what made few-step audio fall apart (Peter; same finding as
+    larryvrh's dedicated loader node). They come back as (adaln_module, A, B*strength)
+    pairs for turbo_adaln_patch's run-time injection during previews."""
+    from safetensors.torch import load_file
+    from fizgig.networks.lora import (create_network_from_weights,
+                                      ensure_kohya_lora_state_dict)
+    sd = ensure_kohya_lora_state_dict(load_file(path))
+    linears = {f"lora_unet_{n.replace('.', '_')}": m
+               for n, m in dit.named_modules() if isinstance(m, torch.nn.Linear)}
+    adaln_parents = {f"lora_unet_{n.replace('.', '_')}_linear": m
+                     for n, m in dit.named_modules()
+                     if type(m).__name__ == "AdalnProj"}
+    keep, adaln_pairs, dropped = {}, [], []
+    for name in sorted({k.split(".")[0] for k in sd}):
+        m = linears.get(name)
+        down = sd.get(f"{name}.lora_down.weight")
+        up = sd.get(f"{name}.lora_up.weight")
+        if down is None or up is None:
+            dropped.append(name)
+            continue
+        if (m is not None and down.shape[1] == m.in_features
+                and up.shape[0] == m.out_features):
+            for suf in (".lora_down.weight", ".lora_up.weight", ".alpha"):
+                if f"{name}{suf}" in sd:
+                    keep[f"{name}{suf}"] = sd[f"{name}{suf}"]
+            continue
+        ap = adaln_parents.get(name)
+        if ap is not None and up.shape[0] == ap.linear.out_features:
+            # full-model AdaLN rows: hosted at preview time by the e-grid injection
+            adaln_pairs.append((ap, down.clone(), up.clone() * float(strength)))
+            continue
+        dropped.append(name)
+    if not keep:
+        raise RuntimeError("no module in this LoRA matches the loaded base — wrong file?")
+    net = create_network_from_weights(None, float(strength), keep, None, dit,
+                                      for_inference=True)
+    net.apply_to(text_encoders=None, unet=dit, apply_text_encoder=False, apply_unet=True)
+    # AFTER apply_to, or the modules keep their zero init and contribute nothing — the same
+    # trap the Krea 2 context-LoRA path documents.
+    net.load_state_dict(keep, strict=False)
+    net.requires_grad_(False)
+    for m in net.unet_loras:
+        m.enabled = False
+    logger.info(f"[turbo] {len(net.unet_loras)} modules wired at strength {strength:g}"
+                + (f" + {len(adaln_pairs)} adaln via run-time injection"
+                   if adaln_pairs else "")
+                + (f" ({len(dropped)} skipped)" if dropped else ""))
+    return net, adaln_pairs
 
 
 @contextlib.contextmanager
@@ -1329,6 +1713,51 @@ def _validate_state_dir(state_dir):
     raise RuntimeError(os.linesep.join(lines))
 
 
+def resume_network_shape(state_dir, network_type, network_dim, network_alpha, lokr_factor):
+    """The network shape a RESUME must build: the checkpoint's, not the GUI's.
+
+    The state dir carries the adapter exactly as it trained; rebuilding from whatever the
+    boxes say NOW crashed the relaunch the moment settings had moved on (a rank-8 pause
+    resumed under a rank-16 preset died on a size-mismatch wall, Peter 17 Aug). This reads
+    the shape out of the saved lora.safetensors — parametrization by key suffix, LoKR factor
+    from w1, rank/alpha from a non-AdaLN module (AdaLN's rank caps at 8, so it lies about
+    the network's dim) — and returns (type, dim, alpha, factor, notes). The caller logs the
+    notes and builds THAT network; a resume continues the run it resumes."""
+    path = os.path.join(state_dir, "lora.safetensors")
+    notes = []
+    if not os.path.isfile(path):
+        return network_type, network_dim, network_alpha, lokr_factor, notes
+    from safetensors import safe_open
+    with safe_open(path, framework="pt", device="cpu") as f:
+        keys = list(f.keys())
+        if any(k.endswith(".lokr_w1") for k in keys):
+            if network_type != "lokr":
+                notes.append(f"the checkpoint is LoKR — overriding the configured "
+                             f"{network_type}")
+                network_type = "lokr"
+            w1 = f.get_slice(next(k for k in keys if k.endswith(".lokr_w1")))
+            if int(w1.get_shape()[0]) != int(lokr_factor):
+                notes.append(f"LoKR factor {int(w1.get_shape()[0])} from the checkpoint "
+                             f"(configured: {lokr_factor})")
+                lokr_factor = int(w1.get_shape()[0])
+        else:
+            if network_type != "lora":
+                notes.append(f"the checkpoint is a standard LoRA — overriding the "
+                             f"configured {network_type}")
+                network_type = "lora"
+            dk = next((k for k in keys if k.endswith(".lora_down.weight")
+                       and "adaln" not in k), None)
+            if dk is not None:
+                dim = int(f.get_slice(dk).get_shape()[0])
+                ak = dk.replace(".lora_down.weight", ".alpha")
+                alpha = float(f.get_tensor(ak)) if ak in keys else float(dim)
+                if dim != int(network_dim) or abs(alpha - float(network_alpha)) > 1e-6:
+                    notes.append(f"rank {dim}/alpha {alpha:g} from the checkpoint "
+                                 f"(configured: {network_dim}/{float(network_alpha):g})")
+                    network_dim, network_alpha = dim, alpha
+    return network_type, network_dim, network_alpha, lokr_factor, notes
+
+
 def _load_training_state(state_dir, network, optimizer, *, device):
     """Restore network + optimizer + RNG from a state dir. Returns (start_epoch, global_step, meta)."""
     _validate_state_dir(state_dir)
@@ -1431,6 +1860,10 @@ def train_minimax(
     optimizer_type: str = "adamw8bit",
     optimizer_args: str = "",
     caption_dropout: float = 0.05,
+    # Clips with sound only. Audio is ~4% of the packed sequence at any clip length, so parity
+    # may well be too quiet to teach anything — but it starts there, and moves on a measurement
+    # rather than a guess. The per-epoch [audio] line reports the share it is actually winning.
+    audio_weight: float = 1.0,
     base_quant: str = "auto",
     include_patterns: list = None,
     train_blocks: str = None,        # "14-37" = train only that block range (experiment)
@@ -1448,6 +1881,17 @@ def train_minimax(
     slow_block_lr_scale: float = 1.0,  # the multiplier applied to those blocks' LR
     quantize: bool = True,           # NF4 the base (QLoRA); False = bf16 base (needs ~66 GB VRAM)
     shift: float = None,             # None = auto resolution schedule (logit-normal); float = legacy
+    highnoise_lr_scale: float = 1.0,  # LR multiplier for steps above sigma 0.5; 1.0 = unchanged
+    # Mixed visual+voice datasets: each category can retire at its own epoch, because the two
+    # need not converge together (a much smaller category can finish, or start to overbake,
+    # well before the larger one). "anchor" keeps the
+    # retired category training at ANCHOR_LR_SCALE — rehearsal against drift on the shared
+    # adapters, and its epoch ledger stays live as the drift alarm; "stop" skips its steps
+    # entirely (faster epochs, blind). 0 = never retire.
+    visual_stop_epoch: int = 0,
+    visual_stop_mode: str = "anchor",
+    audio_stop_epoch: int = 0,
+    audio_stop_mode: str = "anchor",
     blocks_to_swap="auto",           # "auto" | int — park the last N blocks on CPU between uses
     gradient_checkpointing="auto",   # "auto" | "on" | "off" — forced on when swap > 0
     adaptive_lr: bool = False,
@@ -1471,6 +1915,14 @@ def train_minimax(
     sample_frames: int = 1,      # pixel frames on the 17n+5 grid; 1 = classic still
     sample_negative: str = None,
     sample_seed: int = 42,
+    # Turbo LoRA for previews ONLY: applied once with every module disabled, flipped on for
+    # the sampling phase, off again after. The training math never sees it.
+    turbo_lora_path: str = None,
+    turbo_lora_strength: float = 0.75,
+    # Previews with sound: decode the jointly-denoised audio rows to a .wav beside each clip
+    # sample. Needs the audio VAE (its decoder half); silently off without it.
+    sample_audio: bool = False,
+    audio_vae_path: str = None,
     # Output metadata (recorded in the saved LoRA).
     metadata_title: str = None,
     metadata_author: str = None,
@@ -1489,7 +1941,7 @@ def train_minimax(
                                        generate_dataset_group_by_blueprint, load_user_config)
     from fizgig.networks.lora import create_network
     from fizgig.training.optimizers import create_optimizer
-    from fizgig.training.train_utils import LossRecorder
+    from fizgig.training.train_utils import LossRecorder, validate_output_name
     from fizgig.training.metadata import build_metadata, resolve_title, ARCHITECTURE_MINIMAX
     from fizgig.minimax.loader import load_minimax_h3_dit
     from tqdm import tqdm
@@ -1502,6 +1954,7 @@ def train_minimax(
     # waits until the model is up (that is when the real block count is known).
     if train_blocks:
         parse_block_spec(train_blocks)
+    validate_output_name(output_name)          # same reason, one epoch later otherwise (#70)
 
     # ---- dataset (built from the caches the two cache scripts wrote) ----
     shared_epoch = Value("i", 0)
@@ -1530,11 +1983,32 @@ def train_minimax(
         logger.info(f"[timesteps] explicit shift={shift} — uniform-u map.")
 
     # ---- VRAM plan: block swap + gradient checkpointing (before the base loads) ----
+    # A CLIP costs its spatial size TIMES its latent frames, and the planner's activation term is
+    # linear in exactly that — so the plan is built from the heaviest single ITEM's product, read
+    # from the cache headers. The bucket alone makes a 124-frame run look like the still it is
+    # one frame of; two separate maxima (largest bucket x longest T) would charge a 1 MP stills +
+    # voice dataset for a 37 MP step that no item performs.
+    #
+    # Measured, 0.25 MP buckets, gradient checkpointing on: activations run 1.7 GiB at 22 frames
+    # to 9.2 at 124, dead linear. Left as the bucket size, a 32 GB card is told it can afford
+    # int8 (19.8 GiB resident), the 124-frame step then peaks at 28.9 of 31.8 and the allocator
+    # thrashes: 300 s a step against 17.7 s for the same step on NF4. Not an error — just a run
+    # that never finishes, for want of telling the planner what it was planning for.
     _mp = 0.25
     try:
-        _mp = max(w * h / 1e6 for ds in group.datasets for (w, h) in ds.batch_manager.bucket_resos)
+        # Bucket fallback for when no cache exists yet. key[-2:] rather than unpacking the
+        # key: the audio sentinel is ("audio", w, h) and a bare (w, h) unpack would throw,
+        # silently leaving the whole estimate at 0.25.
+        _mp = max(key[-2] * key[-1] / 1e6
+                  for ds in group.datasets for key in ds.batch_manager.bucket_resos)
     except Exception:
         pass
+    _eff_mp, _clip_t = _max_effective_mp(group)
+    if _eff_mp > 0:
+        _mp = _eff_mp
+    if _clip_t > 1:
+        logger.info(f"[vram] the heaviest item is a {_clip_t}-latent-frame clip — planning "
+                    f"against its effective {_mp:.2f} MP (spatial size x frames).")
     _ckpt_req = str(gradient_checkpointing).lower()
     _base_mode = (base_quant if base_quant != "auto"
                   else ("int8" if is_pruned_checkpoint(dit_path) else "nf4"))
@@ -1542,7 +2016,8 @@ def train_minimax(
         _base_mode = "none"
     if str(blocks_to_swap).lower() == "auto":
         if torch.cuda.is_available() and quantize:
-            _free_gb = torch.cuda.mem_get_info()[0] / 1e9
+            from fizgig.utils.device import plannable_free_vram
+            _free_gb = plannable_free_vram()   # honours FIZGIG_SIM_VRAM_GB
             _pruned = is_pruned_checkpoint(dit_path)
             # The adapter is NOT a rounding error and it is not fixed: LoKR 8 trains ~313 M
             # parameters against a rank-16 LoRA's ~75 M, and fp32 Adam state is 4x the 8-bit
@@ -1664,9 +2139,20 @@ def train_minimax(
                               adaln_fp32=not train_adaln)
     dit.requires_grad_(False)                                   # frozen base (QLoRA-style)
     if n_swap > 0:
-        n_swap = dit.enable_block_swap(n_swap)                  # sets the JIT-move boundary
-        logger.info(f"[vram] block swap active: last {n_swap} blocks parked on CPU "
-                    f"(~{n_swap * 0.34:.1f} GB VRAM freed, packed NF4 in RAM)")
+        # int8 bases stream H2D-only (#73, @rintic-13): the base is frozen, so the classic
+        # swap's writeback half was always waste — a ring buffer + copy stream prefetches
+        # each block while the previous computes. NF4 keeps the classic parking (the
+        # offloader is ConvRot-specific). The later preview-restore calls re-enter
+        # enable_block_swap bare and inherit this mode.
+        _use_h2d = (_base_mode == "int8")
+        n_swap = dit.enable_block_swap(n_swap, h2d_only=_use_h2d, ring_size=2)
+        if _use_h2d:
+            logger.info(f"[vram] block swap active: last {n_swap} blocks streamed H2D-only "
+                        f"(int8, ring 2, ~{n_swap * 0.39:.1f} GB pinned in RAM) — no "
+                        f"writeback, prefetch overlaps compute")
+        else:
+            logger.info(f"[vram] block swap active: last {n_swap} blocks parked on CPU "
+                        f"(~{n_swap * 0.34:.1f} GB VRAM freed, packed NF4 in RAM)")
     if use_ckpt:
         dit.enable_gradient_checkpointing()
         logger.info("[vram] gradient checkpointing ON")
@@ -1708,6 +2194,14 @@ def train_minimax(
                 " + AdaLN (deploy-consistent on this build; rank caps at 8)" if _adaln_on
                 else (" (AdaLN excluded - turned off for this run)" if dit.pruned_adaln
                       else " (AdaLN excluded - dropped by pruned inference builds)"))
+    if resume_state_dir:
+        # A resume builds the CHECKPOINT'S network, whatever the boxes say now — settings
+        # that moved on since the pause used to crash the relaunch on a size-mismatch wall.
+        network_type, network_dim, network_alpha, lokr_factor, _rs_notes = \
+            resume_network_shape(resume_state_dir, network_type, network_dim,
+                                 network_alpha, lokr_factor)
+        for _n in _rs_notes:
+            logger.warning(f"[resume] {_n} — a resume continues the run it resumes")
     if network_type == "lokr":
         # LoKR (Kronecker) — same mechanism as Krea 2's: module_class swaps the parametrization
         # inside the identical scan/wrap machinery, so include_patterns (adaln exclusion) and the
@@ -1756,6 +2250,54 @@ def train_minimax(
             f"of the model.")
     _n_targeted = len(_targeted)
     logger.info(f"[network] {len(network.unet_loras)}/{_n_targeted} targeted Linears wrapped")
+
+    # The preview Turbo LoRA — a nicety, never a run-killer: any failure logs and trains on.
+    turbo_net = None
+    turbo_adaln = []
+    if turbo_lora_path:
+        if not os.path.isfile(turbo_lora_path):
+            logger.warning(f"[turbo] file not found — previews render without it: "
+                           f"{turbo_lora_path}")
+        else:
+            try:
+                turbo_net, turbo_adaln = load_preview_turbo(dit, turbo_lora_path,
+                                                            turbo_lora_strength)
+                logger.info(f"[turbo] previews render with "
+                            f"{os.path.basename(turbo_lora_path)} at "
+                            f"{turbo_lora_strength:g} x {sample_steps} steps")
+            except Exception as _te:
+                logger.warning(f"[turbo] could not load ({type(_te).__name__}: {_te}) — "
+                               f"previews render without it")
+        if turbo_net is None and sample_steps < 20:
+            # The launched command carried the TURBO pace — a few steps only make sense with
+            # the Turbo applied, and rendering the fallback at 6 would produce mush and read
+            # as a broken LoRA (Peter). Standard pass instead, said out loud.
+            logger.warning(f"[turbo] previews fall back to the standard pass: {sample_steps} "
+                           f"steps was the Turbo pace — using 20 instead")
+            sample_steps = 20
+
+    # Previews with sound: the audio VAE's DECODER half, loaded once on first use and parked
+    # on CPU (~0.45 GB RAM) between previews. Any failure means silent samples, never a dead
+    # run.
+    _audio_dec_state = {"dec": None, "tried": False}
+
+    def _get_audio_decoder():
+        if _audio_dec_state["tried"]:
+            return _audio_dec_state["dec"]
+        _audio_dec_state["tried"] = True
+        if not (audio_vae_path and os.path.isfile(audio_vae_path)):
+            logger.warning("[preview] sound requested but the audio VAE path is not set — "
+                           "samples render silent (Preferences → Audio VAE)")
+            return None
+        try:
+            from fizgig.minimax.audio_vae import load_minimax_h3_audio_vae_decoder
+            _audio_dec_state["dec"] = load_minimax_h3_audio_vae_decoder(
+                audio_vae_path, device="cpu")
+            logger.info("[preview] audio decoder loaded — clip samples carry a .wav")
+        except Exception as _ae:
+            logger.warning(f"[preview] audio decoder failed to load "
+                           f"({type(_ae).__name__}: {_ae}) — samples render silent")
+        return _audio_dec_state["dec"]
 
     params = list(network.get_trainable_params())
 
@@ -1975,7 +2517,39 @@ def train_minimax(
                            f"nothing left to train. Writing the final LoRA from the restored "
                            f"state. To train further, raise Max Train Epochs and resume again.")
 
-    if warmup_steps > 0 or ramp is not None or _p1_epochs:
+    # Steps drawn above sigma 0.5 — the noisy half, where pose and composition are decided — can
+    # be damped relative to the clean-end steps that carry identity. It has to scale the
+    # OPTIMIZER'S LR and not the loss: Adam's update is m / (sqrt(v) + eps), which is invariant to
+    # a constant factor on the gradient, so a loss multiplier here would do essentially nothing
+    # while reading as though it worked.
+    _hn_scale = float(highnoise_lr_scale)
+    _hn_active = abs(_hn_scale - 1.0) > 1e-9
+    _band_acc = []                       # this window's multipliers; averaged at the step
+    if _hn_active:
+        logger.info(f"[lr] steps above sigma {MINIMAX_LOWNOISE_SIGMA:g} train at "
+                    f"{_hn_scale * 100:.0f}% of the learning rate.")
+
+    # Per-category retirement (mixed visual+voice datasets). The anchor multiplies
+    # param_group["lr"] through the same composed product as everything else — NEVER the loss:
+    # Adam's update is m/(sqrt(v)+eps), invariant to a constant on the gradient, so a loss
+    # multiplier reads as a working throttle and changes almost nothing (measured in
+    # tests/test_minimax_highnoise_lr.py; realized travel is the only honest check).
+    _vis_stop = max(0, int(visual_stop_epoch or 0))
+    _aud_stop = max(0, int(audio_stop_epoch or 0))
+    _cat_acc = []                        # this window's per-category multipliers
+    _retire_active = bool(_vis_stop or _aud_stop)
+    if _vis_stop:
+        logger.info(f"[retire] photos & clips after epoch {_vis_stop}: "
+                    + (f"anchored at {ANCHOR_LR_SCALE * 100:.0f}% LR (drift guard, ledger "
+                       f"stays live)" if visual_stop_mode == "anchor" else
+                       "stopped entirely (faster epochs)"))
+    if _aud_stop:
+        logger.info(f"[retire] voice recordings after epoch {_aud_stop}: "
+                    + (f"anchored at {ANCHOR_LR_SCALE * 100:.0f}% LR (drift guard, ledger "
+                       f"stays live)" if audio_stop_mode == "anchor" else
+                       "stopped entirely (faster epochs)"))
+
+    if warmup_steps > 0 or ramp is not None or _p1_epochs or _hn_active or _retire_active:
         # Stashed AFTER the resume block: optimizer.load_state_dict replaces the param-group
         # dicts, so a stash made earlier would not survive a resume. Derived from the CONFIGURED
         # rate (x the group's depth-split scale), not the group's current lr, which a resumed
@@ -2003,10 +2577,19 @@ def train_minimax(
         interpretation completely, and one of which (58 of 258 modules) had been a silent bug.
         A LoRA that cannot describe its own run is a measurement you have to take on trust."""
         try:
-            _res = sorted({f"{w}x{h}" for ds in group.datasets
-                           for (w, h) in ds.batch_manager.bucket_resos})
+            # key[-2:], not an unpack: the audio sentinel key is ("audio", w, h), and a bare
+            # (w, h) unpack would throw and silently blank EVERY resolution out of the metadata.
+            _res = sorted({("voice" if isinstance(key[0], str) else f"{key[-2]}x{key[-1]}")
+                           for ds in group.datasets for key in ds.batch_manager.bucket_resos})
         except Exception:
             _res = []
+        try:
+            from fizgig.minimax.audio import is_audio as _is_af
+            _n_voice = sum(1 for ds in group.datasets
+                           for p in getattr(getattr(ds, "datasource", None), "image_paths", []) or []
+                           if _is_af(p))
+        except Exception:
+            _n_voice = 0
         _dens = ("shift12" if shift is None else
                  shift if isinstance(shift, str) else f"shift{shift:g}")
         return {
@@ -2019,6 +2602,7 @@ def train_minimax(
             "ss_learning_rate": f"{learning_rate:g}",
             "ss_optimizer": optimizer_label,
             "ss_timestep_density": _dens,
+            "ss_highnoise_lr_scale": f"{float(highnoise_lr_scale):g}",
             "ss_train_blocks": _blocks_used,
             "ss_train_adaln": "1" if _adaln_on else "0",
             "ss_distill": "dataset" if distill else "off",
@@ -2039,6 +2623,9 @@ def train_minimax(
                 os.path.basename(str(getattr(d, "image_directory", "") or "").rstrip("/\\"))
                 for d in group.datasets),
             "ss_max_grad_norm": f"{max_grad_norm:g}",
+            "ss_audio_only_items": str(_n_voice),
+            "ss_visual_stop": (f"{_vis_stop}:{visual_stop_mode}" if _vis_stop else "off"),
+            "ss_audio_stop": (f"{_aud_stop}:{audio_stop_mode}" if _aud_stop else "off"),
             "ss_bucket_resolutions": ",".join(_res),
             "ss_gradient_checkpointing": "1" if use_ckpt else "0",
             "ss_blocks_swapped": str(n_swap),
@@ -2079,7 +2666,8 @@ def train_minimax(
         restore it (and its block-swap split). That is a ~21 GB round trip, which is why the
         result is cached against the prompt text and only paid when you actually change it."""
         from fizgig.minimax.sampling import encode_sample_prompts
-        _free = (torch.cuda.mem_get_info()[0] / 1e9) if torch.cuda.is_available() else 0.0
+        from fizgig.utils.device import plannable_free_vram
+        _free = plannable_free_vram() if torch.cuda.is_available() else 0.0
         _park = torch.cuda.is_available() and _free < 17.0     # TE + headroom
         if _park:
             logger.info(f"[sample override] parking the base on CPU to fit the text encoder "
@@ -2091,9 +2679,7 @@ def train_minimax(
             return encode_sample_prompts(te_path, [prompt], device=device, quantize=quantize)
         finally:
             if _park:
-                dit.to(device)
-                if n_swap > 0:
-                    dit.enable_block_swap(n_swap)   # restores the parked-block split
+                restore_parked_dit(dit, device, n_swap)   # swap-aware: never the whole base
                 gc.collect()
                 torch.cuda.empty_cache()
 
@@ -2104,25 +2690,42 @@ def train_minimax(
     # state the failure handlers can lower.
     _clip_state = {"frames": max(1, int(sample_frames or 1)), "notice_done": False,
                    "slow_done": False}
+    # An OOM'd preview downgrades its resolution one ladder rung and retries; the cap is
+    # STICKY so later epochs don't re-OOM their way down the same ladder every time.
+    _res_cap = {"wh": None, "warned": False}
 
     def _slow_step_notice(seconds, step, total):
-        """Told once when a preview step runs absurdly long.
+        """Told once per render when a preview step runs absurdly long.
 
         A preview that does not fit in VRAM does NOT raise on Windows — the driver pages to
-        system RAM and the render succeeds at roughly a hundred times the cost, so the
-        clip->stills fallback (which is exception-driven) never fires and the run looks hung.
-        Wall time is the only symptom that survives, so it is what we watch."""
+        system RAM and the render succeeds at roughly a hundred times the cost. Wall time is
+        the only symptom that survives, so it is what we watch — and when the ladder still
+        has a rung below (a shorter clip first, then a resolution step), we don't just
+        advise: returning True aborts the render and the preview loop retries one rung down,
+        same as a hard OOM (Peter). Only at the floor of both axes does this fall back to
+        advice.
+        """
+        _cur = _clip_state.get("cur_wh")
+        _curf = int(_clip_state.get("cur_frames", 1))
+        _has_rung = ((_curf > 1 and clip_fallback_frames(_curf) > 1)
+                     or (_cur and next_preview_res(*_cur) != tuple(_cur)))
+        if _has_rung:
+            logger.warning(
+                f"[preview] step {step}/{total} took {seconds:.0f}s — the render is paging "
+                f"into system RAM (Windows never raises an OOM for this). Abandoning this "
+                f"sample and retrying one rung down (a shorter clip first, then resolution).")
+            return True
         if _clip_state["slow_done"]:
-            return
+            return False
         _clip_state["slow_done"] = True
         logger.warning(
-            f"[preview] step {step}/{total} took {seconds:.0f}s — far slower than this should "
-            f"be, which almost always means the preview does not fit in VRAM and is spilling "
-            f"into system RAM. It will finish, just slowly. For future previews, lower "
-            f"Width/Height on the Samples tab (and Sample length if you are rendering clips). "
-            f"Previews are a heartbeat between checkpoints, not the verdict: every epoch saves "
-            f"a .safetensors, and you can Pause the run to free the GPU, judge an epoch in "
-            f"ComfyUI, then close ComfyUI and Resume.")
+            f"[preview] step {step}/{total} took {seconds:.0f}s — the render is spilling "
+            f"into system RAM even at the ladder floor (shortest clip, 512x512). It will "
+            f"finish, just slowly. In order of impact: set the Turbo LoRA in Preferences "
+            f"(6-step previews — over 3x fewer forwards than the standard 20), or switch "
+            f"Sample length to a still. Previews are a heartbeat between checkpoints, not "
+            f"the verdict: every epoch saves a .safetensors, and you can Pause the run, "
+            f"judge an epoch in ComfyUI, then Resume.")
 
     def _render_previews(epoch):
         """Render one still per prompt on the RESIDENT training DiT and write them where the
@@ -2198,6 +2801,10 @@ def train_minimax(
                 logger.info(f"[sample override] active — '{_ov['prompt'][:60]}' "
                             f"seed={_seed} {_w}x{_h}")
 
+            if _res_cap["wh"] is not None:
+                _cw, _ch = _res_cap["wh"]
+                if (_cw, _ch) != (_w, _h) and (_cw <= _w and _ch <= _h):
+                    _w, _h = _cw, _ch
             _seed = _seed if _seed != 0 else random.randint(1, 2 ** 31 - 1)
             ts = _time.strftime("%Y%m%d%H%M%S")
             _frames = max(1, int(_clip_state["frames"]))
@@ -2239,25 +2846,97 @@ def train_minimax(
                 if _opt_parked or _ema_parked:
                     gc.collect()
                     torch.cuda.empty_cache()
-                _free0 = torch.cuda.mem_get_info()[0] / 1e9
+                from fizgig.utils.device import plannable_free_vram
+                _free0 = plannable_free_vram()
                 logger.info(f'[preview] clip sampling with {_free0:.1f} GB free '
                             f'({len(_opt_parked)} optimizer tensors parked'
                             f'{", EMA shadow parked" if _ema_parked else ""})')
+            if turbo_net is not None:
+                # On for the sampling phase only: weights to the GPU (~0.8 GB), modules
+                # enabled at their strength, AdaLN injected. Off + back to CPU before decode.
+                turbo_net.to(device=device, dtype=dtype)
+                for _tm in turbo_net.unet_loras:
+                    _tm.enabled = True
+                _n_ad = turbo_adaln_patch(dit, turbo_adaln, device, dtype)
+                logger.info(f"[preview] Turbo LoRA on — {sample_steps} steps at "
+                            f"{turbo_lora_strength:g}"
+                            + (f", {_n_ad} adaln injected" if _n_ad else ""))
+            _want_audio = bool(sample_audio and _frames > 1)
             _rendered = []
             for i, txt in enumerate(_prompts):
                 print(f"[preview] epoch {epoch}: prompt {i + 1}/{len(_prompts)} "
                       f"({_w}x{_h}, {_frames} frame(s), seed {_seed + i})", flush=True)
-                lat = sampling.sample_image(
-                    dit, txt.to(device, dtype),
-                    width=_w, height=_h, steps=sample_steps,
-                    cfg_scale=sample_cfg_scale,
-                    uncond_embeds=(encoded_negative.to(device, dtype)
-                                   if encoded_negative is not None else None),
-                    seed=_seed + i, device=device, dtype=dtype, log_steps=True,
-                    num_frames=_frames, on_slow_step=_slow_step_notice)
+                while True:
+                    _clip_state["cur_wh"] = (_w, _h)       # the slow-step callback reads these
+                    _clip_state["cur_frames"] = _frames
+                    try:
+                        lat, _arows = sampling.sample_image(
+                            dit, txt.to(device, dtype),
+                            width=_w, height=_h, steps=sample_steps,
+                            cfg_scale=sample_cfg_scale,
+                            uncond_embeds=(encoded_negative.to(device, dtype)
+                                           if encoded_negative is not None else None),
+                            seed=_seed + i, device=device, dtype=dtype, log_steps=True,
+                            num_frames=_frames, on_slow_step=_slow_step_notice,
+                            return_audio=True)
+                        break
+                    except (torch.cuda.OutOfMemoryError, sampling.PreviewAborted):
+                        # Downgrade one ladder rung and retry rather than losing previews for
+                        # the run. Two triggers, one ladder: a hard CUDA OOM (Linux, or a
+                        # too-big single allocation), and the slow-step abort (Windows paging
+                        # never raises — the callback bails after the first crawling step
+                        # instead). FRAMES give back first (Peter): a 56-frame clip retries at
+                        # 22 frames before touching 768x768, because a shorter clip is still a
+                        # clip while below 768 the model leaves its training regime. Only with
+                        # frames at their clip floor does resolution start walking down
+                        # (768x640 -> 640x640 -> ... -> 512x512). Both caps stick for later
+                        # epochs. At the floor of BOTH there is nothing left to give back —
+                        # re-raise into the trainer's usual preview handling (the abort never
+                        # fires there by construction).
+                        _nf = clip_fallback_frames(_frames) if _frames > 1 else 1
+                        if _nf > 1:
+                            gc.collect()
+                            if torch.cuda.is_available():
+                                torch.cuda.empty_cache()
+                            logger.warning(f"[preview] OOM at {_frames} frames — retrying "
+                                           f"this sample at {_nf} frames ({_w}x{_h} kept)")
+                            _frames = _nf
+                            _clip_state["frames"] = _nf
+                            continue
+                        _nw, _nh = next_preview_res(_w, _h)
+                        if (_nw, _nh) == (_w, _h):
+                            raise
+                        gc.collect()
+                        if torch.cuda.is_available():
+                            torch.cuda.empty_cache()
+                        _msg = f"[preview] OOM at {_w}x{_h} — retrying at {_nw}x{_nh}"
+                        if min(_nw, _nh) < 768 and not _res_cap["warned"]:
+                            _res_cap["warned"] = True
+                            _msg += (". NOTE: below H3's 768 training canvas the model is "
+                                     "outside its expected regime — treat these previews as "
+                                     "a rough guide, and judge the LoRA at full size in "
+                                     "ComfyUI.")
+                        logger.warning(_msg)
+                        _w, _h = _nw, _nh
+                        _res_cap["wh"] = (_w, _h)
+                        # A stable marker the GUI watches for: it writes this resolution back
+                        # into the Samples tab, so the NEXT run starts where this one settled
+                        # instead of re-walking the ladder. Printed per downgrade; the last
+                        # one wins.
+                        print(f"[preview] resolution settled: {_w}x{_h}", flush=True)
                 _rendered.append((f"{output_name}_e{epoch:06d}_{i:02d}_{ts}_{_seed + i}",
-                                  lat.to("cpu")))
-                del lat
+                                  lat.to("cpu"),
+                                  _arows.to("cpu") if (_want_audio and _arows is not None)
+                                  else None))
+                del lat, _arows
+
+            if turbo_net is not None:
+                for _tm in turbo_net.unet_loras:
+                    _tm.enabled = False
+                turbo_adaln_unpatch(turbo_adaln)
+                turbo_net.to("cpu")
+                if torch.cuda.is_available():
+                    torch.cuda.empty_cache()      # its ~0.8 GB back before the decode phase
 
             # optimizer state back before anything else - the next training step needs it
             for _st, _k in _opt_parked:
@@ -2272,7 +2951,8 @@ def train_minimax(
                 gc.collect()
                 if torch.cuda.is_available():
                     torch.cuda.empty_cache()
-                    _free = torch.cuda.mem_get_info()[0] / 1e9
+                    from fizgig.utils.device import plannable_free_vram as _pfv
+                    _free = _pfv()
                     if _frames > 1 and _free < 7.5:
                         logger.info(f"[preview] {_free:.1f} GB free is too tight for clip "
                                     f"decode — parking the base on CPU for this decode pass.")
@@ -2281,7 +2961,8 @@ def train_minimax(
                         torch.cuda.empty_cache()
                         _base_parked = True
                 decoder = decoder.to(device)
-            for stem, lat in _rendered:
+            for stem, lat, _arows in _rendered:
+                _px_mp4 = None                # full frames held only for a with-sound mp4
                 lat = lat.to(device)
                 if lat.shape[2] > 1 and decoder is not None:
                     # Clip: decode every frame, store EVERY 2ND frame as JPEG in a sibling
@@ -2303,6 +2984,8 @@ def train_minimax(
                     img = Image.fromarray(mid)
                     print(f"[preview] decoded {n_f}-frame clip at {_w}x{_h} "
                           f"({(n_f + 1) // 2} scrub frames)", flush=True)
+                    if _arows is not None:
+                        _px_mp4 = px.cpu()     # every frame, for the playable mp4 below
                     del px
                 elif decoder is not None:
                     px = decoder.decode(lat.float())[0]          # [3, H, W] in [0, 1]
@@ -2315,12 +2998,43 @@ def train_minimax(
                     arr = sampling.latent_to_rgb(lat)
                     img = Image.fromarray(arr).resize((_w, _h), Image.NEAREST)
                     print(f"[preview] decoded {_w}x{_h}", flush=True)
+                # The wav is written BEFORE the contract PNG on purpose: the gallery's
+                # settle guard treats the PNG as "this sample is finished", so everything
+                # belonging to the sample must already be on disk when it lands.
+                if _arows is not None:
+                    _adec = _get_audio_decoder()
+                    if _adec is not None:
+                        try:
+                            from fizgig.minimax.audio_vae import unpack_audio
+                            _adec.to(device)
+                            _wave = _adec.decode(
+                                unpack_audio(_arows).to(device, torch.float32))
+                            _wav_path = os.path.join(sample_dir, stem + ".wav")
+                            write_wav(_wav_path, _wave[0].cpu())
+                            print(f"[preview] wrote sound: {stem}.wav", flush=True)
+                            if _px_mp4 is not None:
+                                # a real playable clip — frames at true rate, sound muxed in;
+                                # the gallery plays this instead of scrub + separate audio
+                                try:
+                                    write_preview_mp4(
+                                        os.path.join(sample_dir, stem + ".mp4"),
+                                        _px_mp4, _wav_path)
+                                    print(f"[preview] wrote video: {stem}.mp4", flush=True)
+                                except Exception as _me:
+                                    logger.warning(f"[preview] mp4 mux skipped "
+                                                   f"({type(_me).__name__}: {_me}) — the "
+                                                   f"wav and scrub frames still work")
+                        except Exception as _we:
+                            logger.warning(f"[preview] audio decode failed "
+                                           f"({type(_we).__name__}: {_we}) — this sample "
+                                           f"renders silent")
+                    _px_mp4 = None
                 img.save(os.path.join(sample_dir, stem + ".png"))
                 del lat
+            if _audio_dec_state["dec"] is not None:
+                _audio_dec_state["dec"].to("cpu")     # ~0.45 GB back off the card
             if _base_parked:
-                dit.to(device)
-                if n_swap > 0:
-                    dit.enable_block_swap(n_swap)     # restore the parked-block split
+                restore_parked_dit(dit, device, n_swap)   # swap-aware: never the whole base
                 gc.collect()
                 torch.cuda.empty_cache()
                 _base_parked = False
@@ -2328,6 +3042,16 @@ def train_minimax(
                         f"({sample_steps} steps, seed {_seed}) to {sample_dir}")
         finally:
             del decoder                                  # free the ~4.85 GB decoder immediately
+            if _audio_dec_state["dec"] is not None:
+                _audio_dec_state["dec"].to("cpu")        # idempotent; covers a mid-decode raise
+            if turbo_net is not None:
+                # Idempotent, and NON-NEGOTIABLE on an exception mid-sample: a Turbo left
+                # enabled (or an injected AdaLN forward left installed) would ride every
+                # subsequent TRAINING step.
+                for _tm in turbo_net.unet_loras:
+                    _tm.enabled = False
+                turbo_adaln_unpatch(turbo_adaln)
+                turbo_net.to("cpu")
             for _st, _k in _opt_parked:      # exception during phase 1: state must return
                 _st[_k] = _st[_k].to(device)
             if _ema_parked:                  # next ema.update() needs the shadow on-device
@@ -2336,9 +3060,7 @@ def train_minimax(
                 # An exception mid-decode left the 21 GB base on CPU — the next training step
                 # would die with "mat2 is on cpu". Restore residency (and the swap split)
                 # before anything else runs.
-                dit.to(device)
-                if n_swap > 0:
-                    dit.enable_block_swap(n_swap)
+                restore_parked_dit(dit, device, n_swap)
             if was_training:
                 dit.train()
             gc.collect()
@@ -2368,6 +3090,54 @@ def train_minimax(
     # of the learning comes from real pixels versus from the teacher's rendering of them.
     _distill_parts = {}
     _distill_acc = [0.0, 0.0, 0]        # teacher sum, photo sum, count
+    # Clips with sound only. Reported separately per epoch because the two streams sit on
+    # different noise schedules — one averaged number would hide which of them is learning.
+    _audio_parts = {}
+    _audio_acc = [0.0, 0.0, 0]          # video sum, audio sum, count — clips with sound
+    _voice_acc = [0.0, 0]               # audio sum, count — audio-only voice items
+
+    _pending = [0]                       # backwards accumulated since the last optimizer step
+
+    def _boundary_step():
+        """The optimizer step at a window boundary — shared by live iterations and by the
+        stopped-category skip path (whose iterations can land ON a boundary with earlier
+        grads still pending). Guarded: a window of nothing steps nothing.
+
+        Warmup, the ramp, the identity-first phase scale, the noise-band multiplier and the
+        retirement anchor all COMPOSE into param_group["lr"] — never the loss: Adam's update
+        is m/(sqrt(v)+eps), invariant to a constant on the gradient, so a loss multiplier
+        reads as a working throttle and changes almost nothing. Both window multipliers are
+        the MEAN over the window, not the last draw — taking the last would make the setting
+        depend on the order batches happened to arrive in.
+        """
+        if not _pending[0]:
+            return
+        if max_grad_norm and max_grad_norm > 0:
+            torch.nn.utils.clip_grad_norm_(params, max_grad_norm)
+        _bm = (sum(_band_acc) / len(_band_acc)) if _band_acc else 1.0
+        _band_acc.clear()
+        _cm = (sum(_cat_acc) / len(_cat_acc)) if _cat_acc else 1.0
+        _cat_acc.clear()
+        # `or _hn_active or _retire_active` is not decoration: warmup is retired for this
+        # family and the ramp is OFF in the Fast preset, so without them this block never
+        # runs for the preset most people use and the settings would silently do nothing.
+        if warmup_steps or ramp is not None or _p1_epochs or _hn_active or _retire_active:
+            _wf = (min(1.0, (global_step + 1) / warmup_steps) if warmup_steps else 1.0)
+            _rm = ramp.mult if ramp is not None else 1.0
+            for _g in optimizer.param_groups:
+                _g["lr"] = _g["_warmup_base_lr"] * _wf * _rm * _phase_lr * _bm * _cm
+        if limiter is not None:
+            limiter.pre_step()           # snapshot BEFORE the optimizer moves anything
+        optimizer.step()
+        optimizer.zero_grad(set_to_none=True)
+        if limiter is not None:
+            limiter.step()
+        if ramp is not None:
+            ramp.step()                  # post-clip weights; sets the multiplier for NEXT step
+        if ema is not None:
+            ema.update()                 # after the clip, so the shadow tracks clipped weights
+        _pending[0] = 0
+
     for epoch in range(start_epoch, max_train_epochs):
         shared_epoch.value = epoch + 1
         network.train()
@@ -2393,7 +3163,27 @@ def train_minimax(
             text = batch["hidden_states"].to(device, dtype)        # (1, L, 5120)
             if uncond_text is not None and random.random() < caption_dropout:
                 text = uncond_text.to(device, dtype)               # caption dropout step
-            if distill and (_teacher_phase or not _p1_epochs) and "ref_hidden_states" in batch:
+            _is_voice = bool(batch.get("audio_only") is not None and batch["audio_only"].any())
+            # Per-category retirement: past its stop epoch a category is either ANCHORED
+            # (trains on at ANCHOR_LR_SCALE — rehearsal against drift on the shared adapters,
+            # ledger stays live) or STOPPED (skipped outright — faster epochs, blind).
+            _retired = ((not _is_voice and _vis_stop and (epoch + 1) > _vis_stop)
+                        or (_is_voice and _aud_stop and (epoch + 1) > _aud_stop))
+            _ret_mode = audio_stop_mode if _is_voice else visual_stop_mode
+            if _retired and _ret_mode != "anchor":
+                # No forward, no loss, no record — but a boundary landing here still owes any
+                # pending grads from the window's live iterations their step.
+                if (i + 1) % _accum_n == 0 or (i + 1) >= steps_per_epoch:
+                    _boundary_step()
+                global_step += 1
+                progress_bar.update(1)
+                continue
+            if (distill and (_teacher_phase or not _p1_epochs) and "ref_hidden_states" in batch
+                    and not _is_voice):
+                # `not _is_voice`: compute_distill_loss packs still-sized audio noise (4 rows)
+                # against a voice item's hundreds — the sequence and RoPE table would disagree
+                # in length and crash mid-run. A voice has no face to distill anyway; it takes
+                # the plain path below at video_weight 0.
                 _rz = batch["ref_latent"].to(device, dtype)      # (1, 24, h, w) from the cache
                 if _rz.dim() == 4:
                     _rz = _rz.unsqueeze(2)                       # -> (1, 24, 1, h, w)
@@ -2409,34 +3199,49 @@ def train_minimax(
                 _distill_acc[1] += _distill_parts["photo"]
                 _distill_acc[2] += 1
             else:
-                loss, _ = compute_loss(dit, latents, text, shift=shift)
+                # A clip that carried usable sound cached an audio_latent; a still, a muted clip
+                # and a silent one did not, and for those this is the original call unchanged.
+                # A VOICE item is its audio: the video latent is a zeros placeholder, and
+                # video_weight=0 keeps "every frame looks like the dataset mean" out of the run.
+                _a = batch.get("audio_latent")
+                if _a is not None:
+                    _a = _a[0].to(device)            # (1, A*2, 32) -> the DiT's row block
+                loss, _step_sigma = compute_loss(dit, latents, text, shift=shift,
+                                                 audio_latent=_a, audio_weight=audio_weight,
+                                                 video_weight=0.0 if _is_voice else 1.0,
+                                                 parts_out=_audio_parts)
+                if _is_voice:
+                    # Its own ledger. The clip ledger's "video err" is a real number about real
+                    # footage; a voice item's video term is its error against the placeholder —
+                    # folding that in would poison both averages in the epoch report.
+                    if _audio_parts.get("audio") is not None:
+                        _voice_acc[0] += _audio_parts["audio"]
+                        _voice_acc[1] += 1
+                elif _a is not None and _audio_parts.get("audio") is not None:
+                    _audio_acc[0] += _audio_parts["video"]
+                    _audio_acc[1] += _audio_parts["audio"]
+                    _audio_acc[2] += 1
+                # The band multiplier needs to know where this step landed. Only the plain path
+                # reports it; a distillation step keeps the multiplier at 1.0, since its loss is
+                # a teacher comparison rather than a draw from the noise schedule. With sound in
+                # the batch the reported sigma is the VIDEO draw's — the box is defined against
+                # the video schedule, and audio's own remapped curve must not vote on the LR.
+                # A voice step also sits out: its entire gradient lives on the audio schedule
+                # (shift 3), which the video-sigma classification does not describe.
+                _band_acc.append(1.0 if _is_voice else
+                                 (_hn_scale if _step_sigma >= MINIMAX_LOWNOISE_SIGMA else 1.0))
+            # An anchored retired step trains at the anchor scale; everything else at 1.0.
+            # Appended for EVERY executed backward (distill path included — a retired visual
+            # category's distillation steps anchor exactly like its plain ones).
+            _cat_acc.append(ANCHOR_LR_SCALE if _retired else 1.0)
             # Divide so the accumulated gradient is the MEAN over the window, not the sum —
             # otherwise the effective LR scales with the accumulation count.
             (loss / _accum_n if _accum_n > 1 else loss).backward()
+            _pending[0] += 1
             # Step on the window boundary, and always on the last batch of the epoch so a
             # partial tail window is never silently discarded.
             if (i + 1) % _accum_n == 0 or (i + 1) >= steps_per_epoch:
-                if max_grad_norm and max_grad_norm > 0:
-                    torch.nn.utils.clip_grad_norm_(params, max_grad_norm)
-                if warmup_steps or ramp is not None or _p1_epochs:
-                    # Warmup, the ramp and the identity-first phase scale all COMPOSE: warmup
-                    # covers the first steps (where the adapter is near zero and the ramp's ratio
-                    # is undefined), the ramp takes over from there, and phase 1 runs the whole
-                    # thing at a third of the box. The product is the LR.
-                    _wf = (min(1.0, (global_step + 1) / warmup_steps) if warmup_steps else 1.0)
-                    _rm = ramp.mult if ramp is not None else 1.0
-                    for _g in optimizer.param_groups:
-                        _g["lr"] = _g["_warmup_base_lr"] * _wf * _rm * _phase_lr
-                if limiter is not None:
-                    limiter.pre_step()   # snapshot BEFORE the optimizer moves anything
-                optimizer.step()
-                optimizer.zero_grad(set_to_none=True)
-                if limiter is not None:
-                    limiter.step()
-                if ramp is not None:
-                    ramp.step()          # post-clip weights; sets the multiplier for NEXT step
-                if ema is not None:
-                    ema.update()         # after the clip, so the shadow tracks clipped weights
+                _boundary_step()
             global_step += 1
             loss_recorder.add(epoch=epoch, step=i, loss=loss.item())
             progress_bar.set_postfix(avr_loss=f"{loss_recorder.moving_average:.4f}", refresh=False)
@@ -2464,6 +3269,23 @@ def train_minimax(
         if _p1_epochs and not _teacher_phase and distill:
             logger.info(f"[distill] photos only (identity-first phase 2) — the teacher was "
                         f"dropped after epoch {_p1_epochs}.")
+        if _audio_acc[2]:
+            _av, _aa = _audio_acc[0] / _audio_acc[2], _audio_acc[1] / _audio_acc[2]
+            _wa = float(audio_weight) * _aa
+            _share = 100 * _wa / (_av + _wa) if (_av + _wa) else 0.0
+            # The share is the number to watch. Audio is only ~4% of the packed sequence, so if
+            # its weighted contribution is a rounding error the LoRA is not learning sound no
+            # matter how healthy the total loss looks — that is what audio_weight is for.
+            logger.info(
+                f"[audio] {_audio_acc[2]} clip(s) with sound | video err {_av:.4f} | "
+                f"audio err {_aa:.4f} x{float(audio_weight):.2f} = {_wa:.4f} | "
+                f"sound is {_share:.1f}% of their loss")
+            _audio_acc[:] = [0.0, 0.0, 0]
+        if _voice_acc[1]:
+            logger.info(f"[voice] {_voice_acc[1]} voice step(s) | "
+                        f"audio err {_voice_acc[0] / _voice_acc[1]:.4f} "
+                        f"x{float(audio_weight):.2f} (video loss zeroed — placeholder frames)")
+            _voice_acc[:] = [0.0, 0]
         if _distill_acc[2]:
             _t = _distill_acc[0] / _distill_acc[2]
             _p = _distill_acc[1] / _distill_acc[2]

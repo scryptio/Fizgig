@@ -110,6 +110,41 @@ def prune_state_dirs(output_dir: str, output_name: str, keep_n) -> None:
             logger.warning(f"[state] could not remove {path}: {e}")
 
 
+_ILLEGAL_NAME_CHARS = '<>:"|?*'
+
+
+def validate_output_name(output_name: str) -> str:
+    """Refuse an output name that cannot become a filename. Returns it unchanged if it can.
+
+    Every function below turns this string into a path, and nothing opens one until the first
+    checkpoint save — an epoch in. A name carrying a pasted newline (issue #70) trains for
+    sixteen minutes and then dies inside safetensors' Rust writer with OS error 123, which
+    names neither the setting nor the character. Worse, `_save_lora` runs before the state
+    save, so the run is not even resumable: the epoch is simply gone.
+
+    Checked here rather than in one trainer because all three families take --output_name from
+    the same unchecked GUI string, and a direct CLI run skips the GUI's own check entirely.
+    """
+    name = "" if output_name is None else str(output_name)
+    bad = next((c for c in name if c in _ILLEGAL_NAME_CHARS or c < " "), None)
+    if bad is not None:
+        _shown = repr(bad)[1:-1] if bad < " " else bad          # \n rather than an invisible gap
+        raise ValueError(
+            f"output name {name!r} cannot contain {_shown!r} — file names can't include that "
+            f"character. A name pasted from somewhere else often carries a stray line break.")
+    if not name.strip() or name != name.strip() or name.endswith("."):
+        raise ValueError(
+            f"output name {name!r} cannot be empty, or start or end with a space or a dot — "
+            f"the saved file would not come out with the name you gave it.")
+    # Both separators, on both platforms: a backslash is legal in a Linux filename, but a LoRA
+    # named that way on a pod becomes an unopenable path the moment it reaches Windows.
+    if "/" in name or "\\" in name or os.path.basename(name) != name:
+        raise ValueError(
+            f"output name {name!r} must be just a name, not a path — the folder it saves into "
+            f"is set separately.")
+    return name
+
+
 def get_epoch_ckpt_name(model_name: str, epoch_no: int) -> str:
     return EPOCH_FILE_NAME.format(model_name, epoch_no) + ".safetensors"
 
