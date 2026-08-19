@@ -762,3 +762,158 @@ class MiniMaxH3DiT(nn.Module):
                 a = None
             return out, a
         return out
+
+    # (Entry class lives at module level: H3ActivationCacheEntry, below the DiT.)
+    def forward_cached(self, video_latent: torch.Tensor, t: torch.Tensor,
+                       text_embeds: torch.Tensor, audio_rows: torch.Tensor = None,
+                       return_audio: bool = False, *,
+                       resume_from=None, cached=None, new_cache=None,
+                       cache_device: str = "cpu"):
+        """Inference forward with per-block activation caching (Repair Studio Turbo Preview).
+
+        `resume_from` = the earliest changed main-block index (or None for a full pass). When
+        resuming with a valid `cached`, the pre-block setup (token refiner, patchify, audio
+        pack, modulation table, rope) and the cached INPUT to block `resume_from` are reused,
+        so only blocks >= resume_from run. If `new_cache` is given, each executed block's
+        input is stored into it (parked on `cache_device` — a 22-frame 768 clip's per-block
+        h is ~46 MB, x50 blocks x6 steps ~11.6 GB, which lives in system RAM, never VRAM).
+
+        Numerically identical to forward() for resume_from=None. Inference-only: no gradient
+        checkpointing (previews run under no_grad), no refs/tags (the workbench preview path
+        doesn't use them), and a live H2D offloader disables resume (its ring assumes a walk
+        from _swap_from) — the pass silently runs in full instead.
+        """
+        if video_latent.shape[0] != 1:
+            raise ValueError("MiniMax H3 inference is batch size 1")
+        device = video_latent.device
+        dtype = text_embeds.dtype
+        _, _, latent_t, lat_h, lat_w = video_latent.shape
+        nblocks = len(self.blocks)
+
+        can_resume = (resume_from is not None and cached is not None
+                      and getattr(self, "_h2d_offloader", None) is None
+                      and cached.block_inputs and 0 <= resume_from < nblocks
+                      and cached.block_inputs[resume_from] is not None)
+        if can_resume:
+            t_emb = cached.t_emb.to(device)
+            mod_row = cached.mod_row.to(device)
+            cos, sin = cached.cos.to(device), cached.sin.to(device)
+            audio_start, video_start = cached.audio_start, cached.video_start
+            video_t_index, audio_t_index = cached.video_t_index, cached.audio_t_index
+            n_audio = video_start - audio_start
+            h = cached.block_inputs[resume_from].to(device, dtype)
+            start = resume_from
+            if new_cache is not None:
+                new_cache.block_inputs = list(cached.block_inputs)   # unchanged prefix by ref
+        else:
+            # The preamble below mirrors forward() exactly for the no-ref, no-tags case —
+            # verified bitwise by tests/test_h3_forward_cached.py. Touch both or neither.
+            text_len = text_embeds.shape[1]
+            text_states = text_embeds[0]
+            if text_states.shape[-1] != self.hidden_size:
+                text_states = self.token_refiner(self.condition_proj(text_states))
+            video_rows = patchify_video(video_latent.to(torch.float32), self.patch_size)
+            video_embed = self.video_patch_proj(video_rows).to(dtype)
+
+            t_val = t.reshape(-1)[:1].to(torch.float32) if torch.is_tensor(t) else torch.tensor([float(t)], device=device)
+            t_val = t_val.to(device)
+            n_audio_latents = (audio_latents_for_frames(pixel_frames_for_latent(latent_t))
+                              if self.pack_audio_rows else 0)
+            audio_embed = None
+            if n_audio_latents:
+                sigma_v = (1.0 - t_val).clamp(0.0, 1.0)
+                sigma_a = remap_sigma(sigma_v)
+                t_audio = 1.0 - sigma_a
+                if audio_rows is not None:
+                    _want = n_audio_latents * AUDIO_CHANNELS
+                    if audio_rows.shape[0] != _want:
+                        raise ValueError(f"audio_rows has {audio_rows.shape[0]} rows, expected {_want}")
+                    _arows = audio_rows.to(device=device, dtype=torch.float32)
+                else:
+                    _arows = sigma_a * torch.randn(n_audio_latents * AUDIO_CHANNELS,
+                                                   self.config.audio_latents_dim,
+                                                   device=device, dtype=torch.float32)
+                audio_embed = self.audio_patch_proj(_arows).to(dtype)
+
+            parts = ([text_states.to(dtype)]
+                     + ([audio_embed] if audio_embed is not None else [])
+                     + [video_embed])
+            h = torch.cat(parts, dim=0)
+            seq_len = h.shape[0]
+            n_audio = 0 if audio_embed is None else audio_embed.shape[0]
+            audio_start = text_len
+            video_start = audio_start + n_audio
+
+            t_parts = [t_val] + ([t_audio] if audio_embed is not None else [])
+            t_all = torch.cat(t_parts) if len(t_parts) > 1 else t_val
+            uniq, inverse = torch.unique(t_all, sorted=True, return_inverse=True)
+            t_emb = self._time_embedding(uniq)
+            if not self.adaln_fp32:
+                t_emb = t_emb.to(dtype)
+            tags = torch.full((seq_len,), VIDEO_TAG, dtype=torch.long, device=device)
+            tags[:text_len] = TEXT_TAG
+            row_t_index = torch.full((seq_len,), int(inverse[0]), dtype=torch.long, device=device)
+            if audio_embed is not None:
+                tags[audio_start:video_start] = AUDIO_TAG
+                row_t_index[audio_start:video_start] = int(inverse[1])
+            mod_row = row_t_index * MODALITY_NUM + tags
+            video_t_index = int(inverse[0])
+            audio_t_index = int(inverse[1]) if n_audio else 0
+
+            pos = image_position_ids(text_len, lat_h, lat_w, n_audio_latents,
+                                     latent_t=latent_t).to(device)
+            cos, sin = rope_cos_sin(pos, self.rope.inv_freq.to(device))
+            cos, sin = cos.to(dtype), sin.to(dtype)
+            start = 0
+            if new_cache is not None:
+                new_cache.block_inputs = [None] * nblocks
+
+        if new_cache is not None:
+            new_cache.t_emb = t_emb.detach()
+            new_cache.mod_row = mod_row
+            new_cache.cos, new_cache.sin = cos, sin
+            new_cache.audio_start, new_cache.video_start = audio_start, video_start
+            new_cache.video_t_index, new_cache.audio_t_index = video_t_index, audio_t_index
+
+        for i in range(start, nblocks):
+            if new_cache is not None:
+                new_cache.block_inputs[i] = h.detach().to(cache_device)
+            h = _run_block(self.blocks, i, self._swap_from, h, t_emb, mod_row, cos, sin)
+            _off = getattr(self, "_h2d_offloader", None)
+            if _off is not None and i >= self._swap_from:
+                _off.submit_move_blocks_forward(i)
+
+        v = self.final_layer(h[video_start:], t_emb, video_t_index)
+        out = unpatchify_video(v, latent_t, lat_h // self.patch_size[1], lat_w // self.patch_size[2],
+                               self.latents_dim, self.patch_size)
+        out = out.to(video_latent.dtype)
+        if return_audio:
+            a = (self.final_layer.forward_audio(h[audio_start:video_start], t_emb, audio_t_index)
+                 if n_audio else None)
+            return out, a
+        return out
+
+
+class H3ActivationCacheEntry:
+    """Per-denoising-step cache for MiniMaxH3DiT.forward_cached (Repair Studio Turbo
+    Preview): the INPUT h to every block, plus the LoRA-invariant preamble so a resumed
+    pass can skip the token refiner / patchify / audio pack / modulation table / rope.
+
+    block_inputs live on the CACHE device (CPU by default - a 22-frame 768x768 clip holds
+    ~46 MB per block, 2.3 GB per step, ~11.6 GB across a 6-step render; system RAM, never
+    VRAM). Everything else is small and rides wherever it was computed.
+    """
+
+    __slots__ = ("block_inputs", "t_emb", "mod_row", "cos", "sin",
+                 "audio_start", "video_start", "video_t_index", "audio_t_index")
+
+    def __init__(self):
+        self.block_inputs = []
+        self.t_emb = None
+        self.mod_row = None
+        self.cos = None
+        self.sin = None
+        self.audio_start = 0
+        self.video_start = 0
+        self.video_t_index = 0
+        self.audio_t_index = 0

@@ -311,9 +311,11 @@ class RepairEngine:
         # capture `org_forward` (a bound method on the DiT's Linear layers),
         # creating circular references that prevent GC from freeing the DiT.
         # Explicitly clear the module lists to break the cycles.
+        from fizgig.utils.device import release_module_tensors as _strip
         for net in (self.primary_network, self.donor_network):
             if net is not None:
                 try:
+                    _strip(net)     # husk the LoRA weights — see the H3 reset comment
                     for lora in net.unet_loras:
                         lora.org_forward = None
                     net.unet_loras.clear()
@@ -329,6 +331,10 @@ class RepairEngine:
         gc.collect()
 
         if self.pipeline is not None:
+            # Same defense as the H3/Krea 2 engines: husk the DiT before dropping it, so an
+            # externally-pinned module graph can't keep the VRAM (field leak, 19 Aug).
+            from fizgig.utils.device import release_module_tensors
+            release_module_tensors(getattr(self.pipeline, "dit", None))
             try:
                 self.pipeline.unload_models()
             except Exception:
@@ -350,6 +356,9 @@ class RepairEngine:
         gc.collect()
         if torch.cuda.is_available():
             torch.cuda.empty_cache()
+        from fizgig.utils.device import report_cuda_leak, flush_reserved_vram
+        report_cuda_leak("klein-repair-reset")
+        flush_reserved_vram("klein-repair-reset")
 
     # ------------------------------------------------------------------
     # Activation cache (v2 Turbo Preview)

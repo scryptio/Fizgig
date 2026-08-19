@@ -33,7 +33,11 @@ round-trips packed and could get the same treatment later if a use case appears.
 
 from __future__ import annotations
 
+import logging
+
 import torch
+
+logger = logging.getLogger(__name__)
 
 
 class H3Int8H2DOffloader:
@@ -55,6 +59,12 @@ class H3Int8H2DOffloader:
         self.free_event = [None] * self.ring_size
         self.copy_done = {}              # block_idx -> event the compute stream must wait on
         self._layout = None              # (offsets, total_bytes), identical for every block
+        # Page-locking every swapped block's CPU master wants n_swap x ~0.42 GB of pinned RAM
+        # (31 blocks ≈ 13 GB on a 16 GB card's plan). Machines that can't lock that much get
+        # "CUDA error: out of memory" out of cudaHostAlloc — host-side, before training ever
+        # starts (field report: 16 GB 4090). Once one pin fails we stop trying and stage from
+        # ordinary RAM: the async H2D copies quietly become synchronous — slower, not broken.
+        self._pin_failed = False
 
         self._collect_sources()
         self.n_swap = len(self.sources)
@@ -144,8 +154,18 @@ class H3Int8H2DOffloader:
         if block_idx in self.cpu_flat:
             self._bind_cpu(block_idx)
             return
-        flat = torch.empty(self._layout[1], dtype=torch.uint8,
-                           device="cpu").pin_memory(device=self.device)
+        flat = torch.empty(self._layout[1], dtype=torch.uint8, device="cpu")
+        if not self._pin_failed:
+            try:
+                flat = flat.pin_memory(device=self.device)
+            except Exception as e:
+                self._pin_failed = True
+                logger.warning(
+                    "[h2d] could not page-lock the CPU staging buffers (%s: %s) — the OS "
+                    "won't pin this much RAM. Continuing with ordinary (unpinned) staging: "
+                    "H2D copies run synchronously, so steps are slower but the run works. "
+                    "Freeing system RAM (or adding more) restores the fast path.",
+                    type(e).__name__, e)
         cpu_views = self._flat_views(flat, weights)
         for (_, _, src), view in zip(entries, cpu_views):
             view.copy_(src)

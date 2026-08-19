@@ -1,0 +1,540 @@
+"""Repair-Studio engine for MiniMax H3 — the parallel of `krea2_engine.Krea2RepairEngine`.
+
+H3's `sampling.sample_image` is a complete sampler (audio carried-variable math included), so
+the preview is thin: apply the slider state to the LoRA networks (the model-agnostic
+`set_module_*_by_pattern` API) and call `sample_image`. The per-block slider config is the
+shared `SliderState`; only the block ids/regex are H3-specific (`h3_blocks`).
+
+**The preview regime is a 22-frame 768x768 clip judged by its MIDDLE frame.** A still is the
+most out-of-distribution render H3 has (the trainer's preview-regime lesson: single-frame
+previews misrepresent a video model), so the workbench renders the shortest clip that shows
+real behaviour and decodes one frame of it.
+
+Base precision is planned from free VRAM: >=28 GB free loads the accurate int8 base (~21 GB,
+the checkpoint's own storage); anything less loads NF4-of-pruned (~10.5 GB) with NO block
+swap — deliberately, so a future activation-cache resume never has to reason about the H2D
+ring's walk-from-swap_from assumption. The community Turbo LoRA (6-step @ 0.75) is applied
+once at load when configured — it conditions baseline and tweaked renders equally, and the
+bake path reads the LoRA files, never the live network, so saves stay exact.
+
+Public surface mirrors RepairEngine / Krea2RepairEngine so the shared UI and LoRA Royale
+workers can drive any of the three.
+"""
+
+import gc
+import hashlib
+import logging
+import os
+import threading
+from typing import Optional, Set
+
+import torch
+from PIL import Image
+
+from fizgig.repair_studio.h3_blocks import block_regex_h3, extract_block_ids_h3
+
+logger = logging.getLogger(__name__)
+
+H3_PREVIEW_FRAMES = 22          # shortest clip with real motion; ~7x a still, 1/5th of 124
+
+
+class _Loaded:
+    def __init__(self):
+        self.is_loaded = True
+
+
+def _apply_lora(target, sd, multiplier, device, dtype):
+    """Normalize foreign formats, build the network, apply it live, load the weights.
+    Mirrors the verified Context-LoRA / preview path (ensure_kohya -> apply_to ->
+    load_state_dict — create_network_from_weights only builds STRUCTURE; skipping the
+    load leaves lora_up at zero and the LoRA contributes nothing)."""
+    from fizgig.networks.lora import create_network_from_weights, ensure_kohya_lora_state_dict
+    sd = ensure_kohya_lora_state_dict(sd)
+    net = create_network_from_weights(None, float(multiplier), sd, None, target, for_inference=True)
+    net.apply_to(text_encoders=None, unet=target, apply_text_encoder=False, apply_unet=True)
+    net.load_state_dict(sd, strict=False)
+    net.to(device=device, dtype=dtype).eval()
+    return net
+
+
+class H3RepairEngine:
+    def __init__(self):
+        self.pipeline: Optional[_Loaded] = None
+        self.dit = None
+        self.decoder = None            # fp16 video VAE decoder, parked on CPU between decodes
+        self.te_path: Optional[str] = None
+        self.device = "cuda"
+        self.dtype = torch.bfloat16
+
+        self.primary_network = None
+        self.donor_network = None
+        self.primary_path: Optional[str] = None
+        self.donor_path: Optional[str] = None
+        self.primary_block_ids: Set[str] = set()
+        self.donor_block_ids: Set[str] = set()
+        self.primary_hash: Optional[str] = None
+
+        # The community Turbo LoRA (6-step previews). Applied ONCE at ensure_pipeline and left
+        # enabled — it conditions every render identically, so baseline-vs-tweaked comparisons
+        # are apples to apples. (This is the ~780 MB preview accelerator, not Phase C's
+        # activation-cache "Turbo Preview".)
+        self._turbo_net = None
+        self._turbo_adaln = []
+        self._steps = 20               # 6 when the Turbo LoRA loads
+
+        # Encoded-prompt caches. The TE is Qwen3-VL-32B and takes ~2 minutes to load, so
+        # prompts are cached at TWO levels: in-memory for the session, and on DISK keyed by
+        # sha256(prompt + te_path) so later sessions never load the TE at all.
+        self._prompt_cache_key = None
+        self._prompt_cache = None      # CPU [1, L, 5120]
+        self._te_cache_dir = None
+        self._cancel_event = threading.Event()
+        # Optional progress hook: called (step_done, total_steps) once per denoising step,
+        # from the render thread. The GUI sets it to drive a determinate progress bar.
+        self.on_step = None
+        self._baseline_cache_key = None
+        self._baseline_cache_image: Optional[Image.Image] = None
+        self._last_frame_latent = None   # Klein-only chain; kept None for Royale's workers
+
+        # Phase C (activation cache) plumbing — off until forward_cached lands.
+        self._turbo_enabled = False
+        self._act_cache = None
+        self._act_cache_key = None
+        self._act_cache_state = None
+
+    # ----- pipeline + LoRA loading -------------------------------------------
+    def ensure_pipeline(self, dit_path: str, vae_path: str, text_encoder_path: str,
+                        device: str = "cuda", turbo_lora_path: str = "",
+                        turbo_lora_strength: float = 0.75, te_cache_dir: str = "",
+                        **_ignored) -> None:
+        """Load the DiT (base precision auto-planned from free VRAM) + the Turbo LoRA once.
+        The video VAE decoder loads lazily at first decode; the TE loads only on a prompt-cache
+        miss (and is freed straight after)."""
+        if self.pipeline is not None and self.pipeline.is_loaded:
+            return
+        from fizgig.minimax.loader import load_minimax_h3_dit
+        self.device = device
+        self.te_path = text_encoder_path
+        self._vae_path = vae_path
+        self._te_cache_dir = te_cache_dir or None
+
+        try:
+            from fizgig.utils.device import plannable_free_vram
+            free = plannable_free_vram()
+        except Exception:
+            free = 0.0
+        base_quant = "int8" if free >= 28.0 else "nf4"
+        logger.info("[h3-workbench] %.1f GB free -> %s base, no block swap "
+                    "(int8 needs ~21 GB resident + decode headroom; NF4-of-pruned is ~10.5 GB)",
+                    free, base_quant)
+        self.dit = load_minimax_h3_dit(dit_path, device=device, compute_dtype=self.dtype,
+                                       quantize=True, blocks_to_swap=0, base_quant=base_quant)
+        self.dit.eval()
+
+        if turbo_lora_path and os.path.exists(turbo_lora_path):
+            try:
+                from fizgig.minimax.trainer import load_preview_turbo, turbo_adaln_patch
+                self._turbo_net, self._turbo_adaln = load_preview_turbo(
+                    self.dit, turbo_lora_path, float(turbo_lora_strength))
+                self._turbo_net.to(device=device, dtype=self.dtype)
+                for _m in self._turbo_net.unet_loras:
+                    _m.enabled = True
+                n_ad = turbo_adaln_patch(self.dit, self._turbo_adaln, device, self.dtype)
+                self._steps = 6
+                logger.info("[h3-workbench] Turbo LoRA on for all previews — 6 steps at %g"
+                            + (", %d adaln injected" % n_ad if n_ad else ""),
+                            float(turbo_lora_strength))
+            except Exception:
+                logger.exception("[h3-workbench] Turbo LoRA failed to load — previews run "
+                                 "the standard 20 steps")
+                self._turbo_net, self._turbo_adaln, self._steps = None, [], 20
+        else:
+            logger.info("[h3-workbench] no Turbo LoRA configured — previews run 20 steps "
+                        "(set it in Preferences for 6-step previews)")
+        self.pipeline = _Loaded()
+
+    def _ensure_decoder(self):
+        if self.decoder is not None:
+            return self.decoder
+        from safetensors import safe_open
+        from fizgig.minimax.vae import MiniMaxH3VideoVAEDecoder
+        dec = MiniMaxH3VideoVAEDecoder()
+        with safe_open(self._vae_path, framework="pt", device="cpu") as f:
+            dec.load_state_dict({k: f.get_tensor(k) for k in f.keys()}, strict=False)
+        # FP16, not bf16 — the weights ship fp16 and this decoder was excluded from bf16 by
+        # ComfyUI on purpose (see the trainer's decode-phase comment for the full story).
+        self.decoder = dec.to(torch.float16).eval()
+        return self.decoder
+
+    def load_primary(self, path: str) -> None:
+        if self.pipeline is None or not self.pipeline.is_loaded:
+            raise RuntimeError("Pipeline not loaded; call ensure_pipeline() first.")
+        if self.primary_network is not None:
+            raise RuntimeError("Primary already loaded — call reset() to swap.")
+        from safetensors.torch import load_file
+        self.primary_network = _apply_lora(self.dit, load_file(path), 1.0, self.device, self.dtype)
+        self.primary_path = path
+        self.primary_block_ids = extract_block_ids_h3(self.primary_network)
+        self._invalidate_baseline_cache()
+        try:
+            from fizgig.profiler.visualize import compute_lora_hash
+            self.primary_hash = compute_lora_hash(path)
+        except Exception:
+            self.primary_hash = None
+        logger.info("H3 primary loaded: %s (%d blocks)", path, len(self.primary_block_ids))
+
+    def swap_primary_weights(self, path: str) -> bool:
+        """LoRA Royale fast path: same-structure weight swap in place (epochs of one run).
+        Returns False on a structure mismatch — caller resets and reloads."""
+        if self.primary_network is None:
+            raise RuntimeError("No primary loaded; call load_primary() first.")
+        from fizgig.networks.lora import ensure_kohya_lora_state_dict
+        from safetensors.torch import load_file
+        try:
+            sd = ensure_kohya_lora_state_dict(load_file(path))
+        except Exception:
+            logger.exception("swap_primary_weights: failed to load %s", path)
+            return False
+        try:
+            info = self.primary_network.load_state_dict(sd, strict=False)
+        except Exception as e:
+            logger.info("swap_primary_weights: structure/shape mismatch, needs full reload (%s)", e)
+            return False
+        if sd and len(info.unexpected_keys) > 0.5 * len(sd):
+            return False
+        self.primary_network.to(device=self.device, dtype=self.dtype)
+        self.primary_path = path
+        self.primary_block_ids = extract_block_ids_h3(self.primary_network)
+        try:
+            from fizgig.profiler.visualize import compute_lora_hash
+            self.primary_hash = compute_lora_hash(path)
+        except Exception:
+            self.primary_hash = None
+        self._invalidate_baseline_cache()
+        self._invalidate_activation_cache()
+        return True
+
+    def load_donor(self, path: str) -> None:
+        if self.primary_network is None:
+            raise RuntimeError("Load primary LoRA before donor.")
+        if self.donor_network is not None:
+            raise RuntimeError("Donor already loaded — unload_donor() or reset() first.")
+        from safetensors.torch import load_file
+        net = _apply_lora(self.dit, load_file(path), 1.0, self.device, self.dtype)
+        net.set_enabled(False)  # donor blocks are opt-in per-slider
+        self.donor_network = net
+        self.donor_path = path
+        self.donor_block_ids = extract_block_ids_h3(net)
+        logger.info("H3 donor loaded: %s (%d blocks)", path, len(self.donor_block_ids))
+
+    def unload_donor(self) -> None:
+        if self.donor_network is not None:
+            self.donor_network.set_enabled(False)
+            self.donor_network = None
+            self.donor_path = None
+            self.donor_block_ids = set()
+
+    # ----- slider state ------------------------------------------------------
+    def apply_state(self, state) -> None:
+        """Push the per-block slider config into the live networks (regex-based, no reload)."""
+        if self.primary_network is None:
+            return
+        for bid, bs in state.blocks.items():
+            try:
+                pat = block_regex_h3(bid)
+            except ValueError:
+                continue
+            self.primary_network.set_module_enabled_by_pattern(pat, bool(bs.primary_enabled))
+            self.primary_network.set_module_multiplier_by_pattern(pat, float(bs.primary_strength))
+            if self.donor_network is not None:
+                self.donor_network.set_module_enabled_by_pattern(pat, bool(bs.donor_enabled))
+                self.donor_network.set_module_multiplier_by_pattern(pat, float(bs.donor_strength))
+
+    # ----- cancellation ------------------------------------------------------
+    def request_cancel(self) -> None:
+        self._cancel_event.set()
+
+    def clear_cancel(self) -> None:
+        self._cancel_event.clear()
+
+    # ----- prompt encoding (two-level cache) ---------------------------------
+    def _prompt_disk_path(self, prompt: str) -> Optional[str]:
+        if not self._te_cache_dir:
+            return None
+        h = hashlib.sha256((prompt + "\x00" + os.path.basename(self.te_path or ""))
+                           .encode("utf-8")).hexdigest()
+        return os.path.join(self._te_cache_dir, f"{h}.safetensors")
+
+    def _encode_prompt(self, prompt: str):
+        """[1, L, 5120] on CPU. In-memory hit -> free; disk hit -> milliseconds; miss -> the
+        32B TE loads once (couple of minutes), encodes, frees, and the result persists so no
+        future session pays again."""
+        if self._prompt_cache_key == prompt and self._prompt_cache is not None:
+            return self._prompt_cache
+        disk = self._prompt_disk_path(prompt)
+        if disk and os.path.exists(disk):
+            from safetensors.torch import load_file
+            emb = load_file(disk)["hidden_states"].unsqueeze(0)
+            self._prompt_cache_key, self._prompt_cache = prompt, emb
+            return emb
+        from fizgig.minimax.sampling import encode_sample_prompts
+        logger.info("[h3-workbench] encoding prompt with the 32B TE (one-off per prompt — "
+                    "cached to disk after this)")
+        # The TE (~15.7 GB) and the resident base must never be co-resident (the trainer's
+        # rule; the int8 base alone is ~21 GB). Park the DiT + Turbo net for the encode and
+        # restore after — safe as a whole-model .to because this engine never block-swaps.
+        _parked = False
+        if self.dit is not None:
+            self.dit.to("cpu")
+            if self._turbo_net is not None:
+                self._turbo_net.to("cpu")
+            _parked = True
+            gc.collect()
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
+        try:
+            emb = encode_sample_prompts(self.te_path, [prompt], device=self.device)[0]
+        finally:
+            if _parked:
+                self.dit.to(self.device)
+                if self._turbo_net is not None:
+                    self._turbo_net.to(device=self.device, dtype=self.dtype)
+                gc.collect()
+                if torch.cuda.is_available():
+                    torch.cuda.empty_cache()
+        emb = emb.cpu()
+        if disk:
+            try:
+                os.makedirs(self._te_cache_dir, exist_ok=True)
+                from safetensors.torch import save_file
+                save_file({"hidden_states": emb[0].contiguous()}, disk,
+                          metadata={"prompt": prompt[:512], "te": os.path.basename(self.te_path or "")})
+            except Exception:
+                logger.exception("prompt disk-cache write failed (render continues)")
+        self._prompt_cache_key, self._prompt_cache = prompt, emb
+        return emb
+
+    # ----- preview -----------------------------------------------------------
+    def generate_preview(self, state, *, seed: Optional[int] = None,
+                         prompt: Optional[str] = None, width: Optional[int] = None,
+                         height: Optional[int] = None, steps: Optional[int] = None,
+                         num_frames: Optional[int] = None,
+                         seed_b: Optional[int] = None, travel_t: float = 0.0,
+                         override_ctx=None, override_neg_ctx=None,
+                         prev_latent=None, prev_latent_strength: float = 1.0) -> Image.Image:
+        """Apply the slider state, render a 22-frame clip, return its MIDDLE frame.
+
+        seed_b / travel_t / override_neg_ctx / prev_latent are accepted for call-signature
+        parity with the other engines (LoRA Royale's shared workers); seed-travel and the
+        Klein latent chain have no H3 wiring yet and are ignored. override_ctx (a precomputed
+        [1, L, 5120] embed) drives prompt-travel."""
+        from fizgig.minimax import sampling
+        self.apply_state(state)
+        prompt = prompt if prompt is not None else state.prompt
+        seed = seed if seed is not None else state.seed
+        width = width or state.preview_width
+        height = height or state.preview_height
+        steps = steps or self._steps
+        frames = int(num_frames or H3_PREVIEW_FRAMES)
+
+        emb = override_ctx if override_ctx is not None else self._encode_prompt(prompt)
+        if isinstance(emb, tuple):          # travel waypoints carry (txt, None)
+            emb = emb[0]
+
+        def _abort_check(_seconds, _step, _total):
+            cb = self.on_step
+            if cb is not None:
+                try:
+                    cb(_step, _total)
+                except Exception:
+                    pass
+            return True if self._cancel_event.is_set() else None
+
+        # Activation-cache resume — OFF by default and NOT exposed in the H3 GUI. Measured on
+        # the real 33B (18 Aug): the resume is 3-4x faster (3-4s vs 12.5s) but a resumed
+        # render retains only ~6% of a block tweak's visible effect — on a 50-block model
+        # most of the effect comes from the perturbation re-entering the EARLY blocks on
+        # later steps, which a per-step resume never re-runs (Krea 2 hit the same wall at 28
+        # blocks / 8 steps). Kept for programmatic use and as the base for a future
+        # multi-step-aware cache; _turbo_enabled stays False for previews.
+        cache_key = (self.primary_path, self.donor_path, int(seed), prompt,
+                     width, height, frames)
+        ctx = None
+        if self._turbo_enabled and override_ctx is None and seed_b is None:
+            resume = None
+            if self._act_cache_key == cache_key and self._act_cache:
+                resume = self._resume_from_diff(state)
+            ctx = sampling.BlockCacheContext(
+                entries=self._act_cache if self._act_cache_key == cache_key else {},
+                resume_from=resume, cache_device="cpu")
+
+        def _render(block_cache):
+            with torch.no_grad():
+                return sampling.sample_image(
+                    self.dit, emb.to(self.device, self.dtype),
+                    width=width, height=height, steps=steps, cfg_scale=1.0,
+                    seed=int(seed), device=self.device, dtype=self.dtype,
+                    num_frames=frames, on_slow_step=_abort_check, slow_step_s=0.0,
+                    block_cache=block_cache)
+
+        if ctx is not None:
+            try:
+                lat = _render(ctx)
+                self._act_cache = ctx.new_entries
+                self._act_cache_key = cache_key
+                self._act_cache_state = state.copy()
+            except sampling.PreviewAborted:
+                raise
+            except Exception:
+                logger.exception("Turbo Preview failed — falling back to a full forward")
+                self._invalidate_activation_cache()
+                lat = _render(None)
+        else:
+            lat = _render(None)
+
+        dec = self._ensure_decoder().to(self.device)
+        try:
+            px = dec.decode_middle_frame(lat.float())[0]      # [3, H, W] in [0, 1]
+        finally:
+            self.decoder = dec.to("cpu")
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
+        arr = (px.permute(1, 2, 0).clamp(0, 1) * 255).byte().cpu().numpy()
+        return Image.fromarray(arr)
+
+    def generate_baseline(self, state) -> Image.Image:
+        """Baseline = primary at default 1.0 / all enabled, donor off. Cached on
+        (primary_path, seed, prompt, w, h) — slider tweaks don't invalidate it."""
+        from fizgig.repair_studio.state import SliderState
+        key = (self.primary_path, state.seed, state.prompt,
+               state.preview_width, state.preview_height)
+        if self._baseline_cache_key == key and self._baseline_cache_image is not None:
+            return self._baseline_cache_image
+        base = SliderState.default_h3()
+        base.seed = state.seed
+        base.prompt = state.prompt
+        base.preview_width = state.preview_width
+        base.preview_height = state.preview_height
+        img = self.generate_preview(base)
+        self._baseline_cache_key = key
+        self._baseline_cache_image = img
+        return img
+
+    # ----- prompt travel (Royale) --------------------------------------------
+    def encode_travel_prompts(self, prompts):
+        """Encode waypoint prompts in one TE cycle. Returns ([(emb, None), ...], None) to match
+        the other engines' (waypoints, negative) shape."""
+        from fizgig.minimax.sampling import encode_sample_prompts
+        embs = encode_sample_prompts(self.te_path, list(prompts), device=self.device)
+        self._prompt_cache_key = None      # the TE was cycled; session cache is stale
+        self._prompt_cache = None
+        return [(e.cpu(), None) for e in embs], None
+
+    @staticmethod
+    def interp_waypoints(vecs, t, mode="lerp"):
+        """Piecewise lerp across ordered (emb, None) waypoints — H3 embeds are unpadded and can
+        differ in L, so segments interpolate over the shorter length and keep the tail of the
+        LONGER end (tokens fade in/out at segment boundaries rather than truncating hard)."""
+        if len(vecs) == 1:
+            return vecs[0]
+        t = min(max(float(t), 0.0), 1.0)
+        segs = len(vecs) - 1
+        pos = t * segs
+        i = min(int(pos), segs - 1)
+        local = pos - i
+        a, b = vecs[i][0].float(), vecs[i + 1][0].float()
+        L = min(a.shape[1], b.shape[1])
+        blended = torch.lerp(a[:, :L], b[:, :L], local)
+        tail_src = a if a.shape[1] > b.shape[1] else b
+        if tail_src.shape[1] > L:
+            w = (1.0 - local) if tail_src is a else local
+            blended = torch.cat([blended, tail_src[:, L:].float() * w], dim=1)
+        return blended.to(vecs[i][0].dtype), None
+
+    # ----- caches / shims ----------------------------------------------------
+    def _invalidate_baseline_cache(self) -> None:
+        self._baseline_cache_key = None
+        self._baseline_cache_image = None
+
+    def _invalidate_activation_cache(self) -> None:
+        self._act_cache = None
+        self._act_cache_key = None
+        self._act_cache_state = None
+
+    def mark_blocks_changed(self, blocks) -> None:
+        pass          # the resume point derives from a state diff at render time (race-free)
+
+    @staticmethod
+    def _block_index(block_id):
+        return int(block_id.split("_")[1]) if str(block_id).startswith("h3blk_") else None
+
+    def _resume_from_diff(self, state):
+        """Earliest main-block index whose primary/donor differs from the cached state, or
+        None (full recompute) if a refiner block changed (it feeds block 0) or there is no
+        cached state. Diffing the FULL state guarantees no edit made during an in-flight
+        render is ever missed."""
+        if self._act_cache_state is None:
+            return None
+        changed = state.diff_blocks(self._act_cache_state)
+        if not changed:
+            return None
+        idxs = [self._block_index(b) for b in changed]
+        if any(i is None for i in idxs):     # h3_rf_* changed -> full pass
+            return None
+        return min(idxs)
+
+    # ----- teardown ----------------------------------------------------------
+    def reset(self) -> None:
+        """Full unload — drop networks (break forward-hook ref cycles), unpatch the Turbo's
+        AdaLN forwards, then the DiT + decoder."""
+        from fizgig.utils.device import release_module_tensors as _strip
+        for net in (self.primary_network, self.donor_network, self._turbo_net):
+            if net is not None:
+                try:
+                    # Strip the LoRA weights themselves, not just our references: the field
+                    # census showed a full turbo network (208 x up/down/alpha = 625 tensors)
+                    # surviving reset via externally-held forward closures, its small weights
+                    # pinning ~6 GB of allocator segments. Husks can't pin anything.
+                    _strip(net)
+                    for lora in net.unet_loras:
+                        lora.org_forward = None
+                    net.unet_loras.clear()
+                except Exception:
+                    pass
+        try:
+            from fizgig.minimax.trainer import turbo_adaln_unpatch
+            turbo_adaln_unpatch(self._turbo_adaln)
+        except Exception:
+            pass
+        self.primary_network = None
+        self.donor_network = None
+        self._turbo_net = None
+        self._turbo_adaln = []
+        # Field leak (19 Aug): the whole DiT survived reset, pinned from outside the engine
+        # (~1657 params alive, 20 GB). Dropping our reference isn't enough for a pinned
+        # module — strip its storages so the VRAM comes back regardless of the holder.
+        from fizgig.utils.device import release_module_tensors
+        release_module_tensors(self.dit)
+        release_module_tensors(self.decoder)
+        self.dit = None
+        self.decoder = None
+        self.pipeline = None
+        self.primary_path = None
+        self.donor_path = None
+        self.primary_block_ids = set()
+        self.donor_block_ids = set()
+        self.primary_hash = None
+        self._prompt_cache_key = None
+        self._prompt_cache = None
+        self._baseline_cache_key = None
+        self._baseline_cache_image = None
+        self._invalidate_activation_cache()
+        gc.collect()
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+        # Field leak (19 Aug): ~21 GB survived a reset with every attribute above nulled —
+        # the holder was OUTSIDE the engine. If that happens again, name it in the console.
+        from fizgig.utils.device import report_cuda_leak, flush_reserved_vram
+        report_cuda_leak("h3-repair-reset")
+        # Second field case: allocated 0.01 GB but 6 GB reserved — pinned allocator segments.
+        flush_reserved_vram("h3-repair-reset")

@@ -140,13 +140,31 @@ class PreviewAborted(RuntimeError):
     the first slow step completes; that still saves the other steps."""
 
 
+class BlockCacheContext:
+    """Carries the Repair Studio's per-step activation cache through sample_image.
+
+    entries: {step_idx: H3ActivationCacheEntry} from the PREVIOUS render (may be empty).
+    resume_from: earliest changed main-block index, or None for full passes.
+    new_entries: filled by this render — the caller commits it on clean completion.
+    Ignored (full forwards) whenever CFG or reference conditioning is active — those paths
+    run extra/model-variant forwards the cache doesn't model.
+    """
+
+    def __init__(self, entries=None, resume_from=None, cache_device="cpu"):
+        self.entries = entries or {}
+        self.resume_from = resume_from
+        self.new_entries = {}
+        self.cache_device = cache_device
+
+
 @torch.no_grad()
 def sample_image(model, text_embeds, *, width=512, height=512, steps=8, cfg_scale=1.0,
                  uncond_embeds=None, seed=0, shift=12.0, device="cuda",
                  dtype=torch.bfloat16, latent_channels=24, spatial=16, log_steps=False,
                  sampler="res_multistep", schedule_mode="comfy",
                  ref_latents=None, text_token_tags=None, num_frames: int = 1,
-                 on_slow_step=None, slow_step_s: float = 120.0, return_audio=False):
+                 on_slow_step=None, slow_step_s: float = 120.0, return_audio=False,
+                 block_cache: "BlockCacheContext | None" = None):
     """Denoise one image OR clip and return its LATENT [1, 24, T, H/16, W/16].
 
     num_frames is PIXEL frames on the model's 17n+5 grid (5, 22, ..., 124, 141); off-grid
@@ -208,6 +226,8 @@ def sample_image(model, text_embeds, *, width=512, height=512, steps=8, cfg_scal
     # the uncond prompt has its own length, so it must NOT carry the cond prompt's tags
     _ref_uncond_kw = {k: v for k, v in _ref_kw.items() if k != "text_token_tags"}
     use_cfg = cfg_scale > 1.0 and uncond_embeds is not None
+    _use_block_cache = (block_cache is not None and not use_cfg and not ref_latents
+                        and hasattr(model, "forward_cached"))
     sigmas = sample_schedule(steps, shift=shift, mode=schedule_mode)
     n_eval = len(sigmas) - 1                            # the terminal 0 is not an evaluation
     prev_denoised = None                                # res_multistep's one-step memory
@@ -239,8 +259,19 @@ def sample_image(model, text_embeds, *, width=512, height=512, steps=8, cfg_scal
             _sa = float(remap_sigma(torch.tensor(_sv), shift, AUDIO_SIGMA_SHIFT))
             _ascale = float(shift) / float(AUDIO_SIGMA_SHIFT)
             a_in = (audio_rows * (_sa / _sv)).to(dtype)
-            out, a_raw = model(x.to(dtype), t, text_embeds,
-                               audio_rows=a_in, return_audio=True, **_ref_kw)
+            if _use_block_cache:
+                from fizgig.minimax.model import H3ActivationCacheEntry
+                _entry = H3ActivationCacheEntry()
+                _step_cached = block_cache.entries.get(i)
+                _step_resume = block_cache.resume_from if _step_cached is not None else None
+                out, a_raw = model.forward_cached(
+                    x.to(dtype), t, text_embeds, audio_rows=a_in, return_audio=True,
+                    resume_from=_step_resume, cached=_step_cached, new_cache=_entry,
+                    cache_device=block_cache.cache_device)
+                block_cache.new_entries[i] = _entry
+            else:
+                out, a_raw = model(x.to(dtype), t, text_embeds,
+                                   audio_rows=a_in, return_audio=True, **_ref_kw)
             out = out.float()
             if use_cfg:
                 # NOTE the unconditional pass keeps the reference rows: they are conditioning
@@ -263,7 +294,18 @@ def sample_image(model, text_embeds, *, width=512, height=512, steps=8, cfg_scal
                          + (1.0 + (_ascale - 1.0) * _sa) * a_raw.float())
         else:
             a_out = None
-            out = model(x.to(dtype), t, text_embeds, **_ref_kw).float()
+            if _use_block_cache:
+                from fizgig.minimax.model import H3ActivationCacheEntry
+                _entry = H3ActivationCacheEntry()
+                _step_cached = block_cache.entries.get(i)
+                _step_resume = block_cache.resume_from if _step_cached is not None else None
+                out = model.forward_cached(
+                    x.to(dtype), t, text_embeds,
+                    resume_from=_step_resume, cached=_step_cached, new_cache=_entry,
+                    cache_device=block_cache.cache_device).float()
+                block_cache.new_entries[i] = _entry
+            else:
+                out = model(x.to(dtype), t, text_embeds, **_ref_kw).float()
             if use_cfg:
                 out_u = model(x.to(dtype), t, uncond_embeds, **_ref_uncond_kw).float()
                 out = out_u + cfg_scale * (out - out_u)
@@ -292,7 +334,9 @@ def sample_image(model, text_embeds, *, width=512, height=512, steps=8, cfg_scal
         # Windows — the driver pages to system RAM and the forward just crawls, so every
         # exception-driven fallback in the trainer stays silent while a step takes minutes.
         # Timing the step is the only signal that survives that failure mode.
-        if on_slow_step is not None and not _slow_fired:
+        # slow_step_s <= 0 turns the one-shot notice into a per-step poll (the workbench's
+        # cooperative-cancel hook); a positive threshold keeps the classic fire-once notice.
+        if on_slow_step is not None and (not _slow_fired or slow_step_s <= 0):
             _elapsed = _t.time() - _step_t0
             if _elapsed > slow_step_s:
                 _slow_fired = True

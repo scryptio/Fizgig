@@ -151,6 +151,12 @@ def setup_parser() -> argparse.ArgumentParser:
                         "The text refiner is always included. H3's blocks are identical and nobody "
                         "has mapped what each one does, so any selection is a hypothesis — compare "
                         "against a full-model run on the same dataset.")
+    p.add_argument("--photo_blocks", default=None, metavar="SPEC",
+                   help="Optimised Likeness Learning: photo training steps update only these "
+                        "DiT blocks (the refiner always trains); video/audio clip steps update "
+                        "the full model. '20-49' is the measured likeness recipe — photo "
+                        "gradients into the front trunk erode rendering and anatomy while "
+                        "identity lives in the back blocks. Composes with --train_blocks.")
     p.add_argument("--base_quant", default="auto", choices=["auto", "int8", "nf4"],
                    help="Frozen-base precision. 'int8' keeps the checkpoint's own ConvRot "
                         "weights (~0.17%% base error, ~21 GB) — what the reference trainer "
@@ -267,6 +273,7 @@ def main():
         base_quant=args.base_quant,
         include_patterns=args.include_patterns,
         train_blocks=args.train_blocks,
+        photo_blocks=args.photo_blocks,
         distill=args.distill,
         distill_weight=args.distill_weight,
         distill_phase1_epochs=args.distill_phase1_epochs,

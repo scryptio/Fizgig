@@ -14,10 +14,11 @@ Two kinds of asset, handled differently:
 
   * WEIGHTS  — single .safetensors files. Downloaded into <repo>/models/ (or --models-dir)
                and written into prefs.json against the pref key the GUI reads.
-  * TOOLS    — Florence-2, the InsightFace face model, and the EN->ZH translator. These are
-               loaded BY NAME at runtime, not by path, so there's nothing to put in prefs —
-               "fetching" them means warming the cache they'll be loaded from, which turns a
-               mid-workflow stall into a one-off up-front download.
+  * TOOLS    — Florence-2, the InsightFace face model, the EN->ZH translator and Gizmo's
+               Whisper transcriber. These are loaded BY NAME at runtime, not by path, so
+               there's nothing to put in prefs — "fetching" them means warming the cache
+               they'll be loaded from, which turns a mid-workflow stall into a one-off
+               up-front download (and, for Whisper, guarantees Gizmo transcribes offline).
 
 Idempotent throughout: anything already present and valid is skipped, so it's safe to re-run
 and safe to call at container start. Resumable too — hf_hub_download picks a broken 26 GB
@@ -123,6 +124,11 @@ TOOLS = [
     ("MiaoshouAI/Florence-2-base-PromptGen", 1.0, "Florence-2 captioner"),
     ("Helsinki-NLP/opus-mt-en-zh", 0.3, "EN->ZH translator (bilingual captions)"),
     ("insightface:buffalo_l", 0.3, "Face model — Look Filter + likeness scoring"),
+    # hf-model: config + tokenizer + safetensors only. The repo also carries .bin/.msgpack/.h5
+    # duplicates of the same weights — an unfiltered snapshot would pull 1.16 GB for a 0.3 GB
+    # model. Gizmo checks this cache before loading (gizmo.py local_whisper_dir) and stays
+    # offline once it's here; the pattern lists MUST match.
+    ("hf-model:openai/whisper-base", 0.3, "Whisper — Gizmo's Transcribe button, offline"),
     # Tokenizer/processor configs only (hf-config: skips the weights — those load from the
     # user's own safetensors). A few MB each, and the difference between "captioning and text
     # encoding work offline" and "the first use needs internet for a vocab file".
@@ -338,6 +344,13 @@ def fetch_tool(spec, log=print, dry_run=False):
             from huggingface_hub import snapshot_download
             snapshot_download(repo_id=model_id.split(":", 1)[1],
                               allow_patterns=["*.json", "*.txt", "*.model"])
+        elif model_id.startswith("hf-model:"):
+            # Configs + tokenizer + the safetensors weights — skipping the .bin/.msgpack/.h5
+            # duplicates these repos also carry. Keep in lockstep with the runtime's
+            # local-cache check (gizmo.py _WHISPER_PATTERNS).
+            from huggingface_hub import snapshot_download
+            snapshot_download(repo_id=model_id.split(":", 1)[1],
+                              allow_patterns=["*.json", "*.txt", "*.model", "*.safetensors"])
         else:
             from huggingface_hub import snapshot_download
             snapshot_download(repo_id=model_id)
@@ -373,7 +386,7 @@ def fetch(families, models_dir=None, repo_dir=REPO_DIR, token=None, include_opti
     ok = True
     for fam in families:
         if fam == "tools":
-            log("Helper models (Florence-2, face model, translator):")
+            log("Helper models (Florence-2, face model, translator, Whisper):")
             for spec in TOOLS:
                 fetch_tool(spec, log=log, dry_run=dry_run)   # never fails the run
             log("")

@@ -671,6 +671,26 @@ WHISPER_LANGUAGES = ["Auto detect", "English", "French", "German", "Spanish", "I
                      "Portuguese", "Dutch", "Polish", "Welsh", "Russian", "Ukrainian",
                      "Japanese", "Chinese", "Korean", "Arabic", "Hindi"]
 
+# Preferences' "Download models for me" warms the HuggingFace cache with exactly these
+# patterns (fizgig.scripts.fetch_models, the hf-model: branch) — the two lists MUST stay
+# identical, or the local check below misses a file the loader wants and goes online anyway.
+_WHISPER_REPO = "openai/whisper-base"
+_WHISPER_PATTERNS = ["*.json", "*.txt", "*.model", "*.safetensors"]
+
+
+def local_whisper_dir():
+    """The cached Whisper snapshot, or None. Never touches the network.
+
+    This is how Transcribe honours the Preferences downloader: once the fetcher (or a past
+    online first-use) has the files, the pipeline is built from this local path and Gizmo
+    transcribes fully offline — no version check, no reach for the hub at all."""
+    try:
+        from huggingface_hub import snapshot_download
+        return snapshot_download(_WHISPER_REPO, local_files_only=True,
+                                 allow_patterns=_WHISPER_PATTERNS)
+    except Exception:
+        return None
+
 
 def voice_output_name(src_path, out_dir, claimed=()):
     """<source stem>_01.wav, skipping past files on disk and names the queue has spoken for.
@@ -2907,8 +2927,9 @@ class Gizmo:
         self.audio_whisper_btn = self._button(
             trow, "🎤 Transcribe", self.audio_transcribe,
             tip="Listen to the marked segment with Whisper (a small speech-recognition model, "
-                "~150 MB, downloaded once) and append the words it hears to the caption as "
-                "saying \"…\". The description half stays yours — no model can hear that a "
+                "~300 MB, downloaded once — Preferences' ⬇ Download models for me fetches it "
+                "up front so this works offline) and append the words it hears to the caption "
+                "as saying \"…\". The description half stays yours — no model can hear that a "
                 "voice is warm.")
         self.audio_whisper_btn.pack(side=tk.RIGHT)
         _default_lang = self.settings.get("whisper_language", "Auto detect")
@@ -3723,10 +3744,13 @@ class Gizmo:
         """Whisper the marked segment and append `saying "…"` to the caption.
 
         transformers is already in Fizgig's venv (it runs the EN→ZH translator the same way), so
-        no new dependency — just a one-time ~150 MB model download on first use."""
+        no new dependency — just a one-time ~300 MB model download on first use, or none at all
+        when Preferences' downloader already fetched it (see local_whisper_dir)."""
         if self._whisper_busy or not self.audio_src:
             return
         self._whisper_busy = True
+        # Decided once per click, not per 400 ms tick — the check walks the HF cache dir.
+        self._whisper_ready = hasattr(self, "_whisper_pipe") or local_whisper_dir() is not None
         self.audio_whisper_btn.configure(state=tk.DISABLED, text="⏳ Transcribing…")
         self._whisper_dots = 0
         self._whisper_progress_tick()
@@ -3737,13 +3761,13 @@ class Gizmo:
                          daemon=True).start()
 
     def _whisper_progress_tick(self):
-        """A visibly alive status line while Whisper works — the first run downloads ~150 MB
+        """A visibly alive status line while Whisper works — the first run downloads ~300 MB
         and a silent, disabled button for that long reads as a hang."""
         if not self._whisper_busy:
             return
         self._whisper_dots = (self._whisper_dots + 1) % 4
-        base = ("listening — first use downloads ~150 MB, please wait"
-                if not hasattr(self, "_whisper_pipe") else "listening")
+        base = ("listening" if getattr(self, "_whisper_ready", False)
+                else "listening — first use downloads ~300 MB, please wait")
         self.audio_status.configure(text=base + "." * self._whisper_dots,
                                     fg=COLORS["text_secondary"])
         self.root.after(400, self._whisper_progress_tick)
@@ -3777,8 +3801,11 @@ class Gizmo:
                 raise RuntimeError("could not extract the segment")
             from transformers import pipeline
             if not hasattr(self, "_whisper_pipe"):
+                # Local snapshot first: a path never goes online. The hub name is the
+                # fallback for the one-time first-use download.
                 self._whisper_pipe = pipeline("automatic-speech-recognition",
-                                              model="openai/whisper-base", device=-1)
+                                              model=local_whisper_dir() or _WHISPER_REPO,
+                                              device=-1)
 
             # Raw samples, not the file path: handed a path, transformers shells out to its
             # own ffmpeg to decode it — without the no-window flag, so a black console
@@ -3808,9 +3835,11 @@ class Gizmo:
                        "outcome) and try again, pick the language from the dropdown, or just "
                        "type the words.")
         except Exception as exc:
-            err = (f"Whisper could not run: {exc}\n\nIt needs one ~150 MB download the first "
-                   f"time (internet required once). The caption still works without it — "
-                   f"describe the voice and skip the transcript.")
+            err = (f"Whisper could not run: {exc}\n\nIt needs one ~300 MB download the first "
+                   f"time (internet required once — or fetch it in advance with Preferences → "
+                   f"⬇ Download models for me, and it works offline forever after). The "
+                   f"caption still works without it — describe the voice and skip the "
+                   f"transcript.")
         self.root.after(0, self._whisper_done, text, err)
 
     def _whisper_done(self, text, err):

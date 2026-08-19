@@ -29,6 +29,7 @@
 </p>
 
 > ### 📰 Latest news
+> - **Fizgig 4.2 — the workbench opens to MiniMax H3, and what it found ships as features** — all five post-training tools now work on H3 LoRAs, with previews rendered as 22-frame clips judged by their middle frame. Using those tools on real LoRAs produced the first **H3 block map** — and its biggest finding is now **Optimised Likeness Learning**, a default-on checkbox that trains photos on the identity blocks only: sharper, more prompt-responsive, better sound, fewer epochs. Plus a **✨ MiniMax H3 Style** preset, an **Append Transcription** button that Whispers a clip's speech into its caption, and fully offline transcription. [Details ↓](#minimax-h3--third-model-family) · [Release notes](docs/RELEASE_NOTES_v4.2.0.md)
 > - **Fizgig 4.0 — video, sound and voices** — MiniMax H3 now trains on **video clips**, on **their sound**, and on **voice recordings alone**: photos, clips and voice files in one folder train one LoRA in one run. **Gizmo**, a new bundled prep tool, cuts to-spec clips from any footage, auto-chops long videos at scene cuts, and records a voice dataset from nothing but a mic and ten minutes of reading. Training previews render in **6 steps** with the Turbo LoRA and can carry their **generated sound**, opening in the gallery as playable clips. And **16 GB / 24 GB cards now train on the accurate int8 base** — block swap streams one-way, ~6× faster, contributed by **[@rintic-13](https://github.com/rintic-13)**. [Details ↓](#minimax-h3--third-model-family) · [Release notes](docs/RELEASE_NOTES_v4.0.0.md)
 > - **MiniMax H3 LoRAs now work without the Turbo LoRA** (3.7.0) — a LoRA that looked right in a 4-step Turbo workflow could go soft or distort in the stock 20-step one, and the workaround was to drop its strength. The cause was a setting called **mid-concentrated**, which has been removed: across five datasets, LoRAs trained without it hold up at full strength with Turbo unloaded. The old percentage box is now a named **Training Structure** control on the Training tab. Also in the release: a substantial security audit by **[@FNGarvin](https://github.com/FNGarvin)**. [Release notes](docs/RELEASE_NOTES_v3.7.0.md)
 > - **The workbench checks your LoRA before it loads 9 GB** (3.6.4) — pick a Krea 2 LoRA with the selector on Klein 9B in **Royale**, **Explorer** or **Repair Studio** and it now switches to match in milliseconds, instead of loading the wrong pipeline and failing 25 seconds later. Installs got faster and lighter on disk in the same release. All of it contributed by **[@FNGarvin](https://github.com/FNGarvin)**. [Release notes](docs/RELEASE_NOTES_v3.6.4.md)
@@ -55,10 +56,10 @@ Under the workbench sits a fast, light trainer tuned to **fit your GPU**: a full
 
 ## The workbench
 
-Each tool works on a trained run's output **or any LoRA you've downloaded** — and they hand off to each other (profile → repair → explore → compare, one closed loop). Klein and Krea 2; MiniMax H3 is training-only for now.
+Each tool works on a trained run's output **or any LoRA you've downloaded** — and they hand off to each other (profile → repair → explore → compare, one closed loop). All three families: Klein, Krea 2 and MiniMax H3 (H3 previews render a short clip, judged by its middle frame — the model's native regime).
 
 ### Repair Studio
-Thirty-two live sliders — one per transformer block — with a side-by-side preview that updates as you drag. **Turbo Preview** caches per-block activations so late-block edits redraw up to 97% faster; the baked save is always exact. Blend blocks from a second **donor** LoRA, balance the pair per block, condition previews on a reference photo, and save a `.safetensors` that works in ComfyUI at strength 1.0.
+A live slider per transformer block (32 on Klein, up to 50 + the token refiners on MiniMax H3) with a side-by-side preview that updates as you drag. **Turbo Preview** caches per-block activations so late-block edits redraw up to 97% faster; the baked save is always exact. Blend blocks from a second **donor** LoRA, balance the pair per block, condition previews on a reference photo, and save a `.safetensors` that works in ComfyUI at strength 1.0.
 
 ### LoRA the Explorer
 Evolutionary discovery: the app mutates blocks and shows four variants — pick a favourite and it becomes the new baseline. Freeze what you like, set how far composition drifts, cycle seeds — and send any baseline to Repair Studio (and back) with one click.
@@ -70,7 +71,7 @@ Point it at a training run and it renders **every epoch on one fixed seed**, wit
 A per-block activation profile as a colour-coded HTML report — which blocks carry style, identity, and detail, and where they overlap. Repair Studio reads its sidecar automatically and shows the findings inline when you load the same LoRA.
 
 ### Extract
-Distil any Klein or Krea 2 LoRA to a lower rank — Fast presets run weight-only SVD with no models loaded; Klein's activation-weighted presets add block and timestep targeting. PEFT and LyCORIS sources supported.
+Distil any Klein, Krea 2 or MiniMax H3 LoRA to a lower rank — Fast presets run weight-only SVD with no models loaded; Klein's activation-weighted presets add block and timestep targeting. PEFT and LyCORIS sources supported.
 
 ---
 
@@ -101,7 +102,7 @@ Edit any caption yourself mid-run from the Problem Images window — no restart.
 
 Fizgig trains LoRAs for **MiniMax H3**, MiniMax's open-weight ~33B video model, from ordinary still-image datasets — and from **short video clips, their sound, and voice recordings** ([details ↓](#training-on-video-clips--and-on-their-sound)) — on a single consumer GPU. Output loads straight into ComfyUI's H3 workflows, including the pruned inference builds.
 
-**Training only, for now.** H3 trains, previews and pauses/resumes like the other families; the workbench tabs are Klein and Krea 2 only — planned, not ruled out.
+**The full studio, as of 4.2.** H3 trains, previews and pauses/resumes like the other families — and all five workbench tools now work on H3 LoRAs too, with previews rendered as short clips judged by their middle frame. It was those tools, on real LoRAs, that produced the block map behind Optimised Likeness Learning below.
 
 **How it works:** pick **MiniMax H3** from the Base Model selector and the usual flow applies — Start-tab folder, Captions, Samples, Training. Leave **Blocks Swap** and **Base Precision** on Auto: at launch the trainer reads your **free** VRAM (close ComfyUI first) and picks the base precision and block-swap count together:
 
@@ -114,12 +115,21 @@ Fizgig trains LoRAs for **MiniMax H3**, MiniMax's open-weight ~33B video model, 
 
 int8 is the checkpoint's own storage and the most accurate base (~0.17% error). Block swap **streams one way only** — ~6.4× faster than round-trip swap, which is what lets 16 and 24 GB cards keep the accurate base (design contributed by [@rintic-13](https://github.com/rintic-13), [#73](https://github.com/shootthesound/Fizgig/issues/73)). Hit an OOM anyway? Set Blocks Swap to a number to override the planner.
 
-Two built-in presets ship; **Defaults** applies the moment you pick the family:
+Three built-in presets ship; **Defaults** applies the moment you pick the family:
 
 | Preset | Settings |
 |---|---|
 | **✨ MiniMax H3 Defaults** | LoRA dim/alpha 16, 60 epochs, **0.25 MP**, Training Structure **Likeness and Style**, `adamw`, flat 1e-4 |
 | **✨ MiniMax H3 Fast** | The same at **rank 8, 40 epochs, flat 2e-4**. Reaches likeness in a few hundred steps, and the lower rank tends to come out more flexible |
+| **✨ MiniMax H3 Style** | Fast with blocks `0-3, 6-47` and a gentler flat 1e-4 — style lives almost everywhere in H3, and the early blocks it needs want small, consistent updates |
+
+<p align="center"><img src="assets/optimised_likeness.png" alt="Optimised Likeness Learning — the default-on Training-tab checkbox" width="713"></p>
+
+**Optimised Likeness Learning** ships ticked (Defaults and Fast; Style unticks it): photo steps
+train only the identity blocks (**20-49**) while video and audio clips train the full model.
+Measured against full-model photo training: sharper, much better prompt following, better sound,
+fewer epochs — and the occasional deformed preview of full-model photo runs is gone. Untick it
+for style or scene training; while it's on, Blocks to Train is disabled with a note.
 
 **0.25 MP is the default, and it holds up** — four times cheaper per step than 1 MP, and the extra resolution has not paid for itself in testing. Raise it if a specific dataset asks for it.
 
@@ -144,6 +154,8 @@ Two built-in presets ship; **Defaults** applies the moment you pick the family:
 **…get fast previews while training?** Set the **Turbo LoRA** (~780 MB, its own Preferences row): 6-step previews with the Turbo at 75% on top of your training LoRA. Adjustable on the Samples tab.
 
 **…hear what it's generating while training?** Pick a **"with sound"** Sample length on the Samples tab. Each preview carries its generated soundtrack, playable in the gallery.
+
+**…get a clip's spoken words into its caption?** Open it in the caption editor (Captions tab → click the clip): any non-muted video shows an **🎤 Append Transcription** button that Whispers the speech into the caption as `saying "…"` — Gizmo's grammar, without leaving the tab.
 
 **…set it up?** One extra model file for sound: the **audio VAE** (~605 MB), on its own Preferences row. Blank = clips train silent; required only once the folder has voice recordings. Fizgig points out both new files once at startup if your H3 paths are set.
 
@@ -207,7 +219,8 @@ Each has a **Download link on its row in Preferences**:
 Every control has a hint in the app; the highlights:
 
 - **Training Structure** (default **Likeness and Style**) — how much of the run trains on nearly-clean images, where likeness *and* style live. **Model default, movement** is the reference trainer's schedule; **Custom** exposes the raw percentage. **Medium to High LR** beside it is best left at 100.
-- **Blocks to Train** (default all 50) — train a subset of H3's 50 blocks: faster steps, smaller file, and possibly a cleaner likeness with less memorised set. No published block map yet — type ranges (`3-12, 22, 31-33`) and A/B against a full run.
+- **Optimised Likeness Learning** (default On) — photo steps train the identity blocks (20-49) only; clips train the full model. The measured best recipe for character and voice work — untick for style or scene training.
+- **Blocks to Train** — hand-pick a subset of H3's 50 blocks (disabled while Optimised Likeness Learning owns the choice). The measured recipes: **`20-49` for likeness**, **`0-3, 6-47` for style** (the Style preset sets it), voice core `38-48`. Type ranges (`3-12, 22, 31-33`) to experiment beyond them.
 - **Reference distillation** (experimental) — teaches the LoRA to render your subject from the trigger word the way H3 renders them from a *photo*: each image is marked against the model shown *other* photos of the same person, so identity is learned without the scenery. Needs the ref2va model; the LoRA deploys on the ordinary model. **Aimed at Multi Concept**, where it demonstrably helps hold two people apart. **Identity-first** (Auto) trains a teacher-only first phase, then pure photos.
 - **Multi Concept** — two subjects, two folders, two trigger words, one LoRA. Each subject's images are only ever compared against their own.
 - **Adapter-relative LR** (default Off) — the LR box becomes a ceiling the run climbs toward, keeping each step proportional to the adapter's size. Worth trying when a run overshoots early.
@@ -425,7 +438,7 @@ Auto budgets from your *free* VRAM and the console explains its choice. If a pre
 
 ### MiniMax H3
 
-See [the Auto table in its section](#minimax-h3--third-model-family) — 16 GB and up trains on the accurate int8 base with streamed block swap; ≤12 GB falls back to 4-bit.
+See [the Auto table in its section](#minimax-h3--third-model-family) — 16 GB and up trains on the accurate int8 base with streamed block swap; ≤12 GB falls back to 4-bit. On 16 GB-class cards, previews cap themselves at **768×640 and 22 frames** (sound kept) — larger picks in the menus simply clamp, with a console note.
 
 ### Desktop feels juddery while training? (Windows)
 

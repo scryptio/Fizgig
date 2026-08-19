@@ -36,15 +36,18 @@ logger = logging.getLogger(__name__)
 
 
 _BLOCK_KEY_RE = re.compile(r"(?:lora_unet_)?(double_blocks|single_blocks)_(\d+)_")
-# Krea 2 module naming (see repair_studio.krea2_blocks). txtfusion is checked before main
-# blocks; the block-id namespaces (double_/single_ vs block_/txt_) never collide, so one
-# mapper serves both model families — a key that maps to an id absent from state.blocks
-# just falls into the keep-as-is branch.
+# Krea 2 + MiniMax H3 module naming (see repair_studio.krea2_blocks / h3_blocks). txtfusion
+# and token_refiner are checked before main blocks. Krea 2 and H3 SHARE the raw
+# `lora_unet_blocks_N_` key shape but use disjoint block-id namespaces (block_N vs h3blk_N),
+# so the mapper is resolved against the STATE's own ids: whichever namespace the state
+# carries is the family being baked. A key that maps to an id absent from state.blocks
+# still falls into the keep-as-is branch.
 _KREA2_TXT_KEY_RE = re.compile(r"txtfusion_(layerwise|refiner)_blocks_(\d+)_")
-_KREA2_MAIN_KEY_RE = re.compile(r"lora_unet_blocks_(\d+)_")
+_H3_REFINER_KEY_RE = re.compile(r"token_refiner_blocks_(\d+)_")
+_MAIN_BLOCKS_KEY_RE = re.compile(r"lora_unet_blocks_(\d+)_")
 
 
-def _block_id_from_key(key: str) -> Optional[str]:
+def _block_id_from_key(key: str, state_block_ids=None) -> Optional[str]:
     m = _BLOCK_KEY_RE.search(key)
     if m:
         kind = m.group(1).replace("_blocks", "")  # "double" / "single"
@@ -52,9 +55,15 @@ def _block_id_from_key(key: str) -> Optional[str]:
     t = _KREA2_TXT_KEY_RE.search(key)
     if t:
         return f"txt_{'lw' if t.group(1) == 'layerwise' else 'rf'}_{int(t.group(2))}"
-    m = _KREA2_MAIN_KEY_RE.search(key)
+    r = _H3_REFINER_KEY_RE.search(key)
+    if r:
+        return f"h3_rf_{int(r.group(1))}"
+    m = _MAIN_BLOCKS_KEY_RE.search(key)
     if m:
-        return f"block_{int(m.group(1))}"
+        n = int(m.group(1))
+        if state_block_ids is not None and f"h3blk_{n}" in state_block_ids:
+            return f"h3blk_{n}"
+        return f"block_{n}"
     return None
 
 
@@ -249,7 +258,7 @@ def save_repaired_lora(
     keys_in = len(sd_p) + (len(sd_d) if sd_d is not None else 0)
 
     for mod_name in all_modules:
-        block_id = _block_id_from_key(mod_name)
+        block_id = _block_id_from_key(mod_name, state.blocks.keys())
         if block_id is None:
             # Not a transformer-block module — pass primary's keys through if present.
             if mod_name in modules_p:

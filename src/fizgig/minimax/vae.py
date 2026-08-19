@@ -561,6 +561,69 @@ class MiniMaxH3VideoVAEDecoder(nn.Module):
         dec = dec.float() * self.pixel_std.to(dec) + self.pixel_mean.to(dec)
         return dec.clamp_(0.0, 1.0)
 
+    @torch.no_grad()
+    def decode_middle_frame(self, z, frame_idx=None):
+        """Decode ONE frame of a clip latent by decoding only the temporal chunk(s) that
+        contribute to it. Returns pixels [B, 3, H*16, W*16] in [0, 1] — numerically identical
+        to `decode_clip(z)[:, :, frame_idx]`, including the cross-fade when the frame sits in
+        a chunk-boundary blend zone (then the previous chunk decodes too).
+
+        At 22 frames the whole clip is one chunk, so this saves nothing; at 56 frames it
+        decodes 1 of 3 chunks, at 124 one of 7. `frame_idx=None` means the middle frame."""
+        from fizgig.minimax.model import pixel_frames_for_latent
+        out_frames = pixel_frames_for_latent(int(z.shape[2]))
+        if z.shape[2] == 1:
+            return self.decode(z)
+        if frame_idx is None:
+            frame_idx = out_frames // 2
+        frame_idx = max(0, min(out_frames - 1, int(frame_idx)))
+
+        lm = self.latents_mean.view(1, -1, 1, 1, 1).to(z)
+        ls = self.latents_std.view(1, -1, 1, 1, 1).to(z)
+        w_dtype = self.post_quant_conv.weight.dtype
+        zz = self.post_quant_conv((z * ls + lm).to(w_dtype))
+
+        # Same chunk bookkeeping as decode_clip.
+        pseudo = zz.shape[2] + self._PRE_PAD
+        pad_tokens = (-pseudo) % self._CHUNK_TOK
+        num_chunks = (pseudo + pad_tokens) // self._CHUNK_TOK - 1
+        if num_chunks < 1:
+            pad_tokens += self._CHUNK_TOK
+            num_chunks += 1
+        if pad_tokens:
+            zz = torch.cat([zz, zz[:, :, -1:].repeat(1, 1, pad_tokens, 1, 1)], dim=2)
+
+        chunk_dec = self._CHUNK_TOK * self._RATIO_T
+        chunk_len = chunk_dec - self._PRE_PAD              # 17 kept pixel frames per chunk
+
+        def _chunk_parts(i):
+            t0 = i * self._CHUNK_TOK
+            cd = self._tiled_decode(zz[:, :, t0:t0 + self._CHUNK_TOK + self._TOK_OVERLAP])
+            main = cd[:, :, self._PRE_PAD:chunk_dec]       # the 17 frames this chunk owns
+            overlap = cd[:, :, chunk_dec + self._PRE_PAD:]  # up to 5 frames fed forward
+            return main, overlap
+
+        tail_start = num_chunks * chunk_len
+        if frame_idx >= tail_start:
+            # The final 17n..17n+4 frames are the last chunk's overlap, written raw.
+            _, overlap = _chunk_parts(num_chunks - 1)
+            frame = overlap[:, :, frame_idx - tail_start]
+        else:
+            ci = frame_idx // chunk_len
+            local = frame_idx - ci * chunk_len
+            main, _ = _chunk_parts(ci)
+            frame = main[:, :, local]
+            if ci > 0 and local < self._FRAME_OVERLAP:
+                # Cross-fade zone: blend with the previous chunk's overlap using the same
+                # weights _blend applies at this position (wa = 1 - pos/extent).
+                _, prev_overlap = _chunk_parts(ci - 1)
+                extent = min(prev_overlap.shape[2], chunk_len, self._FRAME_OVERLAP)
+                if local < extent:
+                    wb = torch.tensor(local / extent, dtype=frame.dtype, device=frame.device)
+                    frame = prev_overlap[:, :, local] * (1 - wb) + frame * wb
+        frame = frame.float() * self.pixel_std.to(frame)[:, :, 0] + self.pixel_mean.to(frame)[:, :, 0]
+        return frame.clamp_(0.0, 1.0)
+
     def _decode_tile(self, zz):
         """One spatial tile: the full decoded clip [B, 3, 4*T, h*16, w*16] — temporal selection
         is the caller's job (single-frame keeps one frame; decode_clip slices per chunk)."""

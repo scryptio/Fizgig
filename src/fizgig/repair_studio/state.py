@@ -69,6 +69,16 @@ class SliderState:
         from fizgig.repair_studio.krea2_blocks import all_block_ids_krea2
         return cls(blocks={bid: BlockState() for bid in all_block_ids_krea2()})
 
+    @classmethod
+    def default_h3(cls) -> "SliderState":
+        """MiniMax H3 layout: 50 main blocks + 2 token-refiner (see repair_studio.h3_blocks).
+        Preview res 768 — H3's native canvas short edge; the engine renders a 22-frame clip
+        at this size and shows its middle frame (a still is H3's most out-of-distribution
+        render, so the clip regime is the honest instrument)."""
+        from fizgig.repair_studio.h3_blocks import all_block_ids_h3
+        return cls(blocks={bid: BlockState() for bid in all_block_ids_h3()},
+                   preview_width=768, preview_height=768)
+
     def to_json(self) -> Dict[str, Any]:
         return {
             "blocks": {bid: asdict(bs) for bid, bs in self.blocks.items()},

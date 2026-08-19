@@ -1776,13 +1776,11 @@ FAMILY_DISPLAY_NAMES = {
     "minimax": "MiniMax H3",
 }
 
-# Families that actually have an inference-side selector (Royale, Explorer, Repair Studio all
-# offer only these two radios). MiniMax H3 is train-only right now — no engine, no pipeline, no
-# widget for it in any of those tabs — so a caller auto-following lora_family_from_file's result
-# must refuse rather than tk.StringVar.set() a value neither radio button carries (issue #62
-# follow-up: the var still holds it, both radios go blank, and the family that actually loads is
-# whichever one the "else" branch of the caller's own is_krea2 ternary falls back to).
-INFERENCE_FAMILIES = ("klein", "krea2")
+# Families that actually have an inference-side selector (Royale, Explorer, Repair Studio).
+# A caller auto-following lora_family_from_file's result must only .set() values a radio
+# button carries (issue #62 follow-up: a value with no radio leaves both blank and the family
+# that loads is whichever "else" branch the caller's ternary falls back to).
+INFERENCE_FAMILIES = ("klein", "krea2", "minimax")
 
 # Klein 9B's block depth (Klein9BParams in klein/model.py: depth=8, depth_single_blocks=24).
 # double_blocks/single_blocks (native/kohya) and transformer_blocks/single_transformer_blocks
@@ -1926,7 +1924,12 @@ def _build_dit_linear_map(
     for name, module in unet.named_modules():
         if target_replace_modules is None or module.__class__.__name__ in target_replace_modules:
             for child_name, child_module in module.named_modules():
-                if child_module.__class__.__name__ in ("Linear", "Conv2d"):
+                # Must match create_modules' whitelist (lora.py ~:860) — quantized bases hold
+                # Linear SUBCLASSES, and a plain-Linear test silently drops every LyCORIS
+                # module on them (H3's LoKR default loaded 0 modules before this).
+                if child_module.__class__.__name__ in (
+                        "Linear", "Linear4bit", "Linear8bitLt",
+                        "ConvRotInt8Linear", "Nvfp4Linear", "Conv2d"):
                     original_name = (name + "." if name else "") + child_name
                     lora_name = f"{prefix}.{original_name}".replace(".", "_")
                     result[lora_name] = child_module

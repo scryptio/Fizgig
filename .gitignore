@@ -98,3 +98,4 @@ docs/RUNPOD_TEMPLATE.md
 # Local-only deploy/sync helpers (never commit)
 sync-to-remote.sh
 gizmo_settings.json
+docs/RESEARCH_*
