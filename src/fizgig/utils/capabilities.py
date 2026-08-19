@@ -420,6 +420,11 @@ def should_compile(total_steps: int, quant_4bit: bool, quant_int8: str,
     which is why only the compile gate needs them at this strength.
     """
     caps = caps or detect()
+    if caps.is_rocm:
+        return False, (
+            "ROCm/HIP PyTorch build — Auto leaves torch.compile off "
+            "(recompiles per bucket shape on HIP; set Compile Blocks to On to override)"
+        )
     vram = vram_gb if vram_gb is not None else (caps.vram_free_gb or caps.vram_gb)
 
     if blocks_to_swap:
