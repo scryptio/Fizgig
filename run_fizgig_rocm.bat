@@ -11,8 +11,9 @@ set "PYTORCH_ALLOC_CONF=expandable_segments:True,max_split_size_mb:512,garbage_c
 set "TORCH_ROCM_AOTRITON_ENABLE_EXPERIMENTAL=1"
 set "FIZGIG_GPU_BACKEND=rocm"
 
-REM BNB_ROCM_VERSION / ROCM_PATH / HIP_PATH - written by install_fizgig_rocm.bat
-REM to match the installed PyTorch ROCm SDK (e.g. 715 for ROCm 7.15).
+REM BNB_ROCM_VERSION / ROCM_PATH / HIP_PATH / gfx12 batched-GEMM wa — written by
+REM install_fizgig_rocm.bat / write_rocm_env.py (not on every launch; re-run write_rocm_env.py
+REM after a pull if rocm_env.bat is stale).
 if exist "%~dp0rocm_env.bat" (
     call "%~dp0rocm_env.bat"
 ) else if exist "%~dp0venv\Scripts\python.exe" (
@@ -28,6 +29,13 @@ if defined ROCM_PATH if exist "%ROCM_PATH%\bin" set "PATH=%ROCM_PATH%\bin;%PATH%
 if exist "%~dp0venv\Lib\site-packages\_rocm_sdk_devel\bin" set "PATH=%~dp0venv\Lib\site-packages\_rocm_sdk_devel\bin;%PATH%"
 if exist "%~dp0venv\Scripts" set "PATH=%~dp0venv\Scripts;%PATH%"
 
+REM Opt out of gfx12 ROCBLAS_USE_HIPBLASLT_BATCHED=0 from rocm_env.bat:
+REM   set FIZGIG_NO_ROCBLAS_BATCHED_WA=1
+if defined FIZGIG_NO_ROCBLAS_BATCHED_WA set "ROCBLAS_USE_HIPBLASLT_BATCHED="
+
 echo [AMD-ROCm] BNB_ROCM_VERSION=%BNB_ROCM_VERSION%  ROCM_PATH=%ROCM_PATH%
+if defined ROCBLAS_USE_HIPBLASLT_BATCHED (
+    echo [AMD-ROCm] ROCBLAS_USE_HIPBLASLT_BATCHED=%ROCBLAS_USE_HIPBLASLT_BATCHED% ^(gfx12 batched GEMM wa^)
+)
 
 start "" /b wscript //nologo //b "%~dp0run_silent.vbs"

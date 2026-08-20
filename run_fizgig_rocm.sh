@@ -16,7 +16,8 @@ export TORCH_ROCM_AOTRITON_ENABLE_EXPERIMENTAL=1
 export FIZGIG_GPU_BACKEND=rocm
 # Cache fast-exit: src/fizgig/rocm/cache_exit.py (Linux ROCm only). Opt out: FIZGIG_ROCM_NO_FAST_EXIT=1
 
-# BNB_ROCM_VERSION / ROCM_PATH / HIP_PATH — written by install_fizgig_rocm.sh / write_rocm_env.py
+# BNB_ROCM_VERSION / ROCM_PATH / HIP_PATH / gfx12 batched-GEMM wa — write_rocm_env.py
+# (install / first launch only; re-run write_rocm_env.py after a pull if rocm_env.sh is stale).
 if [[ -f rocm_env.sh ]]; then
     # shellcheck source=rocm_env.sh
     source rocm_env.sh
@@ -56,7 +57,16 @@ for _lib in venv/lib/python*/site-packages/_rocm_sdk_core/lib \
 done
 export LD_LIBRARY_PATH
 
+# Opt out of gfx12 ROCBLAS_USE_HIPBLASLT_BATCHED=0 from rocm_env.sh:
+#   FIZGIG_NO_ROCBLAS_BATCHED_WA=1 ./run_fizgig_rocm.sh
+if [[ -n "${FIZGIG_NO_ROCBLAS_BATCHED_WA:-}" ]]; then
+    unset ROCBLAS_USE_HIPBLASLT_BATCHED
+fi
+
 echo "[AMD-ROCm] BNB_ROCM_VERSION=${BNB_ROCM_VERSION:-}  ROCM_PATH=${ROCM_PATH:-}"
+if [[ -n "${ROCBLAS_USE_HIPBLASLT_BATCHED:-}" ]]; then
+    echo "[AMD-ROCm] ROCBLAS_USE_HIPBLASLT_BATCHED=${ROCBLAS_USE_HIPBLASLT_BATCHED} (gfx12 batched GEMM wa)"
+fi
 
 python lora_trainer_gui.py &
 disown

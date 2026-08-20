@@ -324,7 +324,7 @@ Then double-click `install_fizgig_rocm.bat` (NVIDIA users never run this). It pi
 - `torchvision==0.27.0+rocm7.15.0a20260728`
 - `rocm-sdk-devel==7.15.0a20260728`
 
-Override with `TORCH_PIN` / `TORCHVISION_PIN` / `ROCM_SDK_DEVEL_PIN` if needed. **bitsandbytes** is a pinned community Windows ROCm wheel from [0xDELUXA/bitsandbytes_win_rocm](https://github.com/0xDELUXA/bitsandbytes_win_rocm) — built by neither AMD nor Fizgig. Shared deps come from `requirements.txt` with CUDA `torch`/`bitsandbytes` and NVIDIA-only `nvidia-ml-py` filtered out (`filter_requirements_rocm.py`). Launch with `run_fizgig_rocm.bat`.
+Override with `TORCH_PIN` / `TORCHVISION_PIN` / `ROCM_SDK_DEVEL_PIN` if needed. **bitsandbytes** is a pinned community Windows ROCm wheel from [0xDELUXA/bitsandbytes_win_rocm](https://github.com/0xDELUXA/bitsandbytes_win_rocm) — built by neither AMD nor Fizgig. Shared deps come from `requirements.txt` with CUDA `torch`/`bitsandbytes` and NVIDIA-only `nvidia-ml-py` filtered out (`filter_requirements_rocm.py`). Launch with `run_fizgig_rocm.bat`. On **gfx1200 / gfx1201** (RDNA4), the launcher sets `ROCBLAS_USE_HIPBLASLT_BATCHED=0` so batched GEMMs use Tensile ([ROCm#5344](https://github.com/ROCm/ROCm/issues/5344)); opt out with `FIZGIG_NO_ROCBLAS_BATCHED_WA=1`. Do **not** set `ROCBLAS_USE_HIPBLASLT=0` on current nightlies — that path regresses.
 
 **Linux (AMD ROCm — highly experimental)** — expect crashes, GPU resets, and incomplete model support on many setups. Best-effort only; Windows ROCm or NVIDIA Linux are the supported training paths. Prerequisites: amdgpu driver loaded (`/dev/kfd`), user in `render`/`video` groups. See [Install ROCm](https://rocm.docs.amd.com/en/latest/install/rocm.html) and [PyTorch for ROCm](https://rocm.docs.amd.com/projects/ai-ecosystem/en/latest/frameworks/pytorch/install.html). Then:
 
@@ -351,7 +351,7 @@ ROCM_CHANNEL=nightly TORCH_NIGHTLY_MINOR=2.14 ./install_fizgig_rocm.sh
 # (paired torchvision ~0.29.0a0+rocm7.14.0a… — installer resolves the match)
 ```
 
-Linux ROCm cache scripts import `fizgig.rocm.cache_exit` only when `FIZGIG_GPU_BACKEND=rocm` (set by `run_fizgig_rocm.sh`); NVIDIA and other platforms call `main()` unchanged. Opt out: `FIZGIG_ROCM_NO_FAST_EXIT=1 ./run_fizgig_rocm.sh`.
+Linux ROCm cache scripts import `fizgig.rocm.cache_exit` only when `FIZGIG_GPU_BACKEND=rocm` (set by `run_fizgig_rocm.sh`); NVIDIA and other platforms call `main()` unchanged. Opt out: `FIZGIG_ROCM_NO_FAST_EXIT=1 ./run_fizgig_rocm.sh`. Same gfx12 batched-GEMM workaround as Windows (`ROCBLAS_USE_HIPBLASLT_BATCHED=0`); opt out: `FIZGIG_NO_ROCBLAS_BATCHED_WA=1`.
 
 Then shared deps from `requirements.txt` (filtered) and `bitsandbytes>=0.50.0` for ROCm.
 
