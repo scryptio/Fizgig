@@ -121,7 +121,7 @@ Three built-in presets ship; **Defaults** applies the moment you pick the family
 |---|---|
 | **✨ MiniMax H3 Defaults** | LoRA dim/alpha 16, 60 epochs, **0.25 MP**, Training Structure **Likeness and Style**, `adamw`, flat 1e-4 |
 | **✨ MiniMax H3 Fast** | The same at **rank 8, 40 epochs, flat 2e-4**. Reaches likeness in a few hundred steps, and the lower rank tends to come out more flexible |
-| **✨ MiniMax H3 Style** | Fast with blocks `0-3, 6-47` and a gentler flat 1e-4 — style lives almost everywhere in H3, and the early blocks it needs want small, consistent updates |
+| **✨ MiniMax H3 Style** | The Fast recipe on the measured style blocks, `0-3, 6-47` — style lives almost everywhere in H3 except the few blocks that only do identity and voice |
 
 <p align="center"><img src="assets/optimised_likeness.png" alt="Optimised Likeness Learning — the default-on Training-tab checkbox" width="713"></p>
 
@@ -368,7 +368,7 @@ chmod +x run_fizgig.sh
 Three small models auto-download on first use: InsightFace `buffalo_l` (~300 MB, during install), Florence-2 (~500 MB–1.5 GB, first AI caption), and Helsinki-NLP `opus-mt-en-zh` (~300 MB, first bilingual translation).
 ---
 
-## Model downloads (you provide)
+## Model downloads
 
 Fizgig doesn't bundle weights. You only need the family you're using — and **Preferences has a ⬇ Download models for me button** under each model card that downloads, verifies, and fills in the paths (Klein needs a free HuggingFace token for BFL's licence; Krea 2 needs no account). Every row also has a manual **Download** link. CLI:
 

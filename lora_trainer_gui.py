@@ -932,13 +932,12 @@ MINIMAX_BUILT_IN_PRESETS["✨ MiniMax H3 Fast (LoRA 8, 40 epochs)"] = {
 # The 19 Aug style ablation (Repair Studio, same instrument that found the likeness set): a
 # style LoRA's deltas matter across nearly the WHOLE model — droppable only at 4-5 (the dead
 # band / audio-embedder pipe) and 48-49 (subject-specific last-mile work: load-bearing for
-# likeness and voice, silent for style). Hence 0-3, 6-47. Style rides on the gradient-fragile
-# early blocks that likeness training deliberately freezes, so the LR is halved from Fast's
-# 2e-4: style is a broad low-magnitude tilt accumulated over epochs, and gentle everywhere is
-# both the deformation mitigation and good style practice in its own right.
-MINIMAX_BUILT_IN_PRESETS["✨ MiniMax H3 Style (LoRA 8, gentle LR)"] = {
+# likeness and voice, silent for style). Hence 0-3, 6-47. LR matches Fast's 2e-4 — Peter's
+# real style runs (20 Aug) found the halved 1e-4 unnecessary; drop it manually for an extra-
+# gentle run if a style ever fries.
+MINIMAX_BUILT_IN_PRESETS["✨ MiniMax H3 Style (LoRA 8)"] = {
     **MINIMAX_BUILT_IN_PRESETS["✨ MiniMax H3 Fast (LoRA 8, 40 epochs)"],
-    "LEARNING_RATE": 1e-4,
+    "LEARNING_RATE": 2e-4,
     "MINIMAX_BLOCKS": "0-3, 6-47",
     # MUST be off here: style measurably needs the early blocks the likeness mask freezes, and
     # with it on the blocks spec above would be ignored outright.
@@ -1333,8 +1332,16 @@ def _git(*args, timeout=8) -> str:
 
 def _git_describe_version() -> str:
     """Human version of the running checkout: 'v3.1.1' exactly on a tag,
-    'v3.1.1-2-gee3a7fa' in between, or the bare short SHA if tags aren't local."""
-    return _git("describe", "--tags", "--always") or _app_commit()
+    'v3.1.1-2-gee3a7fa' in between. Pods clone --depth 1 (no tags), so describe falls back
+    to a bare short SHA — which read as a mystery build number in the field ('Version
+    37c0c2f' was current master, taken for an old app). Name the branch so a tagless
+    checkout says what it is: 'master @ 37c0c2f'."""
+    v = _git("describe", "--tags", "--always") or _app_commit()
+    if v and "v" not in v.split("-")[0]:
+        branch = _git("rev-parse", "--abbrev-ref", "HEAD")
+        if branch and branch != "HEAD":
+            return f"{branch} @ {v}"
+    return v
 
 
 def _latest_release_tag():
@@ -1395,6 +1402,17 @@ def _check_for_update():
     has_obj = _git_ok("cat-file", "-e", f"{sha}^{{commit}}")
     is_anc = has_obj and _git_ok("merge-base", "--is-ancestor", sha, "HEAD")
     status = _update_status_from(latest, has_obj, is_anc)
+    if status == "update_available":
+        # Shallow-clone truth (pods clone --depth 1): the tag's commit isn't in the local
+        # object store even when HEAD is AHEAD of it, so ancestry can't clear us — but being
+        # exactly the remote tip can. Without this, every pod born after any post-release
+        # commit showed a FALSE Update Available banner on perfectly current code (the 19 Aug
+        # "old pods" saga — three images, all current, all nagging). A genuinely stale pod
+        # is neither on the tag nor at the tip, so real updates still flag.
+        remote_head = (_git("ls-remote", "origin", "HEAD", timeout=15) or "").split()
+        local_head = _git("rev-parse", "HEAD")
+        if remote_head and local_head and remote_head[0] == local_head:
+            status = "up_to_date"
     return status, (tag if status == "update_available" else _git_describe_version())
 
 

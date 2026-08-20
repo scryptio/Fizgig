@@ -37,14 +37,19 @@ to Train box:
 - **Voice: core `38-48`**, generous `34-49`. (Block 5 is the audio *embedder* — essential in
   the base model, but measured to barely adapt under voice training: audio flows through the
   front, voices are learned in the back.)
-- Blocks **0-19** are the fragile shared machinery: likeness training should never touch them except maybe at a very low LR,
-  style training should touch them gently (a lower learning rate - as per the style preset).
+- Blocks **0-19** are the fragile shared machinery: likeness training should never touch them
+  except maybe at a very low LR. Style training uses them at the normal rate without trouble.
 
 ## ✨ MiniMax H3 Style preset
 
-The Fast recipe with two changes from the map: blocks `0-3, 6-47` and the learning rate halved
-to 1e-4 — style is a broad, gentle tilt, and the early blocks it needs don't tolerate big kicks.
-Optimised Likeness Learning is off in this preset by design. You could even lower the learning rate to half that again, but it will take longer. 5e-5 is half of 1e-4.
+The Fast recipe on the measured style blocks, `0-3, 6-47` — style lives almost everywhere in
+H3 except the few blocks that only do identity and voice. Optimised Likeness Learning is off
+in this preset by design.
+
+*Updated after release:* the preset originally shipped at a halved 1e-4 with a
+lower-it-further tip, but real style runs found the standard **2e-4** to be what style
+actually needs — the gentler rates just train slower for no measured benefit. Update Fizgig
+and reload the preset to pick up the new rate.
 
 ## The workbench tabs, for H3
 
