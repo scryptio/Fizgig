@@ -10,8 +10,19 @@ cd /d "%~dp0"
 set "Q=>nul 2>&1"
 set "PY312="
 set "PY312_SOURCE="
+set "ROCM_NIGHTLY=0"
+
+REM Optional: install_fizgig_rocm.bat --nightly  → floating multi-arch torch (no TORCH_PIN),
+REM leave BNB_ROCM_VERSION unset so bitsandbytes auto-picks its highest matching lib.
+:parse_args
+if "%~1"=="" goto :args_done
+if /I "%~1"=="--nightly" set "ROCM_NIGHTLY=1"
+shift
+goto :parse_args
+:args_done
 
 REM Pinned stack confirmed working on RDNA (multi-arch nightlies). Override if needed.
+REM Ignored when --nightly is passed.
 set "ROCM_INDEX=https://rocm.nightlies.amd.com/whl-multi-arch/"
 if not defined TORCH_PIN set "TORCH_PIN=2.12.0+rocm7.15.0a20260728"
 if not defined TORCHVISION_PIN set "TORCHVISION_PIN=0.27.0+rocm7.15.0a20260728"
@@ -21,6 +32,11 @@ set "BNB_WHEEL=https://github.com/0xDELUXA/bitsandbytes_win_rocm/releases/downlo
 echo ============================================================
 echo   Fizgig Installer - AMD ROCm (Windows)
 echo   Klein 9B and Krea 2 LoRA Studio
+if !ROCM_NIGHTLY!==1 (
+    echo   Mode: --nightly ^(floating multi-arch, no torch pin^)
+) else (
+    echo   Mode: pinned multi-arch ^(default^)
+)
 echo ============================================================
 echo.
 echo Requires Python 3.12 ^(the ROCm bitsandbytes wheel is cp312-only^).
@@ -28,9 +44,14 @@ echo Fizgig's GUI needs Tkinter, which ships with a full python.org / pymanager 
 echo.
 echo PyTorch / ROCm wheels come from AMD nightlies - not built by Fizgig:
 echo   Index:  !ROCM_INDEX!
-echo   torch==!TORCH_PIN!
-echo   torchvision==!TORCHVISION_PIN!
-echo   rocm-sdk-devel==!ROCM_SDK_DEVEL_PIN!
+if !ROCM_NIGHTLY!==1 (
+    echo   torch[device-ARCH] / torchvision[device-ARCH] / rocm-sdk-devel  ^(unpinned latest^)
+    echo   BNB_ROCM_VERSION: unset - bitsandbytes auto-selects its highest matching DLL
+) else (
+    echo   torch==!TORCH_PIN!
+    echo   torchvision==!TORCHVISION_PIN!
+    echo   rocm-sdk-devel==!ROCM_SDK_DEVEL_PIN!
+)
 echo.
 echo bitsandbytes is a community Windows ROCm wheel ^(0xDELUXA^) - neither AMD nor Fizgig:
 echo   !BNB_WHEEL!
@@ -150,16 +171,29 @@ if !USE_LEGACY_URL!==1 (
     goto :install_shared
 )
 
-echo Installing pinned ROCm PyTorch ^(multi-arch^) for !arch!...
-echo Source: !ROCM_INDEX!
-echo   torch[device-!arch!]==!TORCH_PIN!
-echo   torchvision[device-!arch!]==!TORCHVISION_PIN!
-echo   rocm-sdk-devel==!ROCM_SDK_DEVEL_PIN!
-python -m uv pip install --index-strategy unsafe-best-match --index-url "!ROCM_INDEX!" ^
-    "torch[device-!arch!]==!TORCH_PIN!" ^
-    "torchvision[device-!arch!]==!TORCHVISION_PIN!" ^
-    "rocm-sdk-devel==!ROCM_SDK_DEVEL_PIN!"
-if errorlevel 1 goto :install_failed
+if !ROCM_NIGHTLY!==1 (
+    echo Installing floating ROCm nightly ^(multi-arch, unpinned^) for !arch!...
+    echo Source: !ROCM_INDEX!
+    echo   torch[device-!arch!]
+    echo   torchvision[device-!arch!]
+    echo   rocm-sdk-devel
+    python -m uv pip install --index-strategy unsafe-best-match --index-url "!ROCM_INDEX!" ^
+        "torch[device-!arch!]" ^
+        "torchvision[device-!arch!]" ^
+        "rocm-sdk-devel"
+    if errorlevel 1 goto :install_failed
+) else (
+    echo Installing pinned ROCm PyTorch ^(multi-arch^) for !arch!...
+    echo Source: !ROCM_INDEX!
+    echo   torch[device-!arch!]==!TORCH_PIN!
+    echo   torchvision[device-!arch!]==!TORCHVISION_PIN!
+    echo   rocm-sdk-devel==!ROCM_SDK_DEVEL_PIN!
+    python -m uv pip install --index-strategy unsafe-best-match --index-url "!ROCM_INDEX!" ^
+        "torch[device-!arch!]==!TORCH_PIN!" ^
+        "torchvision[device-!arch!]==!TORCHVISION_PIN!" ^
+        "rocm-sdk-devel==!ROCM_SDK_DEVEL_PIN!"
+    if errorlevel 1 goto :install_failed
+)
 
 :install_shared
 echo.
@@ -182,8 +216,13 @@ python -c "import torch; print(f'PyTorch {torch.__version__}'); print(f'GPU avai
 if errorlevel 1 goto :install_failed
 
 echo.
-echo Writing ROCm launcher config ^(BNB_ROCM_VERSION for bitsandbytes^)...
-python write_rocm_env.py
+if !ROCM_NIGHTLY!==1 (
+    echo Writing ROCm launcher config ^(BNB_ROCM_VERSION omitted - bitsandbytes auto^)...
+    python write_rocm_env.py --nightly
+) else (
+    echo Writing ROCm launcher config ^(BNB_ROCM_VERSION for bitsandbytes^)...
+    python write_rocm_env.py
+)
 if errorlevel 1 goto :install_failed
 
 echo.

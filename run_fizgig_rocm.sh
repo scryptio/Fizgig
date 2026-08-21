@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Fizgig launcher for AMD ROCm on Linux — mirrors run_fizgig_rocm.bat env tuning.
+# Fizgig launcher for AMD ROCm on Linux - mirrors run_fizgig_rocm.bat env tuning.
 # HIGHLY EXPERIMENTAL: Linux AMD training is best-effort only.
 cd "$(dirname "$0")"
 
@@ -16,7 +16,7 @@ export TORCH_ROCM_AOTRITON_ENABLE_EXPERIMENTAL=1
 export FIZGIG_GPU_BACKEND=rocm
 # Cache fast-exit: src/fizgig/rocm/cache_exit.py (Linux ROCm only). Opt out: FIZGIG_ROCM_NO_FAST_EXIT=1
 
-# BNB_ROCM_VERSION / ROCM_PATH / HIP_PATH / gfx12 batched-GEMM wa — write_rocm_env.py
+# BNB_ROCM_VERSION / ROCM_PATH / HIP_PATH / gfx12 batched-GEMM wa - write_rocm_env.py
 # (install / first launch only; re-run write_rocm_env.py after a pull if rocm_env.sh is stale).
 if [[ -f rocm_env.sh ]]; then
     # shellcheck source=rocm_env.sh
@@ -29,9 +29,7 @@ elif [[ -x venv/bin/python ]]; then
     fi
 fi
 
-if [[ -z "${BNB_ROCM_VERSION:-}" ]]; then
-    export BNB_ROCM_VERSION=714  # libbitsandbytes_rocm714.so — Linux stable torch stack
-fi
+# Pinned installs set BNB_ROCM_VERSION in rocm_env.sh; otherwise leave unset for bitsandbytes.
 if [[ -z "${ROCM_PATH:-}" ]]; then
     for _p in venv/lib/python*/site-packages/_rocm_sdk_core; do
         if [[ -d "$_p" ]]; then
@@ -63,7 +61,11 @@ if [[ -n "${FIZGIG_NO_ROCBLAS_BATCHED_WA:-}" ]]; then
     unset ROCBLAS_USE_HIPBLASLT_BATCHED
 fi
 
-echo "[AMD-ROCm] BNB_ROCM_VERSION=${BNB_ROCM_VERSION:-}  ROCM_PATH=${ROCM_PATH:-}"
+if [[ -n "${BNB_ROCM_VERSION:-}" ]]; then
+    echo "[AMD-ROCm] BNB_ROCM_VERSION=${BNB_ROCM_VERSION}  ROCM_PATH=${ROCM_PATH:-}"
+else
+    echo "[AMD-ROCm] BNB_ROCM_VERSION unset (bitsandbytes selects lib)  ROCM_PATH=${ROCM_PATH:-}"
+fi
 if [[ -n "${ROCBLAS_USE_HIPBLASLT_BATCHED:-}" ]]; then
     echo "[AMD-ROCm] ROCBLAS_USE_HIPBLASLT_BATCHED=${ROCBLAS_USE_HIPBLASLT_BATCHED} (gfx12 batched GEMM wa)"
 fi
