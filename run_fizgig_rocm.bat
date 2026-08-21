@@ -20,7 +20,7 @@ if exist "%~dp0rocm_env.bat" (
     "%~dp0venv\Scripts\python.exe" "%~dp0write_rocm_env.py" >nul 2>&1
     if exist "%~dp0rocm_env.bat" call "%~dp0rocm_env.bat"
 )
-REM Pinned installs set BNB_ROCM_VERSION in rocm_env.bat. Floating --nightly leaves it
+REM Pinned installs set BNB_ROCM_VERSION in rocm_env.bat. Floating --experimental leaves it
 REM unset so bitsandbytes picks its highest matching DLL (override: set BNB_ROCM_VERSION).
 if not defined ROCM_PATH set "ROCM_PATH=%~dp0venv\Lib\site-packages\_rocm_sdk_core"
 if not defined HIP_PATH set "HIP_PATH=%ROCM_PATH%"

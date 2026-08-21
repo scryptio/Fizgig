@@ -8,8 +8,9 @@ On gfx1200/gfx1201, also exports ROCBLAS_USE_HIPBLASLT_BATCHED=0 - Tensile for b
 GEMMs (ROCm#5344). Blunt ROCBLAS_USE_HIPBLASLT=0 is NOT set (hurts ROCm 7.15). Opt out at
 launch: FIZGIG_NO_ROCBLAS_BATCHED_WA=1.
 
-With --nightly (Windows floating install): omit BNB_ROCM_VERSION so bitsandbytes auto-selects
-its highest matching lib (falls back with a warning if exact ROCm minor is missing).
+With --experimental (Windows floating install): omit BNB_ROCM_VERSION so bitsandbytes
+auto-selects its highest matching lib (falls back with a warning if exact ROCm minor is
+missing). Distinct from Linux ROCM_CHANNEL=nightly.
 """
 
 from __future__ import annotations
@@ -154,12 +155,12 @@ def bnb_rocm_version_from_torch() -> str:
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument(
-        "--nightly",
+        "--experimental",
         action="store_true",
-        help="Omit BNB_ROCM_VERSION (bitsandbytes auto-select). Used by install_fizgig_rocm.bat --nightly.",
+        help="Omit BNB_ROCM_VERSION (bitsandbytes auto-select). Used by install_fizgig_rocm.bat --experimental.",
     )
     args = parser.parse_args(argv)
-    omit_bnb = bool(args.nightly)
+    omit_bnb = bool(args.experimental)
 
     is_linux = sys.platform.startswith("linux")
     default_bnb = DEFAULT_BNB_LINUX if is_linux else DEFAULT_BNB_WIN
@@ -207,7 +208,7 @@ def main(argv: list[str] | None = None) -> int:
         src = "default (install probe failed)"
 
     if omit_bnb:
-        src = f"{src}; BNB_ROCM_VERSION omitted (--nightly / bitsandbytes auto)"
+        src = f"{src}; BNB_ROCM_VERSION omitted (--experimental / bitsandbytes auto)"
 
     gfx = detect_gfx_target()
     gfx12_batched_wa = gfx in GFX12_HIPBLASLT_BATCHED_WA if gfx else False
@@ -227,7 +228,7 @@ def main(argv: list[str] | None = None) -> int:
         ]
         if omit_bnb:
             bat_lines.append(
-                "REM Floating nightly: leave BNB_ROCM_VERSION unset - bitsandbytes auto-selects."
+                "REM Experimental: leave BNB_ROCM_VERSION unset - bitsandbytes auto-selects."
             )
         else:
             bat_lines.append(f'set "BNB_ROCM_VERSION={bnb}"')
@@ -261,7 +262,7 @@ def main(argv: list[str] | None = None) -> int:
         ]
         if omit_bnb:
             sh_lines.append(
-                "# Floating nightly: leave BNB_ROCM_VERSION unset - bitsandbytes auto-selects."
+                "# Experimental: leave BNB_ROCM_VERSION unset - bitsandbytes auto-selects."
             )
         else:
             sh_lines.append(f'export BNB_ROCM_VERSION="{bnb}"')
