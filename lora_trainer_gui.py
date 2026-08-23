@@ -1916,11 +1916,15 @@ class LoRATrainerGUI:
         except Exception:
             pass
 
-        # Caption model state (lazy loaded, one at a time — see unload_florence_model)
-        self.florence_model = None
-        self.florence_processor = None
-        self.florence_device = None
-        self.qwen_captioner = None      # Krea 2 Qwen3-VL, ~8 GB when resident
+        # AI captioning runs in batch_caption.py worker — no in-process models.
+        self.caption_process = None
+        self._caption_worker_stdin = None
+        self._caption_worker_key = None
+        self._caption_worker_ready = threading.Event()
+        self._caption_worker_warm = False
+        self._training_start_pending = False
+        self._caption_worker_released_for_training = False
+        self._caption_stop_file = ""
         self.captioning_stop_flag = False
         self.caption_thumbnails = {}
         self.current_caption_page = 0
@@ -2221,11 +2225,6 @@ class LoRATrainerGUI:
             self._unload_explorer_models()
         if tab_text != "LoRA Royale" and not self._royale_is_busy():
             self._royale_unload()
-        # Same rule for the ~8 GB Qwen3-VL captioner: leaving the Captions tab means you're done
-        # with it. Guarded on the in-flight flag like the others — a batch running in the
-        # background must not have its model pulled out from under it.
-        if tab_text != "3. Captions" and not getattr(self, '_captioning_running', False):
-            self._release_qwen_captioner_if_idle()
 
     def remove_focus(self, event):
         """Remove focus from active widget when clicking background"""
@@ -9384,114 +9383,425 @@ class LoRATrainerGUI:
 
     # endregion
 
-    def load_florence_model(self):
-        """Load Florence model (lazy loading)"""
-        if self.florence_model is not None:
-            return True
-
-        try:
-            model_name = self.caption_model_var.get()
-            self.update_caption_log(f"Loading {model_name}...\n")
-            self.update_caption_log("(First run will download model from Hugging Face - ~500MB-1.5GB)\n")
-            self.master.update_idletasks()
-
-            from transformers import AutoModelForCausalLM, AutoProcessor
-            import torch
-
-            device = "cuda" if torch.cuda.is_available() else "cpu"
-
-            self.update_caption_log("Loading processor...\n")
-            self.master.update_idletasks()
-
-            from fizgig.utils.hf_cache import from_pretrained_cache_first
-            florence_revision = FLORENCE_REVISIONS.get(model_name)
-            florence_code_revision = FLORENCE_CODE_REVISIONS.get(model_name)
-            self.florence_processor = from_pretrained_cache_first(
-                AutoProcessor,
-                model_name,
-                revision=florence_revision,
-                code_revision=florence_code_revision,
-                trust_remote_code=True
-            )
-
-            self.update_caption_log("Loading model weights...\n")
-            self.master.update_idletasks()
-
-            # Florence-2's custom code defines _supports_sdpa as a property that
-            # accesses self.language_model — but transformers 4.50+ reads it during
-            # __init__ before language_model exists, causing AttributeError.
-            # attn_implementation="eager" bypasses the SDPA check entirely.
-            self.florence_model = from_pretrained_cache_first(
-                AutoModelForCausalLM,
-                model_name,
-                revision=florence_revision,
-                code_revision=florence_code_revision,
-                torch_dtype=torch.float16 if device == "cuda" else torch.float32,
-                trust_remote_code=True,
-                attn_implementation="eager"
-            ).to(device)
-
-            self.florence_device = device
-            self.update_caption_log(f"Model loaded successfully on {device.upper()}\n")
-            return True
-
-        except ImportError as e:
-            self.update_caption_log(f"Error: transformers not installed\n")
-            self.update_caption_log("Run: pip install transformers einops\n")
-            messagebox.showerror("Missing Dependency",
-                "transformers library not installed.\n\n"
-                "Run the Fizgig installer to add Florence support:\n"
-                "python install_fizgig.py\n\n"
-                "Or manually: pip install transformers einops")
-            return False
-
-        except Exception as e:
-            self.update_caption_log(f"Error loading model: {e}\n")
-            messagebox.showerror("Error", f"Failed to load Florence model:\n{e}")
-            return False
-
     def unload_florence_model(self, silent=False):
-        """Unload whichever caption model is resident (Florence-2 or Qwen3-VL) to free VRAM.
-
-        Name kept for the existing button and the pre-training hook. The Qwen3-VL captioner is
-        ~8 GB, so leaving it resident would OOM the training run this is called before."""
-        # Refuse while a captioning job is running. Without this, unloading mid-job freed the
-        # model and the worker's very next image called _generate_ai_caption, found no model,
-        # and quietly RELOADED it — which looks exactly like the job resuming after you pressed
-        # Unload. _release_qwen_captioner_if_idle already had this guard; the button did not.
+        """Stop the caption worker subprocess and release its GPU memory."""
         if getattr(self, "_captioning_running", False):
-            self.update_caption_log(
-                "Captioning is still running — press Stop first, then Unload.\n")
+            self.update_caption_log("Captioning is still running — press Stop first.\n")
             if not silent:
                 messagebox.showinfo(
                     "Captioning in progress",
-                    "A captioning job is still running.\n\nPress Stop and wait for it to finish, "
-                    "then unload. (Unloading now would just make the job reload the model and "
-                    "carry on.)")
+                    "A captioning job is still running.\n\nPress Stop and wait for it to finish.")
             return
-        import gc
-        import torch
-        freed = []
-        if getattr(self, "florence_model", None) is not None:
-            del self.florence_model
-            del self.florence_processor
-            self.florence_model = None
-            self.florence_processor = None
-            self.florence_device = None
-            freed.append("Florence-2")
-        if getattr(self, "qwen_captioner", None) is not None:
-            del self.qwen_captioner
-            self.qwen_captioner = None
-            freed.append("Qwen3-VL")
-        if freed:
-            gc.collect()
-            torch.cuda.empty_cache()
-            self.update_caption_log(f"{' + '.join(freed)} unloaded\n")
+        proc = getattr(self, "caption_process", None)
+        if proc is None or proc.poll() is not None:
             if not silent:
-                messagebox.showinfo("Model Unloaded",
-                                    f"{' + '.join(freed)} unloaded. VRAM freed.")
-        elif not silent:
-            messagebox.showinfo("Info", "No model loaded")
+                messagebox.showinfo("Info", "No caption model is loaded.")
+            return
+        self.update_caption_log("Unloading caption model...\n")
+
+        def _bg_unload():
+            self._stop_caption_worker(silent=True, wait=True)
+            self.master.after(0, lambda: self._finish_caption_unload(silent))
+
+        threading.Thread(target=_bg_unload, daemon=True).start()
+
+    def _finish_caption_unload(self, silent: bool) -> None:
+        vram = self._read_vram()
+        msg = "Caption model unloaded."
+        if vram:
+            used, tot = vram
+            msg += f"\n\nDevice VRAM {used / 1e9:.1f} / {tot / 1e9:.1f} GB"
+        self.update_caption_log(msg + "\n")
+        if not silent:
+            messagebox.showinfo("Caption model unloaded", msg)
+
+    def _reset_caption_worker_state(self) -> None:
+        self.caption_process = None
+        self._caption_worker_stdin = None
+        self._caption_worker_key = None
+        self._caption_worker_warm = False
+        self._caption_worker_ready.clear()
+
+    def _caption_job_dir(self) -> str:
+        cache = ""
+        try:
+            cache = self.prefs_vars["cache_dir"].get().strip()
+        except Exception:
+            pass
+        if not cache:
+            cache = os.path.join(FIZGIG_DIR, "cache")
+        d = os.path.join(cache, "_caption_job")
+        os.makedirs(d, exist_ok=True)
+        return d
+
+    def _caption_script_path(self) -> str:
+        return os.path.join(FIZGIG_DIR, "src", "fizgig", "scripts", "batch_caption.py")
+
+    def _caption_worker_config_key(self) -> tuple:
+        if self._is_qwen_captioner():
+            return ("qwen", self._qwen_captioner_path() or "", bool(self._is_minimax_arch()))
+        return ("florence", self.caption_model_var.get(), bool(self._is_minimax_arch()))
+
+    def _write_caption_worker_config(self) -> str:
+        job_dir = self._caption_job_dir()
+        config_path = os.path.join(job_dir, "worker_config.json")
+        config = {
+            "backend": "qwen" if self._is_qwen_captioner() else "florence",
+            "include_video": self._is_minimax_arch(),
+        }
+        if config["backend"] == "qwen":
+            config["text_encoder"] = self._qwen_captioner_path()
+        else:
+            model_name = self.caption_model_var.get()
+            config["florence_model"] = model_name
+            rev = FLORENCE_REVISIONS.get(model_name)
+            code_rev = FLORENCE_CODE_REVISIONS.get(model_name)
+            if rev:
+                config["florence_revision"] = rev
+            if code_rev:
+                config["florence_code_revision"] = code_rev
+        with open(config_path, "w", encoding="utf-8") as f:
+            json.dump(config, f)
+        return config_path
+
+    def _write_caption_job(self, images: list[str]) -> tuple[str, str]:
+        job_dir = self._caption_job_dir()
+        list_file = os.path.join(job_dir, "images.txt")
+        instr_file = os.path.join(job_dir, "instruction.txt")
+        job_path = os.path.join(job_dir, "job.json")
+        stop_file = os.path.join(job_dir, "stop")
+        with open(list_file, "w", encoding="utf-8") as f:
+            for p in images:
+                f.write(p + "\n")
+        try:
+            os.remove(stop_file)
+        except OSError:
+            pass
+        try:
+            max_tokens = int(self.caption_max_tokens_var.get())
+        except (ValueError, tk.TclError):
+            max_tokens = 120
+        trigger = self.caption_trigger_var.get().strip() if hasattr(self, "caption_trigger_var") else ""
+        job = {
+            "list_file": list_file,
+            "max_new_tokens": max_tokens,
+            "trigger": trigger,
+            "stop_file": stop_file,
+        }
+        if self._is_qwen_captioner():
+            te = self._qwen_captioner_path()
+            if not te:
+                raise FileNotFoundError("Qwen3-VL text encoder path is not set or not found")
+            with open(instr_file, "w", encoding="utf-8") as f:
+                f.write(self._resolve_caption_instruction())
+            job["instruction_file"] = instr_file
+        else:
+            job["florence_task"] = self.caption_task_var.get()
+        with open(job_path, "w", encoding="utf-8") as f:
+            json.dump(job, f)
+        return job_path, stop_file
+
+    def _caption_worker_env(self) -> dict:
+        env = self._cuda_env_for_subprocess(os.environ.copy())
+        env["PYTHONIOENCODING"] = "utf-8"
+        env["PYTHONUNBUFFERED"] = "1"
+        return env
+
+    def _start_caption_worker_reader(self, proc) -> None:
+        def reader():
+            try:
+                assert proc.stdout is not None
+                for line in proc.stdout:
+                    self._handle_caption_subprocess_line(line.rstrip("\r\n"))
+            finally:
+                rc = proc.wait()
+                self.master.after(0, lambda r=rc: self._on_caption_worker_exit(r))
+
+        threading.Thread(target=reader, daemon=True).start()
+
+    def _caption_worker_alive(self) -> bool:
+        proc = getattr(self, "caption_process", None)
+        try:
+            return proc is not None and proc.poll() is None
+        except Exception:
+            return False
+
+    def _stop_caption_worker(self, silent: bool = False, wait: bool = True,
+                             graceful: bool = True) -> None:
+        import subprocess
+
+        proc = getattr(self, "caption_process", None)
+        if proc is None or proc.poll() is not None:
+            self._reset_caption_worker_state()
+            return
+
+        stdin = getattr(self, "_caption_worker_stdin", None)
+        self._caption_worker_stdin = None
+        self._caption_worker_warm = False
+        self._caption_worker_key = None
+        self._caption_worker_ready.clear()
+        self.caption_process = None
+
+        if wait:
+            if graceful:
+                try:
+                    if stdin is not None:
+                        stdin.write("QUIT\n")
+                        stdin.flush()
+                except Exception:
+                    pass
+                try:
+                    proc.wait(timeout=15)
+                except subprocess.TimeoutExpired:
+                    try:
+                        proc.terminate()
+                    except Exception:
+                        pass
+                    try:
+                        proc.wait(timeout=5)
+                    except Exception:
+                        try:
+                            proc.kill()
+                        except Exception:
+                            pass
+            else:
+                try:
+                    if stdin is not None:
+                        stdin.close()
+                except Exception:
+                    pass
+                try:
+                    proc.terminate()
+                except Exception:
+                    pass
+                try:
+                    proc.wait(timeout=30)
+                except subprocess.TimeoutExpired:
+                    try:
+                        proc.kill()
+                    except Exception:
+                        pass
+                    try:
+                        proc.wait(timeout=5)
+                    except Exception:
+                        pass
+        else:
+            try:
+                if stdin is not None:
+                    stdin.close()
+            except Exception:
+                pass
+            try:
+                proc.terminate()
+            except Exception:
+                pass
+
+            def _reap(p):
+                try:
+                    p.wait(timeout=30)
+                except Exception:
+                    try:
+                        p.kill()
+                    except Exception:
+                        pass
+
+            threading.Thread(target=_reap, args=(proc,), daemon=True).start()
+
+    def _stop_caption_worker_async(self, callback, *, graceful: bool = True) -> None:
+        """Stop the caption worker on a background thread, then run callback on the UI thread."""
+        if not self._caption_worker_alive():
+            self._reset_caption_worker_state()
+            self.master.after(0, callback)
+            return
+
+        def _bg():
+            try:
+                self._stop_caption_worker(silent=True, wait=True, graceful=graceful)
+            except Exception:
+                pass
+            self.master.after(0, callback)
+
+        threading.Thread(target=_bg, daemon=True).start()
+
+    def _ensure_caption_worker(self) -> bool:
+        import subprocess
+
+        key = self._caption_worker_config_key()
+        proc = getattr(self, "caption_process", None)
+        if (
+            proc is not None
+            and proc.poll() is None
+            and self._caption_worker_warm
+            and self._caption_worker_key == key
+        ):
+            return True
+
+        self._stop_caption_worker(silent=True)
+
+        try:
+            config_path = self._write_caption_worker_config()
+        except FileNotFoundError:
+            raise
+
+        cmd = [
+            self._venv_python(),
+            self._caption_script_path(),
+            "--serve",
+            "--config", config_path,
+        ]
+        if os.name == "nt":
+            creationflags = subprocess.CREATE_NEW_PROCESS_GROUP | subprocess.CREATE_NO_WINDOW
+            preexec_fn = None
+        else:
+            creationflags = 0
+            preexec_fn = os.setsid
+
+        self._caption_worker_ready.clear()
+        proc = subprocess.Popen(
+            cmd,
+            stdin=subprocess.PIPE,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            text=True,
+            bufsize=1,
+            encoding="utf-8",
+            env=self._caption_worker_env(),
+            creationflags=creationflags,
+            preexec_fn=preexec_fn,
+        )
+        self.caption_process = proc
+        self._caption_worker_stdin = proc.stdin
+        self._caption_worker_key = key
+        self._start_caption_worker_reader(proc)
+
+        if not self._caption_worker_ready.wait(timeout=600):
+            self._stop_caption_worker(silent=True)
+            return False
+        return True
+
+    def _handle_caption_subprocess_line(self, line: str) -> None:
+        line = (line or "").strip()
+        if not line:
+            return
+        if line == "READY":
+            self._caption_worker_warm = True
+            self._caption_worker_ready.set()
+            return
+        if line == "DONE":
+            self.master.after(0, self._on_caption_job_done)
+            return
+        if line == "STOPPED":
+            self.master.after(0, lambda: self._on_caption_job_done(stopped=True))
+            return
+        if line.startswith("PROGRESS:"):
+            try:
+                _tag, cur_s, tot_s = line.split(None, 2)
+                cur, tot = int(cur_s), int(tot_s)
+            except (ValueError, IndexError):
+                return
+            self.master.after(0, lambda p=(cur / tot) * 100.0 if tot else 0.0, c=cur, t=tot:
+                              self.update_caption_progress(p, c, t))
+        elif line.startswith("OK:"):
+            self.master.after(0, lambda n=line[3:].strip(): self.update_caption_log(f"✓ {n}\n"))
+        elif line.startswith("FAIL:"):
+            self.master.after(0, lambda d=line[5:].strip(): self.update_caption_log(f"✗ {d}\n"))
+        elif line.startswith("INFO:"):
+            self.master.after(0, lambda m=line[5:].strip(): self.update_caption_log(f"{m}\n"))
+
+    def _on_caption_job_done(self, stopped: bool = False) -> None:
+        self._captioning_running = False
+        self.caption_stop_btn.configure(state=tk.DISABLED)
+        self._set_caption_buttons_running(False)
+        stop_file = getattr(self, "_caption_stop_file", "")
+        if stop_file:
+            try:
+                os.remove(stop_file)
+            except OSError:
+                pass
+        self._caption_stop_file = ""
+        if stopped:
+            self.update_caption_log("\nCaptioning stopped.\n")
+        else:
+            self.update_caption_log("\nCaptioning complete!\n")
+        self.refresh_caption_images()
+
+    def _on_caption_worker_exit(self, returncode: int) -> None:
+        was_running = getattr(self, "_captioning_running", False)
+        self.caption_process = None
+        self._caption_worker_stdin = None
+        self._caption_worker_key = None
+        self._caption_worker_warm = False
+        self._caption_worker_ready.clear()
+        if was_running:
+            self._on_caption_job_done(stopped=True)
+            self.update_caption_log(
+                f"Caption worker exited unexpectedly (code {returncode}).\n")
+        elif returncode not in (0, None):
+            self.update_caption_log(f"Caption worker exited (code {returncode}).\n")
+
+    def _run_ai_caption_subprocess(self, images: list[str]) -> None:
+        if not images:
+            return
+        proc = getattr(self, "caption_process", None)
+        warm = (
+            proc is not None
+            and proc.poll() is None
+            and self._caption_worker_warm
+            and self._caption_worker_key == self._caption_worker_config_key()
+        )
+        try:
+            job_path, stop_file = self._write_caption_job(images)
+        except FileNotFoundError as exc:
+            messagebox.showerror("Error", str(exc))
+            return
+
+        self.captioning_stop_flag = False
+        self._captioning_running = True
+        self.caption_stop_btn.configure(state=tk.NORMAL)
+        self._set_caption_buttons_running(True)
+        self._caption_stop_file = stop_file
+        if warm:
+            self.update_caption_log(f"Captioning {len(images)} image(s)...\n")
+        else:
+            self.update_caption_log(
+                f"Starting AI captioning of {len(images)} image(s) (separate process)...\n")
+
+        def _ensure_and_run():
+            try:
+                if not self._ensure_caption_worker():
+                    self.master.after(0, lambda: self._on_caption_worker_start_failed())
+                    return
+                self.master.after(0, lambda: self._send_caption_job(job_path))
+            except Exception as exc:
+                self.master.after(0, lambda e=exc: self._on_caption_worker_start_failed(str(e)))
+
+        threading.Thread(target=_ensure_and_run, daemon=True).start()
+
+    def _on_caption_worker_start_failed(self, detail: str = "") -> None:
+        self._captioning_running = False
+        self.caption_stop_btn.configure(state=tk.DISABLED)
+        self._set_caption_buttons_running(False)
+        self._caption_stop_file = ""
+        msg = "Could not start the caption worker or load the model."
+        if detail:
+            msg += f"\n\n{detail}"
+        msg += "\nCheck the caption log for details."
+        self.update_caption_log(msg + "\n")
+        messagebox.showerror("Caption worker failed", msg)
+        self._stop_caption_worker(silent=True)
+
+    def _send_caption_job(self, job_path: str) -> None:
+        if not getattr(self, "_captioning_running", False):
+            return
+        try:
+            assert self._caption_worker_stdin is not None
+            self._caption_worker_stdin.write(f"RUN {job_path}\n")
+            self._caption_worker_stdin.flush()
+        except Exception as exc:
+            self._captioning_running = False
+            self._set_caption_buttons_running(False)
+            messagebox.showerror("Caption worker error", str(exc))
+            self._stop_caption_worker(silent=True)
 
     # === Bilingual translation (Qwen3-8B chat) ===
 
@@ -9650,140 +9960,8 @@ class LoRATrainerGUI:
             f"=== Done: {translated} translated, {skipped} skipped, {failed} failed ===\n"
         ))
 
-    def generate_florence_caption(self, img_path):
-        """Generate caption for a single image using Florence"""
-        if self.florence_model is None:
-            if not self.load_florence_model():
-                return None
-
-        try:
-            import torch
-
-            image = self._open_training_frame(img_path).convert("RGB")
-            task = self.caption_task_var.get()
-            max_tokens = int(self.caption_max_tokens_var.get())
-
-            inputs = self.florence_processor(
-                text=task,
-                images=image,
-                return_tensors="pt"
-            ).to(self.florence_device)
-            inputs["pixel_values"] = inputs["pixel_values"].to(self.florence_model.dtype)
-
-            generated_ids = self.florence_model.generate(
-                input_ids=inputs["input_ids"],
-                pixel_values=inputs["pixel_values"],
-                max_new_tokens=max_tokens,
-                do_sample=False,
-                num_beams=3,
-                use_cache=False
-            )
-
-            caption = self.florence_processor.batch_decode(
-                generated_ids,
-                skip_special_tokens=False
-            )[0]
-
-            # Parse the output
-            parsed = self.florence_processor.post_process_generation(
-                caption,
-                task=task,
-                image_size=(image.width, image.height)
-            )
-
-            return parsed.get(task, caption)
-
-        except Exception as e:
-            self.update_caption_log(f"Error captioning {os.path.basename(img_path)}: {e}\n")
-            return None
-
-    def load_qwen_captioner(self):
-        """Load the Krea 2 Qwen3-VL text encoder for captioning (lazy, ~8 GB bf16)."""
-        if getattr(self, "qwen_captioner", None) is not None:
-            return True
-        path = self._qwen_captioner_path()
-        if not path:
-            self.update_caption_log("Qwen3-VL captioner: the Krea 2 text encoder path isn't set "
-                                    "(Preferences tab), or the file is missing.\n")
-            return False
-        try:
-            self.update_caption_log(f"Loading Qwen3-VL captioner (~8 GB) from "
-                                    f"{os.path.basename(path)}...\n")
-            self.master.update_idletasks()
-            sys.path.insert(0, os.path.join(os.path.dirname(__file__), "src"))
-            import torch
-            from fizgig.krea2.utils import load_krea2_text_encoder
-            device = "cuda" if torch.cuda.is_available() else "cpu"
-            self.qwen_captioner = load_krea2_text_encoder(path, dtype=torch.bfloat16, device=device)
-            self.update_caption_log(f"Qwen3-VL captioner ready on {device}.\n")
-            return True
-        except Exception as e:
-            # The embedder's own RuntimeError already carries precise instructions (the offline
-            # sneakernet shopping list) — appending the check-your-path hint to it sent an
-            # offline user hunting through a path that was fine. Only add the path hint for
-            # errors that don't explain themselves.
-            _msg = f"Could not load the Qwen3-VL captioner: {type(e).__name__}: {e}\n"
-            if not isinstance(e, RuntimeError):
-                _msg += ("Check the Krea 2 text-encoder path in Preferences — Fizgig reads the "
-                         "bf16 and fp8_scaled Qwen3-VL-4B files from Comfy-Org/Krea-2.\n")
-            self.update_caption_log(_msg)
-            self.qwen_captioner = None
-            return False
-
-    def generate_qwen_caption(self, img_path):
-        """Caption one image with Qwen3-VL, using the currently-selected task's instruction."""
-        if getattr(self, "qwen_captioner", None) is None:
-            if not self.load_qwen_captioner():
-                return None
-        try:
-            from fizgig.krea2.embedder import generate_caption
-            try:
-                max_tokens = int(self.caption_max_tokens_var.get())
-            except (ValueError, tk.TclError):
-                max_tokens = 120
-            # The frame, not the path: a MiniMax clip has no still on disk to hand over.
-            return generate_caption(self.qwen_captioner, self._open_training_frame(img_path),
-                                    max_new_tokens=max_tokens,
-                                    instruction=self._resolve_caption_instruction())
-        except Exception as e:
-            self.update_caption_log(f"Error captioning {os.path.basename(img_path)}: {e}\n")
-            return None
-
-    def _generate_ai_caption(self, img_path):
-        """Route to whichever caption model is selected. Both bulk captioning and the Edit
-        dialog's Regenerate (AI) go through here, which is what keeps them in step — and why
-        trigger-word handling (save_caption_with_trigger) stays identical for both models."""
-        if self._is_qwen_captioner():
-            return self.generate_qwen_caption(img_path)
-        return self.generate_florence_caption(img_path)
-
-    def _release_qwen_captioner_if_idle(self):
-        """Free the Qwen3-VL captioner (~8 GB) when a captioning job is finished with it.
-
-        Called after a bulk batch, on leaving the Captions tab, and from the Unload button — but
-        NOT after a single regenerate, which is an iterative loop where a ~30 s reload per click
-        would hurt and nothing is at risk: training lives on another tab, so leaving this one
-        (which releases) is unavoidable before a run starts. Guarded on _captioning_running so a
-        job still in flight never has the model pulled out from under it."""
-        if getattr(self, "_captioning_running", False):
-            return
-        if getattr(self, "qwen_captioner", None) is None:
-            return
-        import gc
-        import torch
-        del self.qwen_captioner
-        self.qwen_captioner = None
-        gc.collect()
-        torch.cuda.empty_cache()
-        self.update_caption_log("Qwen3-VL unloaded — ~8 GB of VRAM released.\n")
-
     def _caption_model_blocked_by_training(self) -> bool:
-        """True (with a message) if a training run is live and the chosen captioner won't co-fit.
-
-        Qwen3-VL is ~8 GB — loading it alongside a resident training DiT is an OOM either for the
-        captioner or, worse, for the run. Florence-2 is small enough to leave alone."""
-        if not self._is_qwen_captioner():
-            return False
+        """True if a training run is live and a caption subprocess likely won't co-fit."""
         proc = getattr(self, "current_process", None)
         try:
             running = proc is not None and proc.poll() is None
@@ -9791,11 +9969,7 @@ class LoRATrainerGUI:
             running = False
         if not running:
             return False
-        # A live training process alone is not a reason to refuse — MEASURE. mem_get_info
-        # reports device-wide free memory, so it already accounts for whatever the training
-        # subprocess holds. On a 141 GB pod card there is room for both several times over;
-        # the co-fit problem is real only on consumer cards. The 12 GB bar is the ~8 GB
-        # captioner plus margin for the run's epoch-boundary spikes (previews, state saves).
+        need_gb = 8.0 if self._is_qwen_captioner() else 2.5
         free_gb = None
         try:
             import torch as _torch
@@ -9803,35 +9977,24 @@ class LoRATrainerGUI:
                 free_gb = _torch.cuda.mem_get_info()[0] / 1e9
         except Exception:
             free_gb = None
-        if free_gb is not None and free_gb >= 12.0:
+        margin = need_gb + 3.0
+        if free_gb is not None and free_gb >= margin:
             self.update_caption_log(
                 f"Training is running, but {free_gb:.0f} GB of VRAM is free — captioning "
-                f"alongside it. Training steps may slow a little while this runs.\n")
+                f"alongside it.\n")
             return False
+        model = "Qwen3-VL" if self._is_qwen_captioner() else "the caption model"
         _detail = (f"about {free_gb:.0f} GB free right now" if free_gb is not None
                    else "free VRAM can't be measured from here")
         messagebox.showwarning(
             "Training is running",
-            f"The Qwen3-VL captioner needs about 8 GB of VRAM on top of the training run, "
-            f"and there's {_detail}.\n\n"
-            "Wait for training to finish, or switch the Model dropdown to Florence-2.")
+            f"Captioning with {model} needs about {need_gb:.0f} GB of VRAM on top of the "
+            f"training run, and there's {_detail}.\n\n"
+            "Wait for training to finish.")
         return True
 
-    def save_caption_with_trigger(self, img_path, caption):
-        """Save caption with trigger word prepended"""
-        trigger = self.caption_trigger_var.get().strip()
-
-        if trigger:
-            full_caption = f"{trigger}, {caption}"
-        else:
-            full_caption = caption
-
-        caption_path = os.path.splitext(img_path)[0] + ".txt"
-        with open(caption_path, 'w', encoding='utf-8') as f:
-            f.write(full_caption)
-
     def caption_all_florence(self):
-        """Caption all images using Florence AI"""
+        """Caption all images using the selected AI model (Florence-2 or Qwen3-VL)."""
         folder = self.image_folder_var.get()
         if not folder or not os.path.isdir(folder):
             messagebox.showerror("Error", "Please select a valid image folder")
@@ -9845,87 +10008,28 @@ class LoRATrainerGUI:
             return
 
         overwrite = self.overwrite_captions_var.get()
-
-        # Filter images that need captioning
         if not overwrite:
             images = [img for img in images if not os.path.exists(os.path.splitext(img)[0] + ".txt")]
             if not images:
                 messagebox.showinfo("Info", "All images already have captions. Enable 'Overwrite' to regenerate.")
                 return
 
-        # Guard against a second job over the same files — the previous behaviour was two worker
-        # threads writing the same .txt files, which looks like the job restarting itself.
         if getattr(self, "_captioning_running", False):
             messagebox.showinfo("Already running",
                                 "A captioning job is already running. Press Stop to end it first.")
             return
 
-        # Run in thread
-        self.captioning_stop_flag = False
-        self._captioning_running = True
-        self.caption_stop_btn.configure(state=tk.NORMAL)
-        self._set_caption_buttons_running(True)
-
-        def caption_thread():
-            total = len(images)
-            self.update_caption_log(f"Starting AI captioning of {total} images...\n")
-
-            for i, img_path in enumerate(images):
-                if self.captioning_stop_flag:
-                    self.master.after(0, lambda: self.update_caption_log("Captioning stopped by user\n"))
-                    break
-
-                # Update progress
-                progress = ((i + 1) / total) * 100
-                self.master.after(0, lambda p=progress, c=i+1, t=total: self.update_caption_progress(p, c, t))
-
-                caption = self._generate_ai_caption(img_path)
-                if caption:
-                    self.save_caption_with_trigger(img_path, caption)
-                    self.master.after(0, lambda f=os.path.basename(img_path): self.update_caption_log(f"✓ {f}\n"))
-                else:
-                    self.master.after(0, lambda f=os.path.basename(img_path): self.update_caption_log(f"✗ {f} (failed)\n"))
-
-            self._captioning_running = False
-            self.master.after(0, lambda: self.update_caption_log(f"\nCaptioning complete!\n"))
-            self.master.after(0, lambda: self.caption_stop_btn.configure(state=tk.DISABLED))
-            self.master.after(0, lambda: self._set_caption_buttons_running(False))
-            self.master.after(0, self.refresh_caption_images)
-            # A finished batch is a finished job — give the ~8 GB back rather than holding it
-            # until the user thinks to press Unload. Florence (~1 GB) keeps its old behaviour:
-            # it's small, and reloading it for the next batch costs more than it saves.
-            self.master.after(0, self._release_qwen_captioner_if_idle)
-
-        threading.Thread(target=caption_thread, daemon=True).start()
-
+        self._run_ai_caption_subprocess(images)
 
     def caption_single_image(self, img_path):
-        """Caption a single image (for regenerate button)"""
+        """Caption a single image (Regenerate AI on the thumbnail grid)."""
         if getattr(self, "_captioning_running", False):
-            # Two threads generating on one model at once is asking for trouble, and the bulk
-            # job would overwrite this caption moments later anyway.
             messagebox.showinfo("Captioning in progress",
-                                "A captioning job is running — wait for it to finish (or press "
-                                "Stop) before regenerating a single image.")
+                                "A captioning job is running — wait for it to finish (or press Stop).")
             return
         if self._caption_model_blocked_by_training():
             return
-        self.update_caption_log(f"Captioning {os.path.basename(img_path)}...\n")
-
-        def caption_thread():
-            caption = self._generate_ai_caption(img_path)
-            if caption:
-                self.save_caption_with_trigger(img_path, caption)
-                self.master.after(0, lambda: self.update_caption_log(f"✓ Done\n"))
-                self.master.after(0, self.refresh_caption_images)
-            else:
-                self.master.after(0, lambda: self.update_caption_log(f"✗ Failed\n"))
-            # Deliberately NOT released here. Regenerating from a thumbnail is an iterative
-            # loop — you click it on several images in a row — and freeing each time would cost
-            # a ~30 s reload per click. Nothing is at risk by holding it: training lives on
-            # another tab, and leaving this one releases it.
-
-        threading.Thread(target=caption_thread, daemon=True).start()
+        self._run_ai_caption_subprocess([img_path])
 
     def _set_caption_buttons_running(self, running: bool):
         """Grey the job-starting buttons while a captioning job is in flight."""
@@ -9939,11 +10043,19 @@ class LoRATrainerGUI:
                     pass
 
     def stop_captioning(self):
-        """Stop the captioning process.
-
-        The flag is only read between images, so the one being generated right now still
-        finishes — with Qwen3-VL that can be several seconds, which looks like Stop being
-        ignored unless we say so."""
+        """Stop AI captioning — subprocess jobs honour a stop file between images."""
+        proc = getattr(self, "caption_process", None)
+        if proc is not None and proc.poll() is None:
+            stop_file = getattr(self, "_caption_stop_file", "")
+            if stop_file:
+                try:
+                    with open(stop_file, "w", encoding="utf-8"):
+                        pass
+                except OSError:
+                    pass
+            self.caption_stop_btn.configure(state=tk.DISABLED)
+            self.update_caption_log("Stopping — finishing the current image first...\n")
+            return
         self.captioning_stop_flag = True
         self.caption_stop_btn.configure(state=tk.DISABLED)
         self.update_caption_log("Stopping — finishing the current image first...\n")
@@ -24414,9 +24526,27 @@ class LoRATrainerGUI:
         # its settings into this tab, so the window needs a way back to the run in progress.
         self._active_run_item = self._queue_snapshot()
 
-        # Unload Florence model to free VRAM before training
-        if self.florence_model is not None:
-            self.unload_florence_model(silent=True)
+        if getattr(self, "_training_start_pending", False):
+            return
+        if self._caption_worker_alive():
+            self._training_start_pending = True
+            self._caption_worker_released_for_training = True
+            try:
+                self._start_training_btn.configure(state=tk.DISABLED)
+            except Exception:
+                pass
+            self._stop_caption_worker_async(self._start_training_launch, graceful=False)
+            return
+
+        self._start_training_launch()
+
+    def _start_training_launch(self):
+        """Launch training after validations and any caption-worker VRAM release."""
+        self._training_start_pending = False
+        try:
+            self._start_training_btn.configure(state=tk.NORMAL)
+        except Exception:
+            pass
         # ...and the tool-tab engines (Repair Studio / Explorer / Royale, 10-20 GB each).
         # A manual Start implies a switch to the Training tab, which unloads them via
         # on_tab_changed — but a queue auto-advance or the queue window's "Start next now"
@@ -24612,6 +24742,10 @@ class LoRATrainerGUI:
         self.console_output.configure(state="normal")
         self.console_output.delete(1.0, tk.END)
         self.console_output.configure(state="disabled")
+
+        if getattr(self, "_caption_worker_released_for_training", False):
+            self._caption_worker_released_for_training = False
+            self.update_console("Caption model released.\n")
 
         def on_training_complete():
             """Called when training finishes - cleanup watchers"""
@@ -26135,6 +26269,10 @@ class LoRATrainerGUI:
         # tabs' events, so closing mid-edit would otherwise drop the last change.
         try:
             self._save_last_used_paths()
+        except Exception:
+            pass
+        try:
+            self._stop_caption_worker(silent=True, wait=False)
         except Exception:
             pass
         try:
