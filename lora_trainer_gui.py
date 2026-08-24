@@ -9674,7 +9674,10 @@ class LoRATrainerGUI:
         self._caption_worker_key = key
         self._start_caption_worker_reader(proc)
 
-        if not self._caption_worker_ready.wait(timeout=600):
+        # The exit handler SETS the event too (with warm still False), so a worker that
+        # dies during model load — bad path, missing download — fails this promptly
+        # instead of blocking the full 600 s and popping a stale error dialog later.
+        if not self._caption_worker_ready.wait(timeout=600) or not self._caption_worker_warm:
             self._stop_caption_worker(silent=True)
             return False
         return True
@@ -9731,7 +9734,10 @@ class LoRATrainerGUI:
         self._caption_worker_stdin = None
         self._caption_worker_key = None
         self._caption_worker_warm = False
-        self._caption_worker_ready.clear()
+        # SET, not clear: release any thread blocked in _ensure_caption_worker's ready-wait
+        # so a load failure reports immediately (warm stays False, which is the signal).
+        # The next _ensure_caption_worker clears it via _stop_caption_worker before spawning.
+        self._caption_worker_ready.set()
         if was_running:
             self._on_caption_job_done(stopped=True)
             self.update_caption_log(

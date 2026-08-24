@@ -103,10 +103,12 @@ def _load_florence(model_name: str, revision: str | None, code_revision: str | N
         kwargs["code_revision"] = code_revision
     processor = from_pretrained_cache_first(AutoProcessor, model_name, **kwargs)
     dtype = torch.float16 if device == "cuda" else torch.float32
+    # torch_dtype, not dtype: the pinned transformers reads torch_dtype; an unknown kwarg
+    # falls through silently and Florence loads fp32 (double VRAM), which nothing reports.
     model = from_pretrained_cache_first(
         AutoModelForCausalLM,
         model_name,
-        dtype=dtype,
+        torch_dtype=dtype,
         attn_implementation="eager",
         **kwargs,
     ).to(device)
