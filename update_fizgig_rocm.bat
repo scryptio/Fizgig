@@ -51,7 +51,7 @@ if errorlevel 1 (
     )
 )
 
-REM Shared deps — CUDA torch/bnb stripped ^(same filter as the installer^).
+REM Shared deps — same path as install_fizgig_rocm.bat ^(not uv_install_deps.py / CUDA^).
 set "ROCM_REQS=%TEMP%\fizgig_rocm_shared_reqs.txt"
 "venv\Scripts\python.exe" "filter_requirements_rocm.py" "requirements.txt" "!ROCM_REQS!"
 if errorlevel 1 (
@@ -59,7 +59,8 @@ if errorlevel 1 (
     pause
     exit /b 1
 )
-"venv\Scripts\python.exe" "uv_install_deps.py" "!ROCM_REQS!" "venv"
+echo Installing shared dependencies ^(CUDA torch/bnb lines stripped^)...
+"venv\Scripts\python.exe" -m uv pip install --index-strategy unsafe-best-match -r "!ROCM_REQS!"
 if errorlevel 1 (
     echo ERROR: Failed to install shared dependencies.
     del "!ROCM_REQS!" >nul 2>&1
