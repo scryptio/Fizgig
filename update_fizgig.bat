@@ -30,6 +30,22 @@ if not exist "venv\Scripts\python.exe" (
     goto skip_deps
 )
 
+REM Guard: requirements.txt pulls CUDA torch/bitsandbytes. Running this on an AMD ROCm
+REM venv replaces the ROCm stack and breaks training. ROCm users must use update_fizgig_rocm.bat.
+"venv\Scripts\python.exe" -c "import torch; v=getattr(torch,'__version__','') or ''; r=getattr(getattr(torch,'version',None),'rocm',None); h=getattr(getattr(torch,'version',None),'hip',None); raise SystemExit(1 if (r or h or '+rocm' in v.lower()) else 0)" >nul 2>&1
+if errorlevel 1 (
+    echo.
+    echo ERROR: This looks like an AMD ROCm install.
+    echo.
+    echo   update_fizgig.bat installs CUDA packages from requirements.txt and would
+    echo   overwrite your ROCm PyTorch / bitsandbytes stack.
+    echo.
+    echo   Use instead:  update_fizgig_rocm.bat
+    echo.
+    pause
+    exit /b 1
+)
+
 "venv\Scripts\python.exe" -m uv --version >nul 2>&1
 if errorlevel 1 (
     "venv\Scripts\python.exe" -m pip install --upgrade uv

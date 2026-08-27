@@ -3240,7 +3240,9 @@ class LoRATrainerGUI:
         _how = ("On RunPod, Fizgig updates itself every time you restart the pod — just stop "
                 "and start it to get the latest."
                 if _running_on_pod() else
-                "To update: close Fizgig and run update_fizgig.bat.")
+                ("To update: close Fizgig and run update_fizgig_rocm.bat."
+                 if os.environ.get("FIZGIG_GPU_BACKEND", "").lower() == "rocm" else
+                 "To update: close Fizgig and run update_fizgig.bat."))
         tk.Label(pad, text=_how, font=(FONT_FAMILY, 9), fg=COLORS["text_muted"],
                  bg=COLORS["bg_deep"], wraplength=WRAP, justify=tk.LEFT).pack(
             anchor=tk.W, pady=(0, 10))
@@ -3264,7 +3266,9 @@ class LoRATrainerGUI:
                      bg=COLORS["accent_subtle"]).pack(anchor=tk.W, padx=12, pady=(10, 0))
             _upd = ("Restart the pod (stop and start it) to update."
                     if _running_on_pod() else
-                    "Close Fizgig and run update_fizgig.bat to update.")
+                    ("Close Fizgig and run update_fizgig_rocm.bat to update."
+                     if os.environ.get("FIZGIG_GPU_BACKEND", "").lower() == "rocm" else
+                     "Close Fizgig and run update_fizgig.bat to update."))
             tk.Label(card, text=f"You're on {_git_describe_version() or 'an older build'}. {_upd}",
                      font=(FONT_FAMILY, 9), fg=COLORS["text_explain"], bg=COLORS["accent_subtle"],
                      wraplength=WRAP - 24, justify=tk.LEFT).pack(anchor=tk.W, padx=12, pady=(2, 8))
