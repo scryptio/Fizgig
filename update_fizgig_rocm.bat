@@ -29,13 +29,17 @@ if not exist "requirements.txt" (
     goto skip_deps
 )
 
-REM Abort if this venv looks like a CUDA install.
+REM Guard: this updater installs a ROCm bitsandbytes wheel and skips CUDA torch.
+REM Running it on an NVIDIA venv would replace CUDA bitsandbytes with the AMD wheel.
 "venv\Scripts\python.exe" -c "import torch; v=getattr(torch,'__version__','') or ''; r=getattr(getattr(torch,'version',None),'rocm',None); h=getattr(getattr(torch,'version',None),'hip',None); raise SystemExit(0 if (r or h or '+rocm' in v.lower()) else 1)" >nul 2>&1
 if errorlevel 1 (
     echo.
-    echo ERROR: This venv does not look like a ROCm PyTorch install.
-    echo   NVIDIA / CUDA installs must use:  update_fizgig.bat
-    echo   AMD ROCm installs use this script: update_fizgig_rocm.bat
+    echo ERROR: This looks like an NVIDIA / CUDA install.
+    echo.
+    echo   update_fizgig_rocm.bat installs the AMD ROCm bitsandbytes wheel and would
+    echo   overwrite your CUDA PyTorch / bitsandbytes stack.
+    echo.
+    echo   Use instead:  update_fizgig.bat
     echo.
     pause
     exit /b 1
