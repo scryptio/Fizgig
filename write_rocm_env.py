@@ -12,6 +12,7 @@ missing). Distinct from Linux ROCM_CHANNEL=nightly.
 from __future__ import annotations
 
 import argparse
+import os
 import re
 import subprocess
 import sys
@@ -78,6 +79,27 @@ def _normalize_gfx(raw: str | None) -> str | None:
         return None
     m = re.search(r"gfx\d+[a-z]?", str(raw), re.I)
     return m.group(0).lower() if m else None
+
+
+def _ensure_windows_rocm_on_path() -> None:
+    """Put hipinfo / ROCm bin dirs on PATH before bitsandbytes or torch probes them.
+
+    Without this, bitsandbytes prints WinError 2 ("could not detect ROCm GPU
+    architecture") on a fresh update because hipinfo.exe is not findable yet —
+    rocm_env.bat is what normally prepends those dirs at launch time.
+    """
+    if sys.platform != "win32":
+        return
+    core = SCRIPT_DIR / "venv" / "Lib" / "site-packages" / "_rocm_sdk_core"
+    if not core.is_dir():
+        return
+    prefix = _windows_rocm_path_prefix(core.resolve())
+    if not prefix:
+        return
+    # Prepend; keep existing PATH for everything else.
+    os.environ["PATH"] = prefix + ";" + os.environ.get("PATH", "")
+    os.environ.setdefault("ROCM_PATH", str(core.resolve()))
+    os.environ.setdefault("HIP_PATH", str(core.resolve()))
 
 
 def detect_gfx_target() -> str | None:
@@ -155,6 +177,9 @@ def main(argv: list[str] | None = None) -> int:
     )
     args = parser.parse_args(argv)
     omit_bnb = bool(args.experimental)
+
+    # hipinfo lives under the pip ROCm SDK — put it on PATH before bitsandbytes probes.
+    _ensure_windows_rocm_on_path()
 
     is_linux = sys.platform.startswith("linux")
     default_bnb = DEFAULT_BNB_LINUX if is_linux else DEFAULT_BNB_WIN
