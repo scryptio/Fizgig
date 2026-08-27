@@ -88,11 +88,11 @@ if not defined BNB_WHEEL (
     )
 )
 
-REM Refresh launcher env. Preserve --experimental when no set BNB_ROCM_VERSION= line
-REM exists ^(REM comments also mention the name — do not findstr the bare token^).
+REM Refresh launcher env. Preserve --experimental when no BNB_ROCM_VERSION= assignment
+REM exists ^(REM text says "omitted"/"unset" without "=" — safe to findstr^).
 set "ROCM_ENV_EXPERIMENTAL=1"
 if exist "rocm_env.bat" (
-    findstr /I /C:"set \"BNB_ROCM_VERSION=" "rocm_env.bat" >nul 2>&1
+    findstr /I /C:"BNB_ROCM_VERSION=" "rocm_env.bat" >nul 2>&1
     if not errorlevel 1 set "ROCM_ENV_EXPERIMENTAL=0"
 )
 if !ROCM_ENV_EXPERIMENTAL!==1 (
